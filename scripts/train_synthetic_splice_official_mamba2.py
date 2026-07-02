@@ -166,16 +166,26 @@ def make_batch(
 
 
 class OfficialMamba2Block(nn.Module):
-    def __init__(self, hidden_dim: int, chunk_size: int = 16):
+    def __init__(self, hidden_dim: int, chunk_size: int = 16, headdim: int = 8):
         super().__init__()
         self.chunk_size = chunk_size
         self.norm = nn.LayerNorm(hidden_dim)
+        d_inner = 2 * hidden_dim
+        if d_inner % headdim != 0:
+            raise ValueError(f"2 * hidden_dim must be divisible by headdim, got {d_inner=} and {headdim=}")
+        nheads = d_inner // headdim
+        fused_projection_width = 2 * d_inner + 2 * 32 + nheads
+        if fused_projection_width % 8 != 0:
+            raise ValueError(
+                "Official Mamba2's fused CUDA causal-conv path needs an internal projection width "
+                f"divisible by 8, got {fused_projection_width}. Try --headdim 8 for hidden_dim=32."
+            )
         self.mamba = Mamba2(
             d_model=hidden_dim,
             d_state=32,
             d_conv=4,
             expand=2,
-            headdim=32,
+            headdim=headdim,
             chunk_size=chunk_size,
         )
         self._reset_mamba_parameters()
@@ -210,10 +220,10 @@ class OfficialMamba2Block(nn.Module):
 
 
 class OfficialMamba2Encoder(nn.Module):
-    def __init__(self, hidden_dim: int, layers: int = 2, chunk_size: int = 16):
+    def __init__(self, hidden_dim: int, layers: int = 2, chunk_size: int = 16, headdim: int = 8):
         super().__init__()
         self.layers = nn.ModuleList(
-            [OfficialMamba2Block(hidden_dim, chunk_size=chunk_size) for _ in range(layers)]
+            [OfficialMamba2Block(hidden_dim, chunk_size=chunk_size, headdim=headdim) for _ in range(layers)]
         )
         self.final_norm = nn.LayerNorm(hidden_dim)
 
@@ -231,6 +241,7 @@ class MambaSplicePointerTranslator(nn.Module):
         hidden_dim: int = 32,
         layers: int = 3,
         chunk_size: int = 16,
+        headdim: int = 8,
     ):
         super().__init__()
         self.transcript_bases = transcript_bases
@@ -244,6 +255,7 @@ class MambaSplicePointerTranslator(nn.Module):
             hidden_dim=hidden_dim,
             layers=layers,
             chunk_size=chunk_size,
+            headdim=headdim,
         )
         self.query = nn.Embedding(transcript_bases, hidden_dim)
         self.coordinate_head = nn.Sequential(
@@ -340,6 +352,7 @@ def train(args: argparse.Namespace) -> None:
         hidden_dim=args.hidden_dim,
         layers=args.layers,
         chunk_size=args.chunk_size,
+        headdim=args.headdim,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
@@ -428,6 +441,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument("--headdim", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--print-every", type=int, default=25)
