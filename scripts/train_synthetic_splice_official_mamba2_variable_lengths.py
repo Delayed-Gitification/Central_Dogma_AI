@@ -150,9 +150,9 @@ def make_batch(
     min_exon_count: int = 1,
     max_exon_count: int = 6,
     min_exon_bases: int = 5,
-    min_intron_length: int = 200,
-    max_intron_length: int = 3_000,
-    length_bucket_size: int = 1_024,
+    min_intron_length: int = 30,
+    max_intron_length: int = 300,
+    length_bucket_size: int = 256,
     seed: int | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -951,14 +951,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-micro-batch-tokens", type=int, default=500_000)
     parser.add_argument("--min-protein-codons", type=int, default=96)
     parser.add_argument("--max-protein-codons", type=int, default=256)
-    parser.add_argument("--min-exon-count", type=int, default=3)
-    parser.add_argument("--max-exon-count", type=int, default=10)
+    parser.add_argument("--min-exon-count", type=int, default=2)
+    parser.add_argument("--max-exon-count", type=int, default=6)
     parser.add_argument("--min-exon-bases", type=int, default=15)
     parser.add_argument("--eval-protein-codons", type=int, default=160)
-    parser.add_argument("--eval-exon-count", type=int, default=6)
-    parser.add_argument("--min-intron-length", type=int, default=200)
-    parser.add_argument("--max-intron-length", type=int, default=3_000)
-    parser.add_argument("--length-bucket-size", type=int, default=1_024)
+    parser.add_argument("--eval-exon-count", type=int, default=4)
+    parser.add_argument("--min-intron-length", type=int, default=30)
+    parser.add_argument("--max-intron-length", type=int, default=300)
+    parser.add_argument("--length-bucket-size", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=32)
