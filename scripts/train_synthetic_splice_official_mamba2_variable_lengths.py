@@ -320,7 +320,7 @@ class MambaSplicePointerTranslator(nn.Module):
         layers: int = 3,
         chunk_size: int = 16,
         headdim: int = 8,
-        use_prior_coordinate: bool = True,
+        use_prior_coordinate: bool = False,
     ):
         super().__init__()
         self.use_prior_coordinate = use_prior_coordinate
@@ -631,14 +631,14 @@ def train(args: argparse.Namespace) -> None:
         f"effective batch size: {args.batch_size}; micro batch size: {effective_micro_batch_size}; "
         f"micro batch mode: {micro_batch_mode}; length bucket: {args.length_bucket_size} bp"
     )
-    print("coordinate mode: exon-prior renderer" if not args.learn_coordinate else "coordinate mode: learned Mamba coordinate")
+    print("coordinate mode: oracle exon-prior renderer" if args.oracle_prior_coordinate else "coordinate mode: learned Mamba coordinate")
 
     model = MambaSplicePointerTranslator(
         hidden_dim=args.hidden_dim,
         layers=args.layers,
         chunk_size=args.chunk_size,
         headdim=args.headdim,
-        use_prior_coordinate=not args.learn_coordinate,
+        use_prior_coordinate=args.oracle_prior_coordinate,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -956,21 +956,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--micro-batch-size", type=int, default=0, help="Per-forward batch size. Use 0 for auto.")
     parser.add_argument("--max-micro-batch-tokens", type=int, default=500_000)
-    parser.add_argument("--min-protein-codons", type=int, default=96)
-    parser.add_argument("--max-protein-codons", type=int, default=256)
-    parser.add_argument("--min-exon-count", type=int, default=2)
-    parser.add_argument("--max-exon-count", type=int, default=6)
-    parser.add_argument("--min-exon-bases", type=int, default=15)
-    parser.add_argument("--eval-protein-codons", type=int, default=160)
-    parser.add_argument("--eval-exon-count", type=int, default=4)
-    parser.add_argument("--min-intron-length", type=int, default=30)
-    parser.add_argument("--max-intron-length", type=int, default=300)
-    parser.add_argument("--length-bucket-size", type=int, default=256)
+    parser.add_argument("--min-protein-codons", type=int, default=24)
+    parser.add_argument("--max-protein-codons", type=int, default=96)
+    parser.add_argument("--min-exon-count", type=int, default=1)
+    parser.add_argument("--max-exon-count", type=int, default=4)
+    parser.add_argument("--min-exon-bases", type=int, default=9)
+    parser.add_argument("--eval-protein-codons", type=int, default=48)
+    parser.add_argument("--eval-exon-count", type=int, default=3)
+    parser.add_argument("--min-intron-length", type=int, default=10)
+    parser.add_argument("--max-intron-length", type=int, default=120)
+    parser.add_argument("--length-bucket-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--headdim", type=int, default=8)
-    parser.add_argument("--learn-coordinate", action="store_true")
+    parser.add_argument("--oracle-prior-coordinate", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-5)
     parser.add_argument("--warmup-steps", type=int, default=500)
