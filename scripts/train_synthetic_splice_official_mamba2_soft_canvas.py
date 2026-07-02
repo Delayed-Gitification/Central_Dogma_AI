@@ -460,6 +460,16 @@ def train(args: argparse.Namespace) -> None:
         construct_sharpness_init=args.construct_sharpness_init,
         max_construct_sharpness=args.max_construct_sharpness,
     ).to(device)
+    if args.load_canvas_checkpoint:
+        canvas_checkpoint_path = Path(args.load_canvas_checkpoint).expanduser()
+        if not canvas_checkpoint_path.is_absolute():
+            canvas_checkpoint_path = ROOT / canvas_checkpoint_path
+        try:
+            canvas_checkpoint = torch.load(canvas_checkpoint_path, map_location=device, weights_only=False)
+        except TypeError:
+            canvas_checkpoint = torch.load(canvas_checkpoint_path, map_location=device)
+        canvas.load_state_dict(canvas_checkpoint["canvas_state_dict"])
+        print(f"loaded canvas checkpoint: {canvas_checkpoint_path}")
 
     renderer = load_renderer(args, device)
     renderer_enabled = renderer is not None and not args.compaction_only
@@ -508,9 +518,11 @@ def train(args: argparse.Namespace) -> None:
         downstream_nt_accuracy = 0.0
         downstream_nt_exact = 0.0
         if renderer_enabled:
+            renderer_construct_dna = construct_dna * construct_mask[..., None].to(construct_dna.dtype)
+            renderer_construct_tracks = construct_tracks * construct_mask[..., None].to(construct_tracks.dtype)
             amino_acid_probs, transcript_base_probs, _assignment, _assignment_logits, _renderer_diag = renderer(
-                construct_dna,
-                construct_tracks,
+                renderer_construct_dna,
+                renderer_construct_tracks,
                 transcript_bases=transcript_bases,
             )
             aa_loss_rows = F.nll_loss(
@@ -559,7 +571,8 @@ def train(args: argparse.Namespace) -> None:
             construct_exact = float(((hard_construct == target_bases) | ~construct_mask).all(dim=1).float().mean().item())
             track_mse = masked_mean((construct_tracks - target_tracks).pow(2).mean(dim=-1), construct_mask)
             track_binary = (construct_tracks > 0.5).to(target_tracks.dtype)
-            track_accuracy = float(((track_binary == target_tracks) | ~construct_mask[..., None]).all(dim=-1).sum().item()) / max(
+            track_position_correct = (track_binary == target_tracks).all(dim=-1) & construct_mask
+            track_accuracy = float(track_position_correct.sum().item()) / max(
                 1, int(construct_mask.sum().item())
             )
             final_metrics = {
@@ -631,9 +644,11 @@ def train(args: argparse.Namespace) -> None:
         predicted_cds = None
         predicted_protein = None
         if renderer_enabled:
+            renderer_construct_dna = construct_dna * construct_mask[..., None].to(construct_dna.dtype)
+            renderer_construct_tracks = construct_tracks * construct_mask[..., None].to(construct_tracks.dtype)
             amino_acid_probs, transcript_base_probs, _assignment, _assignment_logits, _renderer_diag = renderer(
-                construct_dna,
-                construct_tracks,
+                renderer_construct_dna,
+                renderer_construct_tracks,
                 transcript_bases=transcript_bases,
             )
             eval_aa_length = int(target_aa_mask[0].sum().item())
@@ -669,6 +684,21 @@ def train(args: argparse.Namespace) -> None:
     print("selected presence max:", float(selected_presence.max().item()))
     print("first mismatch:", mismatch if mismatch is not None else "none")
 
+    if args.save_canvas_checkpoint:
+        canvas_checkpoint_path = Path(args.save_canvas_checkpoint).expanduser()
+        if not canvas_checkpoint_path.is_absolute():
+            canvas_checkpoint_path = ROOT / canvas_checkpoint_path
+        canvas_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "canvas_state_dict": canvas.state_dict(),
+                "args": vars(args),
+                "final_metrics": final_metrics,
+            },
+            canvas_checkpoint_path,
+        )
+        print(f"saved canvas checkpoint: {canvas_checkpoint_path}")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -688,6 +718,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--renderer-checkpoint", default="")
     parser.add_argument("--freeze-renderer", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--compaction-only", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--load-canvas-checkpoint", default="")
+    parser.add_argument("--save-canvas-checkpoint", default="")
     parser.add_argument("--optional-slots-per-base", type=int, default=2)
     parser.add_argument("--canvas-steps", type=int, default=2_000)
     parser.add_argument("--canvas-learning-rate", type=float, default=3e-2)

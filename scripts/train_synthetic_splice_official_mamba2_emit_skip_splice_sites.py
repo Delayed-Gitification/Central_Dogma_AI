@@ -377,7 +377,8 @@ class MambaEmitSkipTranslator(nn.Module):
 
         emit_logits = self.emit_head(encoded).squeeze(-1)
         emit_gate = splice_site_signal.squeeze(-1).clamp(0, 1) if self.use_prior_emit_mask else torch.ones_like(emit_logits)
-        emit_prob = torch.sigmoid(emit_logits) * emit_gate
+        genome_mask = (dna_one_hot.sum(dim=-1) > 0).to(emit_logits.dtype)
+        emit_prob = torch.sigmoid(emit_logits) * emit_gate * genome_mask
         soft_rank = torch.cumsum(emit_prob, dim=1)
 
         target_index = torch.arange(transcript_bases, device=dna_one_hot.device)
