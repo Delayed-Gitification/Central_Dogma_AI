@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "central-dogma-ai"
+version = "0.1.0"
+description = "Splice-aware translation and synthetic vector-design scaffolding."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Central Dogma AI" }]
+dependencies = []
+
+[project.optional-dependencies]
+ml = ["torch>=2.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+central-dogma-demo = "central_dogma_ai.cli:main"
+central-dogma-train = "central_dogma_ai.train:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
