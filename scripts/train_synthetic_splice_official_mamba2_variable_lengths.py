@@ -321,9 +321,11 @@ class MambaSplicePointerTranslator(nn.Module):
         chunk_size: int = 16,
         headdim: int = 8,
         use_prior_coordinate: bool = False,
+        max_coordinate_sharpness: float = 10.0,
     ):
         super().__init__()
         self.use_prior_coordinate = use_prior_coordinate
+        self.max_coordinate_sharpness = max_coordinate_sharpness
         self.input_projection = nn.Linear(input_dim, hidden_dim)
         self.position_projection = nn.Sequential(
             nn.Linear(2, hidden_dim),
@@ -381,7 +383,7 @@ class MambaSplicePointerTranslator(nn.Module):
         query = self.query_projection(query_features)
         content_logits = torch.einsum("bld,td->btl", encoded, query) / math.sqrt(encoded.shape[-1])
 
-        coordinate_sharpness = F.softplus(self.log_coordinate_sharpness)
+        coordinate_sharpness = F.softplus(self.log_coordinate_sharpness).clamp(max=self.max_coordinate_sharpness)
         coordinate_bias = -coordinate_sharpness * (
             latent_coordinate[:, None, :] - target_coordinate[None, :, None]
         ).pow(2)
@@ -595,6 +597,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--pointer-loss-weight must be non-negative")
     if args.pointer_loss_anneal_steps < 0:
         raise ValueError("--pointer-loss-anneal-steps must be non-negative")
+    if args.max_coordinate_sharpness <= 0:
+        raise ValueError("--max-coordinate-sharpness must be positive")
+    if not 0 <= args.loss_ema_beta < 1:
+        raise ValueError("--loss-ema-beta must be in [0, 1)")
     if args.print_every < 1:
         raise ValueError("--print-every must be at least 1")
     if args.checkpoint_every < 0:
@@ -639,6 +645,7 @@ def train(args: argparse.Namespace) -> None:
         chunk_size=args.chunk_size,
         headdim=args.headdim,
         use_prior_coordinate=args.oracle_prior_coordinate,
+        max_coordinate_sharpness=args.max_coordinate_sharpness,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -657,6 +664,7 @@ def train(args: argparse.Namespace) -> None:
     start_step = 0
     best_loss = float("inf")
     final_metrics = None
+    loss_ema = None
     resume_path = None
     if args.resume_from:
         resume_path = resolve_checkpoint_path(args.resume_from)
@@ -824,11 +832,13 @@ def train(args: argparse.Namespace) -> None:
         coordinate_sharpness = coordinate_sharpness_sum / max(1, total_examples)
         coordinate_span = coordinate_span_sum / max(1, total_examples)
         mean_exon_attention = mean_exon_attention_sum / max(1, total_examples)
+        loss_ema = loss_value if loss_ema is None else args.loss_ema_beta * loss_ema + (1.0 - args.loss_ema_beta) * loss_value
 
         final_metrics = {
             "step": step,
             "lr": lr,
             "loss": loss_value,
+            "loss_ema": loss_ema,
             "aa_loss": aa_loss_value,
             "nt_loss": nt_loss_value,
             "pointer_loss": pointer_loss_value,
@@ -873,7 +883,7 @@ def train(args: argparse.Namespace) -> None:
 
         if is_report_step:
             print(
-                f"step={step:03d} lr={lr:.2e} loss={loss_value:.3f} "
+                f"step={step:03d} lr={lr:.2e} loss={loss_value:.3f} loss_ema={loss_ema:.3f} "
                 f"aa_loss={aa_loss_value:.3f} nt_loss={nt_loss_value:.3f} "
                 f"ptr_loss={pointer_loss_value:.3f} ptr_w={pointer_loss_weight:.3f} "
                 f"token_acc={token_accuracy:.3f} exact={exact:.3f} "
@@ -972,14 +982,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headdim", type=int, default=8)
     parser.add_argument("--oracle-prior-coordinate", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--min-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-6)
     parser.add_argument("--warmup-steps", type=int, default=500)
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.95)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--nucleotide-loss-weight", type=float, default=0.5)
     parser.add_argument("--pointer-loss-weight", type=float, default=1.0)
-    parser.add_argument("--pointer-loss-anneal-steps", type=int, default=10_000)
+    parser.add_argument("--pointer-loss-anneal-steps", type=int, default=1_000)
+    parser.add_argument("--max-coordinate-sharpness", type=float, default=10.0)
+    parser.add_argument("--loss-ema-beta", type=float, default=0.95)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=1)
