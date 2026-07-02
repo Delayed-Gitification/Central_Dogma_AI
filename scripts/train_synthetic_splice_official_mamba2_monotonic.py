@@ -334,6 +334,15 @@ def select_device(device_name: str) -> torch.device:
     return device
 
 
+def get_lr(step: int, total_steps: int, base_lr: float, min_lr: float, warmup_steps: int) -> float:
+    if warmup_steps > 0 and step < warmup_steps:
+        return base_lr * float(step + 1) / float(warmup_steps)
+    decay_steps = max(1, total_steps - warmup_steps)
+    decay_step = min(max(0, step - warmup_steps), decay_steps)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * decay_step / decay_steps))
+    return min_lr + (base_lr - min_lr) * cosine
+
+
 def train(args: argparse.Namespace) -> None:
     device = select_device(args.device)
     torch.manual_seed(args.seed)
@@ -357,10 +366,25 @@ def train(args: argparse.Namespace) -> None:
         chunk_size=args.chunk_size,
         headdim=args.headdim,
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.weight_decay,
+    )
 
     final_metrics = None
     for step in range(args.steps):
+        lr = get_lr(
+            step=step,
+            total_steps=args.steps,
+            base_lr=args.learning_rate,
+            min_lr=args.min_learning_rate,
+            warmup_steps=args.warmup_steps,
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
         dna, splice_tracks, target, _examples = make_batch(
             batch_size=args.batch_size,
             protein_codons=args.protein_codons,
@@ -374,6 +398,8 @@ def train(args: argparse.Namespace) -> None:
 
         optimizer.zero_grad(set_to_none=True)
         aa_loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
         with torch.no_grad():
@@ -383,6 +409,7 @@ def train(args: argparse.Namespace) -> None:
 
         final_metrics = {
             "step": step,
+            "lr": lr,
             "loss": aa_loss.item(),
             "token_accuracy": token_accuracy,
             "exact_match": exact,
@@ -394,7 +421,7 @@ def train(args: argparse.Namespace) -> None:
 
         if step % args.print_every == 0 or step == args.steps - 1:
             print(
-                f"step={step:03d} loss={aa_loss.item():.3f} "
+                f"step={step:03d} lr={lr:.2e} loss={aa_loss.item():.3f} "
                 f"token_acc={token_accuracy:.3f} exact={exact:.3f} "
                 f"entropy={diagnostics['attention_entropy'].item():.3f} "
                 f"coord_span={diagnostics['coordinate_span'].item():.2f} "
@@ -445,7 +472,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=16)
     parser.add_argument("--headdim", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=3e-3)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--min-learning-rate", type=float, default=1e-5)
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--adam-beta1", type=float, default=0.9)
+    parser.add_argument("--adam-beta2", type=float, default=0.95)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=1)
