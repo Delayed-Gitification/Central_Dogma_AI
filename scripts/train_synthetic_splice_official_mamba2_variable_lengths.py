@@ -154,6 +154,7 @@ def make_batch(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
     int,
     list[dict[str, object]],
 ]:
@@ -183,6 +184,7 @@ def make_batch(
     target_mask_rows = []
     base_target_rows = []
     base_mask_rows = []
+    pointer_target_rows = []
     for example in examples:
         dna = example["dna"]
         tracks = example["tracks"]
@@ -213,6 +215,13 @@ def make_batch(
                 dim=0,
             )
         )
+        true_transcript_rank = example["annotations"][:, 3]
+        exonic_positions = true_transcript_rank >= 0
+        transcript_ranks = true_transcript_rank[exonic_positions].long()
+        genomic_indices = torch.nonzero(exonic_positions, as_tuple=False).flatten().long()
+        pointer_target = torch.zeros(max_transcript_bases, dtype=torch.long)
+        pointer_target[transcript_ranks] = genomic_indices
+        pointer_target_rows.append(pointer_target)
 
     return (
         torch.stack(dna_rows).to(device),
@@ -221,6 +230,7 @@ def make_batch(
         torch.stack(target_mask_rows).to(device),
         torch.stack(base_target_rows).to(device),
         torch.stack(base_mask_rows).to(device),
+        torch.stack(pointer_target_rows).to(device),
         max_transcript_bases,
         examples,
     )
@@ -383,7 +393,7 @@ class MambaSplicePointerTranslator(nn.Module):
             latent_coordinate.max(dim=1).values - latent_coordinate.min(dim=1).values
         ).mean()
 
-        return amino_acid_probs, transcript_base_probs, attention, {
+        return amino_acid_probs, transcript_base_probs, attention, pointer_logits, {
             "attention_entropy": attention_entropy.detach(),
             "coordinate_sharpness": coordinate_sharpness.detach(),
             "coordinate_span": coordinate_span.detach(),
@@ -412,6 +422,71 @@ def get_lr(step: int, total_steps: int, base_lr: float, min_lr: float, warmup_st
     return min_lr + (base_lr - min_lr) * cosine
 
 
+def get_linear_annealed_weight(step: int, start_weight: float, end_step: int) -> float:
+    if start_weight <= 0 or end_step <= 0:
+        return 0.0
+    if step >= end_step:
+        return 0.0
+    return start_weight * (1.0 - float(step) / float(end_step))
+
+
+def resolve_checkpoint_path(path: str | Path) -> Path:
+    checkpoint_path = Path(path).expanduser()
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = ROOT / checkpoint_path
+    return checkpoint_path
+
+
+def checkpoint_payload(
+    *,
+    step: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    final_metrics: dict[str, float | int] | None,
+    best_loss: float,
+) -> dict[str, object]:
+    return {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "args": vars(args),
+        "final_metrics": final_metrics,
+        "best_loss": best_loss,
+        "torch_rng_state": torch.get_rng_state(),
+        "python_random_state": random.getstate(),
+    }
+
+
+def save_checkpoint(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary_path)
+    temporary_path.replace(path)
+
+
+def load_checkpoint(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[int, float, dict[str, float | int] | None]:
+    checkpoint = torch.load(path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if "torch_rng_state" in checkpoint:
+        torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+    if "python_random_state" in checkpoint:
+        random.setstate(checkpoint["python_random_state"])
+    start_step = int(checkpoint.get("step", -1)) + 1
+    best_loss = float(checkpoint.get("best_loss", float("inf")))
+    final_metrics = checkpoint.get("final_metrics")
+    if final_metrics is not None and not isinstance(final_metrics, dict):
+        final_metrics = None
+    return start_step, best_loss, final_metrics
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.min_protein_codons < 1:
         raise ValueError("--min-protein-codons must be at least 1")
@@ -431,6 +506,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-exon-count must be at least 1")
     if args.eval_exon_count * args.min_exon_bases > args.eval_protein_codons * 3:
         raise ValueError("--eval-exon-count is too large for --eval-protein-codons and --min-exon-bases")
+    if args.pointer_loss_weight < 0:
+        raise ValueError("--pointer-loss-weight must be non-negative")
+    if args.pointer_loss_anneal_steps < 0:
+        raise ValueError("--pointer-loss-anneal-steps must be non-negative")
 
 
 def train(args: argparse.Namespace) -> None:
@@ -447,7 +526,8 @@ def train(args: argparse.Namespace) -> None:
     if device.type == "cuda":
         print(f"CUDA device: {torch.cuda.get_device_name(device)}")
     print(f"model tracks: {MODEL_TRACK_NAMES}")
-    print(f"annotation tracks generated but not used: {ANNOTATION_TRACK_NAMES}")
+    print(f"annotation tracks generated: {ANNOTATION_TRACK_NAMES}")
+    print("true_transcript_rank is used only for annealed pointer supervision")
 
     model = MambaSplicePointerTranslator(
         hidden_dim=args.hidden_dim,
@@ -473,8 +553,13 @@ def train(args: argparse.Namespace) -> None:
         )
         for group in optimizer.param_groups:
             group["lr"] = lr
+        pointer_loss_weight = get_linear_annealed_weight(
+            step=step,
+            start_weight=args.pointer_loss_weight,
+            end_step=args.pointer_loss_anneal_steps,
+        )
 
-        dna, splice_tracks, target, target_mask, base_target, base_mask, transcript_bases, _examples = make_batch(
+        dna, splice_tracks, target, target_mask, base_target, base_mask, pointer_target, transcript_bases, _examples = make_batch(
             batch_size=args.batch_size,
             device=device,
             min_protein_codons=args.min_protein_codons,
@@ -485,7 +570,7 @@ def train(args: argparse.Namespace) -> None:
             max_intron_length=args.max_intron_length,
             seed=args.batch_seed_offset + step,
         )
-        amino_acid_probs, transcript_base_probs, _attention, diagnostics = model(
+        amino_acid_probs, transcript_base_probs, _attention, pointer_logits, diagnostics = model(
             dna,
             splice_tracks,
             transcript_bases=transcript_bases,
@@ -502,7 +587,13 @@ def train(args: argparse.Namespace) -> None:
             reduction="none",
         ).reshape_as(base_target)
         nt_loss = (per_base_loss * base_mask.to(per_base_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
-        loss = aa_loss + args.nucleotide_loss_weight * nt_loss
+        per_pointer_loss = F.cross_entropy(
+            pointer_logits.reshape(-1, pointer_logits.shape[-1]),
+            pointer_target.reshape(-1),
+            reduction="none",
+        ).reshape_as(pointer_target)
+        pointer_loss = (per_pointer_loss * base_mask.to(per_pointer_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
+        loss = aa_loss + args.nucleotide_loss_weight * nt_loss + pointer_loss_weight * pointer_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -519,6 +610,10 @@ def train(args: argparse.Namespace) -> None:
             base_correct = (predicted_bases == base_target) & base_mask
             nucleotide_accuracy = base_correct.sum().float().div(base_mask.sum().clamp_min(1)).item()
             nucleotide_exact = ((predicted_bases == base_target) | ~base_mask).all(dim=1).float().mean().item()
+            predicted_pointer = pointer_logits.argmax(dim=-1)
+            pointer_correct = (predicted_pointer == pointer_target) & base_mask
+            pointer_accuracy = pointer_correct.sum().float().div(base_mask.sum().clamp_min(1)).item()
+            pointer_exact = ((predicted_pointer == pointer_target) | ~base_mask).all(dim=1).float().mean().item()
             target_lengths = target_mask.sum(dim=1)
             mean_target_length = target_lengths.float().mean().item()
             max_target_length = int(target_lengths.max().item())
@@ -529,10 +624,14 @@ def train(args: argparse.Namespace) -> None:
             "loss": loss.item(),
             "aa_loss": aa_loss.item(),
             "nt_loss": nt_loss.item(),
+            "pointer_loss": pointer_loss.item(),
+            "pointer_loss_weight": pointer_loss_weight,
             "token_accuracy": token_accuracy,
             "exact_match": exact,
             "nucleotide_accuracy": nucleotide_accuracy,
             "nucleotide_exact_match": nucleotide_exact,
+            "pointer_accuracy": pointer_accuracy,
+            "pointer_exact_match": pointer_exact,
             "mean_target_length": mean_target_length,
             "max_target_length": max_target_length,
             "attention_entropy": diagnostics["attention_entropy"].item(),
@@ -545,8 +644,10 @@ def train(args: argparse.Namespace) -> None:
             print(
                 f"step={step:03d} lr={lr:.2e} loss={loss.item():.3f} "
                 f"aa_loss={aa_loss.item():.3f} nt_loss={nt_loss.item():.3f} "
+                f"ptr_loss={pointer_loss.item():.3f} ptr_w={pointer_loss_weight:.3f} "
                 f"token_acc={token_accuracy:.3f} exact={exact:.3f} "
                 f"nt_acc={nucleotide_accuracy:.3f} nt_exact={nucleotide_exact:.3f} "
+                f"ptr_acc={pointer_accuracy:.3f} ptr_exact={pointer_exact:.3f} "
                 f"aa_len_mean={mean_target_length:.1f} aa_len_max={max_target_length} "
                 f"entropy={diagnostics['attention_entropy'].item():.3f} "
                 f"coord_span={diagnostics['coordinate_span'].item():.2f} "
@@ -555,7 +656,7 @@ def train(args: argparse.Namespace) -> None:
                 flush=True,
             )
 
-    dna, splice_tracks, _target, target_mask, base_target, base_mask, transcript_bases, examples = make_batch(
+    dna, splice_tracks, _target, target_mask, base_target, base_mask, _pointer_target, transcript_bases, examples = make_batch(
         batch_size=1,
         device=device,
         min_protein_codons=args.eval_protein_codons,
@@ -568,7 +669,7 @@ def train(args: argparse.Namespace) -> None:
     )
     model.eval()
     with torch.no_grad():
-        amino_acid_probs, transcript_base_probs, _attention, diagnostics = model(
+        amino_acid_probs, transcript_base_probs, _attention, _pointer_logits, diagnostics = model(
             dna,
             splice_tracks,
             transcript_bases=transcript_bases,
@@ -623,6 +724,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adam-beta2", type=float, default=0.95)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--nucleotide-loss-weight", type=float, default=0.5)
+    parser.add_argument("--pointer-loss-weight", type=float, default=1.0)
+    parser.add_argument("--pointer-loss-anneal-steps", type=int, default=10_000)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=1)
