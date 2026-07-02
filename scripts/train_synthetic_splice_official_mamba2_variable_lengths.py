@@ -864,6 +864,10 @@ def train(args: argparse.Namespace) -> None:
         f"effective batch size: {args.batch_size}; micro batch size: {effective_micro_batch_size}; "
         f"micro batch mode: {micro_batch_mode}; length bucket: {args.length_bucket_size} bp"
     )
+    print(
+        f"learning rate: base={args.learning_rate}, min={args.min_learning_rate}, "
+        f"success_decay={args.success_lr_decay}"
+    )
     print("coordinate mode: oracle exon-prior renderer" if args.oracle_prior_coordinate else "coordinate mode: learned Mamba coordinate")
 
     model = MambaSplicePointerTranslator(
@@ -1378,7 +1382,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-entropy-weight", type=float, default=0.0)
     parser.add_argument("--max-coordinate-sharpness", type=float, default=10.0)
     parser.add_argument("--loss-ema-beta", type=float, default=0.95)
-    parser.add_argument("--success-lr-decay", type=float, default=0.2)
+    parser.add_argument("--success-lr-decay", type=float, default=0.05)
     parser.add_argument("--success-exact-threshold", type=float, default=0.95)
     parser.add_argument("--success-nucleotide-exact-threshold", type=float, default=0.95)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
