@@ -601,6 +601,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-coordinate-sharpness must be positive")
     if not 0 <= args.loss_ema_beta < 1:
         raise ValueError("--loss-ema-beta must be in [0, 1)")
+    if not 0 < args.success_lr_decay <= 1:
+        raise ValueError("--success-lr-decay must be in (0, 1]")
+    if not 0 <= args.success_exact_threshold <= 1:
+        raise ValueError("--success-exact-threshold must be in [0, 1]")
+    if not 0 <= args.success_nucleotide_exact_threshold <= 1:
+        raise ValueError("--success-nucleotide-exact-threshold must be in [0, 1]")
     if args.print_every < 1:
         raise ValueError("--print-every must be at least 1")
     if args.checkpoint_every < 0:
@@ -665,6 +671,7 @@ def train(args: argparse.Namespace) -> None:
     best_loss = float("inf")
     final_metrics = None
     loss_ema = None
+    success_lr_multiplier = 1.0
     resume_path = None
     if args.resume_from:
         resume_path = resolve_checkpoint_path(args.resume_from)
@@ -684,18 +691,27 @@ def train(args: argparse.Namespace) -> None:
         )
         print(f"resumed checkpoint: {resume_path}")
         print(f"resuming from step={start_step} with best_loss={best_loss:.6f}")
+        if final_metrics is not None:
+            success_lr_multiplier = float(final_metrics.get("next_lr_multiplier", success_lr_multiplier))
+            if (
+                final_metrics.get("exact_match", 0.0) >= args.success_exact_threshold
+                and final_metrics.get("nucleotide_exact_match", 0.0) >= args.success_nucleotide_exact_threshold
+            ):
+                success_lr_multiplier = min(success_lr_multiplier, args.success_lr_decay)
 
     if start_step >= args.steps:
         print(f"checkpoint has already reached requested --steps={args.steps}; skipping training loop")
 
     for step in range(start_step, args.steps):
-        lr = get_lr(
+        scheduled_lr = get_lr(
             step=step,
             total_steps=args.steps,
             base_lr=args.learning_rate,
             min_lr=args.min_learning_rate,
             warmup_steps=args.warmup_steps,
         )
+        current_lr_multiplier = success_lr_multiplier
+        lr = scheduled_lr * current_lr_multiplier
         for group in optimizer.param_groups:
             group["lr"] = lr
         pointer_loss_weight = get_linear_annealed_weight(
@@ -833,9 +849,22 @@ def train(args: argparse.Namespace) -> None:
         coordinate_span = coordinate_span_sum / max(1, total_examples)
         mean_exon_attention = mean_exon_attention_sum / max(1, total_examples)
         loss_ema = loss_value if loss_ema is None else args.loss_ema_beta * loss_ema + (1.0 - args.loss_ema_beta) * loss_value
+        if (
+            success_lr_multiplier > args.success_lr_decay
+            and exact >= args.success_exact_threshold
+            and nucleotide_exact >= args.success_nucleotide_exact_threshold
+        ):
+            success_lr_multiplier = args.success_lr_decay
+            print(
+                f"success lr brake armed: future lr multiplier={success_lr_multiplier:.3f}",
+                flush=True,
+            )
 
         final_metrics = {
             "step": step,
+            "scheduled_lr": scheduled_lr,
+            "lr_multiplier": current_lr_multiplier,
+            "next_lr_multiplier": success_lr_multiplier,
             "lr": lr,
             "loss": loss_value,
             "loss_ema": loss_ema,
@@ -883,7 +912,8 @@ def train(args: argparse.Namespace) -> None:
 
         if is_report_step:
             print(
-                f"step={step:03d} lr={lr:.2e} loss={loss_value:.3f} loss_ema={loss_ema:.3f} "
+                f"step={step:03d} lr={lr:.2e} lr_mult={current_lr_multiplier:.3f} "
+                f"loss={loss_value:.3f} loss_ema={loss_ema:.3f} "
                 f"aa_loss={aa_loss_value:.3f} nt_loss={nt_loss_value:.3f} "
                 f"ptr_loss={pointer_loss_value:.3f} ptr_w={pointer_loss_weight:.3f} "
                 f"token_acc={token_accuracy:.3f} exact={exact:.3f} "
@@ -992,6 +1022,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pointer-loss-anneal-steps", type=int, default=1_000)
     parser.add_argument("--max-coordinate-sharpness", type=float, default=10.0)
     parser.add_argument("--loss-ema-beta", type=float, default=0.95)
+    parser.add_argument("--success-lr-decay", type=float, default=0.2)
+    parser.add_argument("--success-exact-threshold", type=float, default=0.95)
+    parser.add_argument("--success-nucleotide-exact-threshold", type=float, default=0.95)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=1)
