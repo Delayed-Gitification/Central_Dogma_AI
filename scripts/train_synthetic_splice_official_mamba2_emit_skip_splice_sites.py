@@ -678,6 +678,36 @@ def failure_metrics(stats: dict[str, float]) -> dict[str, float]:
     }
 
 
+def format_report_metrics(label: str, metrics: dict[str, float | int]) -> str:
+    return (
+        f"{label:<10} "
+        f"loss {metrics['loss']:.3f} "
+        f"(aa {metrics['aa_loss']:.3f}, nt {metrics['nt_loss']:.3f}, emit {metrics['emit_loss']:.3f}) | "
+        f"acc tok {metrics['token_accuracy']:.3f}, exact {metrics['exact_match']:.3f}, "
+        f"nt {metrics['nucleotide_accuracy']:.3f}/{metrics['nucleotide_exact_match']:.3f}, "
+        f"assign {metrics['assignment_accuracy']:.3f}/{metrics['assignment_exact_match']:.3f} | "
+        f"conf aa {metrics['aa_confidence']:.3f}, nt {metrics['nucleotide_confidence']:.3f}, "
+        f"assign {metrics['assignment_confidence']:.3f} | "
+        f"assign entropy {metrics['assignment_entropy']:.3f}, sharp {metrics['assignment_sharpness']:.3f}; "
+        f"emit count {metrics['emit_count']:.2f}, mass_err {metrics['emit_mass_error']:.3f}; "
+        f"site_assign {metrics['mean_splice_site_assignment']:.3f}"
+    )
+
+
+def format_failure_report(label: str, metrics: dict[str, float | int]) -> str:
+    return (
+        f"{label:<10} "
+        f"fail {metrics['failure_rate']:.3f}; "
+        f"len {metrics['failed_target_bases_mean']:.1f}, "
+        f"exons {metrics['failed_exon_count_mean']:.2f}, "
+        f"max_intron {metrics['failed_max_intron_mean']:.0f}, "
+        f"first_nt {metrics['failed_first_error_mean']:.1f}; "
+        f"ptr_err_dist {metrics['pointer_error_distance_mean']:.2f}, "
+        f"junc_ptr {metrics['junction_pointer_accuracy']:.3f} "
+        f"(n={metrics['junction_pointer_total']:.0f})"
+    )
+
+
 def evaluate_model_batch(
     *,
     model: nn.Module,
@@ -1238,71 +1268,28 @@ def train(args: argparse.Namespace) -> None:
             print(f"saved best checkpoint: {best_path}", flush=True)
 
         if is_report_step:
-            print(
-                f"step={step:03d} lr={lr:.2e} lr_mult={current_lr_multiplier:.3f} "
-                f"loss={loss_value:.3f} loss_ema={loss_ema:.3f} "
-                f"aa_loss={aa_loss_value:.3f} nt_loss={nt_loss_value:.3f} "
-                f"emit_loss={emit_loss_value:.3f} emit_w={emit_loss_weight:.3f} "
-                f"token_acc={token_accuracy:.3f} exact={exact:.3f} "
-                f"nt_acc={nucleotide_accuracy:.3f} nt_exact={nucleotide_exact:.3f} "
-                f"assign_acc={assignment_accuracy:.3f} assign_exact={assignment_exact:.3f} "
-                f"aa_conf={aa_confidence:.3f} nt_conf={nucleotide_confidence:.3f} "
-                f"assign_conf={assignment_confidence:.3f} "
-                f"aa_len_mean={mean_target_length:.1f} aa_len_max={max_target_length} "
-                f"genome_len_mean={mean_genome_length:.0f} genome_len_max={max_genome_length} "
-                f"intron_len_mean={mean_intron_length:.0f} intron_len_max={max_intron_length} "
-                f"micro_batch={effective_micro_batch_size}/{args.batch_size} "
-                f"assign_entropy={assignment_entropy:.3f} "
-                f"emit_count={emit_count:.2f} "
-                f"emit_mass_err={emit_mass_error:.3f} "
-                f"assign_sharp={assignment_sharpness:.3f} "
-                f"site_assign={mean_splice_site_assignment:.3f}",
-                flush=True,
-            )
-            print(
-                f"train_fail fail={train_failure['failure_rate']:.3f} "
-                f"fail_len={train_failure['failed_target_bases_mean']:.1f} "
-                f"fail_exons={train_failure['failed_exon_count_mean']:.2f} "
-                f"fail_max_intron={train_failure['failed_max_intron_mean']:.0f} "
-                f"first_nt_err={train_failure['failed_first_error_mean']:.1f} "
-                f"ptr_err_dist={train_failure['pointer_error_distance_mean']:.2f} "
-                f"junc_ptr_acc={train_failure['junction_pointer_accuracy']:.3f} "
-                f"junc_n={train_failure['junction_pointer_total']:.0f}",
-                flush=True,
-            )
+            report_lines = [
+                (
+                    f"\nstep {step:06d} | lr {lr:.2e} (mult {current_lr_multiplier:.3f}) | "
+                    f"ema {loss_ema:.3f} | emit_w {emit_loss_weight:.3f} | "
+                    f"micro_batch {effective_micro_batch_size}/{args.batch_size}"
+                ),
+                (
+                    f"lengths    aa {mean_target_length:.1f}/{max_target_length}, "
+                    f"genome {mean_genome_length:.0f}/{max_genome_length}, "
+                    f"intron {mean_intron_length:.0f}/{max_intron_length}"
+                ),
+                format_report_metrics("train", final_metrics),
+                format_failure_report("train fail", final_metrics),
+            ]
             if validation_metrics is not None:
-                print(
-                    f"fixed_val loss={validation_metrics['loss']:.3f} "
-                    f"aa_loss={validation_metrics['aa_loss']:.3f} "
-                    f"nt_loss={validation_metrics['nt_loss']:.3f} "
-                    f"emit_loss={validation_metrics['emit_loss']:.3f} "
-                    f"token_acc={validation_metrics['token_accuracy']:.3f} "
-                    f"exact={validation_metrics['exact_match']:.3f} "
-                    f"nt_acc={validation_metrics['nucleotide_accuracy']:.3f} "
-                    f"nt_exact={validation_metrics['nucleotide_exact_match']:.3f} "
-                    f"assign_acc={validation_metrics['assignment_accuracy']:.3f} "
-                    f"assign_exact={validation_metrics['assignment_exact_match']:.3f} "
-                    f"aa_conf={validation_metrics['aa_confidence']:.3f} "
-                    f"nt_conf={validation_metrics['nucleotide_confidence']:.3f} "
-                    f"assign_conf={validation_metrics['assignment_confidence']:.3f} "
-                    f"assign_entropy={validation_metrics['assignment_entropy']:.3f} "
-                    f"emit_count={validation_metrics['emit_count']:.2f} "
-                    f"emit_mass_err={validation_metrics['emit_mass_error']:.3f} "
-                    f"assign_sharp={validation_metrics['assignment_sharpness']:.3f} "
-                    f"site_assign={validation_metrics['mean_splice_site_assignment']:.3f}",
-                    flush=True,
+                report_lines.extend(
+                    [
+                        format_report_metrics("fixed", validation_metrics),
+                        format_failure_report("fixed fail", validation_metrics),
+                    ]
                 )
-                print(
-                    f"fixed_val_fail fail={validation_metrics['failure_rate']:.3f} "
-                    f"fail_len={validation_metrics['failed_target_bases_mean']:.1f} "
-                    f"fail_exons={validation_metrics['failed_exon_count_mean']:.2f} "
-                    f"fail_max_intron={validation_metrics['failed_max_intron_mean']:.0f} "
-                    f"first_nt_err={validation_metrics['failed_first_error_mean']:.1f} "
-                    f"ptr_err_dist={validation_metrics['pointer_error_distance_mean']:.2f} "
-                    f"junc_ptr_acc={validation_metrics['junction_pointer_accuracy']:.3f} "
-                    f"junc_n={validation_metrics['junction_pointer_total']:.0f}",
-                    flush=True,
-                )
+            print("\n".join(report_lines), flush=True)
 
         maybe_save_checkpoint(
             step=step,
