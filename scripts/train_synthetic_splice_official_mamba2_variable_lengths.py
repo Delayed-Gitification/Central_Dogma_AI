@@ -78,6 +78,7 @@ def random_split_lengths(total_length: int, parts: int, rng: random.Random, min_
 def make_synthetic_example(
     protein_codons: int,
     exon_count: int,
+    min_intron_length: int,
     max_intron_length: int,
     rng: random.Random,
     min_exon_bases: int = 5,
@@ -91,6 +92,7 @@ def make_synthetic_example(
     donor_track = []
     acceptor_track = []
     true_transcript_rank = []
+    intron_lengths = []
 
     cds_cursor = 0
     transcript_cursor = 0
@@ -106,7 +108,8 @@ def make_synthetic_example(
             transcript_cursor += 1
 
         if exon_index < exon_count - 1:
-            intron_length = rng.randint(8, max_intron_length)
+            intron_length = rng.randint(min_intron_length, max_intron_length)
+            intron_lengths.append(intron_length)
             intron = "GT" + random_dna(intron_length - 4, rng) + "AG"
             for base in intron:
                 genome_parts.append(base)
@@ -129,6 +132,8 @@ def make_synthetic_example(
         "cds": cds,
         "protein_codons": protein_codons,
         "exon_count": exon_count,
+        "exon_lengths": exon_lengths,
+        "intron_lengths": intron_lengths,
         "dna": one_hot_dna(genome),
         "tracks": model_tracks,
         "annotations": annotations,
@@ -145,7 +150,8 @@ def make_batch(
     min_exon_count: int = 1,
     max_exon_count: int = 6,
     min_exon_bases: int = 5,
-    max_intron_length: int = 36,
+    min_intron_length: int = 200,
+    max_intron_length: int = 3_000,
     seed: int | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -169,6 +175,7 @@ def make_batch(
             make_synthetic_example(
                 protein_codons=protein_codons,
                 exon_count=exon_count,
+                min_intron_length=min_intron_length,
                 max_intron_length=max_intron_length,
                 rng=rng,
                 min_exon_bases=min_exon_bases,
@@ -454,6 +461,7 @@ def checkpoint_payload(
         "final_metrics": final_metrics,
         "best_loss": best_loss,
         "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         "python_random_state": random.getstate(),
     }
 
@@ -480,6 +488,8 @@ def load_checkpoint(
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if "torch_rng_state" in checkpoint:
         torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+    if checkpoint.get("cuda_rng_state_all") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state_all"])
     if "python_random_state" in checkpoint:
         random.setstate(checkpoint["python_random_state"])
     start_step = int(checkpoint.get("step", -1)) + 1
@@ -537,8 +547,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-exon-count must be >= --min-exon-count")
     if args.min_exon_bases < 1:
         raise ValueError("--min-exon-bases must be at least 1")
-    if args.max_intron_length < 8:
-        raise ValueError("--max-intron-length must be at least 8")
+    if args.min_intron_length < 4:
+        raise ValueError("--min-intron-length must be at least 4")
+    if args.max_intron_length < args.min_intron_length:
+        raise ValueError("--max-intron-length must be >= --min-intron-length")
     if args.eval_protein_codons < 1:
         raise ValueError("--eval-protein-codons must be at least 1")
     if args.eval_exon_count < 1:
@@ -573,6 +585,12 @@ def train(args: argparse.Namespace) -> None:
     print(f"model tracks: {MODEL_TRACK_NAMES}")
     print(f"annotation tracks generated: {ANNOTATION_TRACK_NAMES}")
     print("true_transcript_rank is used only for annealed pointer supervision")
+    print(
+        "synthetic length regime: "
+        f"protein_codons={args.min_protein_codons}-{args.max_protein_codons}, "
+        f"exons={args.min_exon_count}-{args.max_exon_count}, "
+        f"introns={args.min_intron_length}-{args.max_intron_length} bp"
+    )
 
     model = MambaSplicePointerTranslator(
         hidden_dim=args.hidden_dim,
@@ -636,7 +654,7 @@ def train(args: argparse.Namespace) -> None:
             end_step=args.pointer_loss_anneal_steps,
         )
 
-        dna, splice_tracks, target, target_mask, base_target, base_mask, pointer_target, transcript_bases, _examples = make_batch(
+        dna, splice_tracks, target, target_mask, base_target, base_mask, pointer_target, transcript_bases, examples = make_batch(
             batch_size=args.batch_size,
             device=device,
             min_protein_codons=args.min_protein_codons,
@@ -644,6 +662,7 @@ def train(args: argparse.Namespace) -> None:
             min_exon_count=args.min_exon_count,
             max_exon_count=args.max_exon_count,
             min_exon_bases=args.min_exon_bases,
+            min_intron_length=args.min_intron_length,
             max_intron_length=args.max_intron_length,
             seed=args.batch_seed_offset + step,
         )
@@ -694,6 +713,16 @@ def train(args: argparse.Namespace) -> None:
             target_lengths = target_mask.sum(dim=1)
             mean_target_length = target_lengths.float().mean().item()
             max_target_length = int(target_lengths.max().item())
+            genome_lengths = [len(str(example["genome"])) for example in examples]
+            intron_lengths = [
+                int(intron_length)
+                for example in examples
+                for intron_length in example["intron_lengths"]
+            ]
+            mean_genome_length = sum(genome_lengths) / len(genome_lengths)
+            max_genome_length = max(genome_lengths)
+            mean_intron_length = sum(intron_lengths) / len(intron_lengths) if intron_lengths else 0.0
+            max_intron_length = max(intron_lengths) if intron_lengths else 0
 
         final_metrics = {
             "step": step,
@@ -711,6 +740,10 @@ def train(args: argparse.Namespace) -> None:
             "pointer_exact_match": pointer_exact,
             "mean_target_length": mean_target_length,
             "max_target_length": max_target_length,
+            "mean_genome_length": mean_genome_length,
+            "max_genome_length": max_genome_length,
+            "mean_intron_length": mean_intron_length,
+            "max_intron_length": max_intron_length,
             "attention_entropy": diagnostics["attention_entropy"].item(),
             "coordinate_sharpness": diagnostics["coordinate_sharpness"].item(),
             "coordinate_span": diagnostics["coordinate_span"].item(),
@@ -744,6 +777,8 @@ def train(args: argparse.Namespace) -> None:
                 f"nt_acc={nucleotide_accuracy:.3f} nt_exact={nucleotide_exact:.3f} "
                 f"ptr_acc={pointer_accuracy:.3f} ptr_exact={pointer_exact:.3f} "
                 f"aa_len_mean={mean_target_length:.1f} aa_len_max={max_target_length} "
+                f"genome_len_mean={mean_genome_length:.0f} genome_len_max={max_genome_length} "
+                f"intron_len_mean={mean_intron_length:.0f} intron_len_max={max_intron_length} "
                 f"entropy={diagnostics['attention_entropy'].item():.3f} "
                 f"coord_span={diagnostics['coordinate_span'].item():.2f} "
                 f"coord_sharp={diagnostics['coordinate_sharpness'].item():.3f} "
@@ -770,6 +805,7 @@ def train(args: argparse.Namespace) -> None:
         min_exon_count=args.eval_exon_count,
         max_exon_count=args.eval_exon_count,
         min_exon_bases=args.min_exon_bases,
+        min_intron_length=args.min_intron_length,
         max_intron_length=args.max_intron_length,
         seed=args.eval_seed,
     )
@@ -797,6 +833,8 @@ def train(args: argparse.Namespace) -> None:
     print("predicted cds:", predicted_cds)
     print("protein codons:", examples[0]["protein_codons"])
     print("exon count:", examples[0]["exon_count"])
+    print("exon lengths:", examples[0]["exon_lengths"])
+    print("intron lengths:", examples[0]["intron_lengths"])
     print("genome length:", len(examples[0]["genome"]))
     print("attention entropy:", diagnostics["attention_entropy"].item())
     print("coordinate span:", diagnostics["coordinate_span"].item())
@@ -810,18 +848,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="auto", help="Device to use. Default requires CUDA via auto.")
     parser.add_argument("--steps", type=int, default=250_000)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--min-protein-codons", type=int, default=8)
-    parser.add_argument("--max-protein-codons", type=int, default=48)
-    parser.add_argument("--min-exon-count", type=int, default=1)
-    parser.add_argument("--max-exon-count", type=int, default=6)
-    parser.add_argument("--min-exon-bases", type=int, default=5)
-    parser.add_argument("--eval-protein-codons", type=int, default=24)
-    parser.add_argument("--eval-exon-count", type=int, default=3)
-    parser.add_argument("--max-intron-length", type=int, default=40)
-    parser.add_argument("--hidden-dim", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--min-protein-codons", type=int, default=96)
+    parser.add_argument("--max-protein-codons", type=int, default=256)
+    parser.add_argument("--min-exon-count", type=int, default=3)
+    parser.add_argument("--max-exon-count", type=int, default=10)
+    parser.add_argument("--min-exon-bases", type=int, default=15)
+    parser.add_argument("--eval-protein-codons", type=int, default=160)
+    parser.add_argument("--eval-exon-count", type=int, default=6)
+    parser.add_argument("--min-intron-length", type=int, default=200)
+    parser.add_argument("--max-intron-length", type=int, default=3_000)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=3)
-    parser.add_argument("--chunk-size", type=int, default=16)
+    parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--headdim", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-5)
