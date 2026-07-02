@@ -557,6 +557,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-exon-count must be at least 1")
     if args.eval_exon_count * args.min_exon_bases > args.eval_protein_codons * 3:
         raise ValueError("--eval-exon-count is too large for --eval-protein-codons and --min-exon-bases")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.micro_batch_size < 1:
+        raise ValueError("--micro-batch-size must be at least 1")
     if args.pointer_loss_weight < 0:
         raise ValueError("--pointer-loss-weight must be non-negative")
     if args.pointer_loss_anneal_steps < 0:
@@ -591,6 +595,7 @@ def train(args: argparse.Namespace) -> None:
         f"exons={args.min_exon_count}-{args.max_exon_count}, "
         f"introns={args.min_intron_length}-{args.max_intron_length} bp"
     )
+    print(f"effective batch size: {args.batch_size}; micro batch size: {args.micro_batch_size}")
 
     model = MambaSplicePointerTranslator(
         hidden_dim=args.hidden_dim,
@@ -654,84 +659,143 @@ def train(args: argparse.Namespace) -> None:
             end_step=args.pointer_loss_anneal_steps,
         )
 
-        dna, splice_tracks, target, target_mask, base_target, base_mask, pointer_target, transcript_bases, examples = make_batch(
-            batch_size=args.batch_size,
-            device=device,
-            min_protein_codons=args.min_protein_codons,
-            max_protein_codons=args.max_protein_codons,
-            min_exon_count=args.min_exon_count,
-            max_exon_count=args.max_exon_count,
-            min_exon_bases=args.min_exon_bases,
-            min_intron_length=args.min_intron_length,
-            max_intron_length=args.max_intron_length,
-            seed=args.batch_seed_offset + step,
-        )
-        amino_acid_probs, transcript_base_probs, _attention, pointer_logits, diagnostics = model(
-            dna,
-            splice_tracks,
-            transcript_bases=transcript_bases,
-        )
-        per_token_loss = F.nll_loss(
-            torch.log(amino_acid_probs).reshape(-1, len(AMINO_ACIDS)),
-            target.reshape(-1),
-            reduction="none",
-        ).reshape_as(target)
-        aa_loss = (per_token_loss * target_mask.to(per_token_loss.dtype)).sum() / target_mask.sum().clamp_min(1)
-        per_base_loss = F.nll_loss(
-            torch.log(transcript_base_probs.clamp_min(1e-8)).reshape(-1, len(DNA_BASES)),
-            base_target.reshape(-1),
-            reduction="none",
-        ).reshape_as(base_target)
-        nt_loss = (per_base_loss * base_mask.to(per_base_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
-        per_pointer_loss = F.cross_entropy(
-            pointer_logits.reshape(-1, pointer_logits.shape[-1]),
-            pointer_target.reshape(-1),
-            reduction="none",
-        ).reshape_as(pointer_target)
-        pointer_loss = (per_pointer_loss * base_mask.to(per_pointer_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
-        loss = aa_loss + args.nucleotide_loss_weight * nt_loss + pointer_loss_weight * pointer_loss
-
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        micro_batch_count = math.ceil(args.batch_size / args.micro_batch_size)
+        total_examples = 0
+        loss_sum = 0.0
+        aa_loss_sum = 0.0
+        nt_loss_sum = 0.0
+        pointer_loss_sum = 0.0
+        token_correct = 0
+        token_total = 0
+        exact_sum = 0.0
+        nucleotide_correct = 0
+        nucleotide_total = 0
+        nucleotide_exact_sum = 0.0
+        pointer_correct_total = 0
+        pointer_total = 0
+        pointer_exact_sum = 0.0
+        target_lengths_all = []
+        genome_lengths = []
+        intron_lengths = []
+        attention_entropy_sum = 0.0
+        coordinate_sharpness_sum = 0.0
+        coordinate_span_sum = 0.0
+        mean_exon_attention_sum = 0.0
+
+        for micro_batch_index in range(micro_batch_count):
+            micro_batch_size = min(
+                args.micro_batch_size,
+                args.batch_size - micro_batch_index * args.micro_batch_size,
+            )
+            dna, splice_tracks, target, target_mask, base_target, base_mask, pointer_target, transcript_bases, examples = make_batch(
+                batch_size=micro_batch_size,
+                device=device,
+                min_protein_codons=args.min_protein_codons,
+                max_protein_codons=args.max_protein_codons,
+                min_exon_count=args.min_exon_count,
+                max_exon_count=args.max_exon_count,
+                min_exon_bases=args.min_exon_bases,
+                min_intron_length=args.min_intron_length,
+                max_intron_length=args.max_intron_length,
+                seed=args.batch_seed_offset + step * micro_batch_count + micro_batch_index,
+            )
+            amino_acid_probs, transcript_base_probs, _attention, pointer_logits, diagnostics = model(
+                dna,
+                splice_tracks,
+                transcript_bases=transcript_bases,
+            )
+            per_token_loss = F.nll_loss(
+                torch.log(amino_acid_probs).reshape(-1, len(AMINO_ACIDS)),
+                target.reshape(-1),
+                reduction="none",
+            ).reshape_as(target)
+            aa_loss = (per_token_loss * target_mask.to(per_token_loss.dtype)).sum() / target_mask.sum().clamp_min(1)
+            per_base_loss = F.nll_loss(
+                torch.log(transcript_base_probs.clamp_min(1e-8)).reshape(-1, len(DNA_BASES)),
+                base_target.reshape(-1),
+                reduction="none",
+            ).reshape_as(base_target)
+            nt_loss = (per_base_loss * base_mask.to(per_base_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
+            per_pointer_loss = F.cross_entropy(
+                pointer_logits.reshape(-1, pointer_logits.shape[-1]),
+                pointer_target.reshape(-1),
+                reduction="none",
+            ).reshape_as(pointer_target)
+            pointer_loss = (per_pointer_loss * base_mask.to(per_pointer_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
+            loss = aa_loss + args.nucleotide_loss_weight * nt_loss + pointer_loss_weight * pointer_loss
+            loss_scale = float(micro_batch_size) / float(args.batch_size)
+            (loss * loss_scale).backward()
+
+            with torch.no_grad():
+                predicted = amino_acid_probs.argmax(dim=-1)
+                correct = (predicted == target) & target_mask
+                predicted_bases = transcript_base_probs.argmax(dim=-1)
+                base_correct = (predicted_bases == base_target) & base_mask
+                predicted_pointer = pointer_logits.argmax(dim=-1)
+                pointer_correct = (predicted_pointer == pointer_target) & base_mask
+                target_lengths = target_mask.sum(dim=1)
+
+                total_examples += micro_batch_size
+                loss_sum += loss.item() * micro_batch_size
+                aa_loss_sum += aa_loss.item() * micro_batch_size
+                nt_loss_sum += nt_loss.item() * micro_batch_size
+                pointer_loss_sum += pointer_loss.item() * micro_batch_size
+                token_correct += int(correct.sum().item())
+                token_total += int(target_mask.sum().item())
+                exact_sum += float(((predicted == target) | ~target_mask).all(dim=1).float().sum().item())
+                nucleotide_correct += int(base_correct.sum().item())
+                nucleotide_total += int(base_mask.sum().item())
+                nucleotide_exact_sum += float(((predicted_bases == base_target) | ~base_mask).all(dim=1).float().sum().item())
+                pointer_correct_total += int(pointer_correct.sum().item())
+                pointer_total += int(base_mask.sum().item())
+                pointer_exact_sum += float(((predicted_pointer == pointer_target) | ~base_mask).all(dim=1).float().sum().item())
+                target_lengths_all.extend(int(length) for length in target_lengths.tolist())
+                genome_lengths.extend(len(str(example["genome"])) for example in examples)
+                intron_lengths.extend(
+                    int(intron_length)
+                    for example in examples
+                    for intron_length in example["intron_lengths"]
+                )
+                attention_entropy_sum += diagnostics["attention_entropy"].item() * micro_batch_size
+                coordinate_sharpness_sum += diagnostics["coordinate_sharpness"].item() * micro_batch_size
+                coordinate_span_sum += diagnostics["coordinate_span"].item() * micro_batch_size
+                mean_exon_attention_sum += diagnostics["mean_exon_attention"].item() * micro_batch_size
+
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
-        with torch.no_grad():
-            predicted = amino_acid_probs.argmax(dim=-1)
-            correct = (predicted == target) & target_mask
-            token_accuracy = correct.sum().float().div(target_mask.sum().clamp_min(1)).item()
-            exact = ((predicted == target) | ~target_mask).all(dim=1).float().mean().item()
-            predicted_bases = transcript_base_probs.argmax(dim=-1)
-            base_correct = (predicted_bases == base_target) & base_mask
-            nucleotide_accuracy = base_correct.sum().float().div(base_mask.sum().clamp_min(1)).item()
-            nucleotide_exact = ((predicted_bases == base_target) | ~base_mask).all(dim=1).float().mean().item()
-            predicted_pointer = pointer_logits.argmax(dim=-1)
-            pointer_correct = (predicted_pointer == pointer_target) & base_mask
-            pointer_accuracy = pointer_correct.sum().float().div(base_mask.sum().clamp_min(1)).item()
-            pointer_exact = ((predicted_pointer == pointer_target) | ~base_mask).all(dim=1).float().mean().item()
-            target_lengths = target_mask.sum(dim=1)
-            mean_target_length = target_lengths.float().mean().item()
-            max_target_length = int(target_lengths.max().item())
-            genome_lengths = [len(str(example["genome"])) for example in examples]
-            intron_lengths = [
-                int(intron_length)
-                for example in examples
-                for intron_length in example["intron_lengths"]
-            ]
-            mean_genome_length = sum(genome_lengths) / len(genome_lengths)
-            max_genome_length = max(genome_lengths)
-            mean_intron_length = sum(intron_lengths) / len(intron_lengths) if intron_lengths else 0.0
-            max_intron_length = max(intron_lengths) if intron_lengths else 0
+        loss_value = loss_sum / max(1, total_examples)
+        aa_loss_value = aa_loss_sum / max(1, total_examples)
+        nt_loss_value = nt_loss_sum / max(1, total_examples)
+        pointer_loss_value = pointer_loss_sum / max(1, total_examples)
+        token_accuracy = token_correct / max(1, token_total)
+        exact = exact_sum / max(1, total_examples)
+        nucleotide_accuracy = nucleotide_correct / max(1, nucleotide_total)
+        nucleotide_exact = nucleotide_exact_sum / max(1, total_examples)
+        pointer_accuracy = pointer_correct_total / max(1, pointer_total)
+        pointer_exact = pointer_exact_sum / max(1, total_examples)
+        mean_target_length = sum(target_lengths_all) / max(1, len(target_lengths_all))
+        max_target_length = max(target_lengths_all) if target_lengths_all else 0
+        mean_genome_length = sum(genome_lengths) / max(1, len(genome_lengths))
+        max_genome_length = max(genome_lengths) if genome_lengths else 0
+        mean_intron_length = sum(intron_lengths) / len(intron_lengths) if intron_lengths else 0.0
+        max_intron_length = max(intron_lengths) if intron_lengths else 0
+        attention_entropy = attention_entropy_sum / max(1, total_examples)
+        coordinate_sharpness = coordinate_sharpness_sum / max(1, total_examples)
+        coordinate_span = coordinate_span_sum / max(1, total_examples)
+        mean_exon_attention = mean_exon_attention_sum / max(1, total_examples)
 
         final_metrics = {
             "step": step,
             "lr": lr,
-            "loss": loss.item(),
-            "aa_loss": aa_loss.item(),
-            "nt_loss": nt_loss.item(),
-            "pointer_loss": pointer_loss.item(),
+            "loss": loss_value,
+            "aa_loss": aa_loss_value,
+            "nt_loss": nt_loss_value,
+            "pointer_loss": pointer_loss_value,
             "pointer_loss_weight": pointer_loss_weight,
+            "micro_batch_size": args.micro_batch_size,
             "token_accuracy": token_accuracy,
             "exact_match": exact,
             "nucleotide_accuracy": nucleotide_accuracy,
@@ -744,16 +808,16 @@ def train(args: argparse.Namespace) -> None:
             "max_genome_length": max_genome_length,
             "mean_intron_length": mean_intron_length,
             "max_intron_length": max_intron_length,
-            "attention_entropy": diagnostics["attention_entropy"].item(),
-            "coordinate_sharpness": diagnostics["coordinate_sharpness"].item(),
-            "coordinate_span": diagnostics["coordinate_span"].item(),
-            "mean_exon_attention": diagnostics["mean_exon_attention"].item(),
+            "attention_entropy": attention_entropy,
+            "coordinate_sharpness": coordinate_sharpness,
+            "coordinate_span": coordinate_span,
+            "mean_exon_attention": mean_exon_attention,
         }
 
         is_final_step = step == args.steps - 1
         is_report_step = step % args.print_every == 0 or is_final_step
-        if args.save_best_checkpoint and is_report_step and loss.item() < best_loss:
-            best_loss = loss.item()
+        if args.save_best_checkpoint and is_report_step and loss_value < best_loss:
+            best_loss = loss_value
             best_path = checkpoint_dir / "best.pt"
             save_checkpoint(
                 best_path,
@@ -770,19 +834,20 @@ def train(args: argparse.Namespace) -> None:
 
         if is_report_step:
             print(
-                f"step={step:03d} lr={lr:.2e} loss={loss.item():.3f} "
-                f"aa_loss={aa_loss.item():.3f} nt_loss={nt_loss.item():.3f} "
-                f"ptr_loss={pointer_loss.item():.3f} ptr_w={pointer_loss_weight:.3f} "
+                f"step={step:03d} lr={lr:.2e} loss={loss_value:.3f} "
+                f"aa_loss={aa_loss_value:.3f} nt_loss={nt_loss_value:.3f} "
+                f"ptr_loss={pointer_loss_value:.3f} ptr_w={pointer_loss_weight:.3f} "
                 f"token_acc={token_accuracy:.3f} exact={exact:.3f} "
                 f"nt_acc={nucleotide_accuracy:.3f} nt_exact={nucleotide_exact:.3f} "
                 f"ptr_acc={pointer_accuracy:.3f} ptr_exact={pointer_exact:.3f} "
                 f"aa_len_mean={mean_target_length:.1f} aa_len_max={max_target_length} "
                 f"genome_len_mean={mean_genome_length:.0f} genome_len_max={max_genome_length} "
                 f"intron_len_mean={mean_intron_length:.0f} intron_len_max={max_intron_length} "
-                f"entropy={diagnostics['attention_entropy'].item():.3f} "
-                f"coord_span={diagnostics['coordinate_span'].item():.2f} "
-                f"coord_sharp={diagnostics['coordinate_sharpness'].item():.3f} "
-                f"exon_attention={diagnostics['mean_exon_attention'].item():.3f}",
+                f"micro_batch={args.micro_batch_size}/{args.batch_size} "
+                f"entropy={attention_entropy:.3f} "
+                f"coord_span={coordinate_span:.2f} "
+                f"coord_sharp={coordinate_sharpness:.3f} "
+                f"exon_attention={mean_exon_attention:.3f}",
                 flush=True,
             )
 
@@ -849,6 +914,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="Device to use. Default requires CUDA via auto.")
     parser.add_argument("--steps", type=int, default=250_000)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--micro-batch-size", type=int, default=4)
     parser.add_argument("--min-protein-codons", type=int, default=96)
     parser.add_argument("--max-protein-codons", type=int, default=256)
     parser.add_argument("--min-exon-count", type=int, default=3)
