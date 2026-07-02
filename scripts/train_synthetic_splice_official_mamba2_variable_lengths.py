@@ -320,8 +320,10 @@ class MambaSplicePointerTranslator(nn.Module):
         layers: int = 3,
         chunk_size: int = 16,
         headdim: int = 8,
+        use_prior_coordinate: bool = True,
     ):
         super().__init__()
+        self.use_prior_coordinate = use_prior_coordinate
         self.input_projection = nn.Linear(input_dim, hidden_dim)
         self.position_projection = nn.Sequential(
             nn.Linear(2, hidden_dim),
@@ -345,8 +347,8 @@ class MambaSplicePointerTranslator(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
-        self.content_scale = nn.Parameter(torch.tensor(0.2))
-        self.log_coordinate_sharpness = nn.Parameter(torch.tensor(-1.0))
+        self.content_scale = nn.Parameter(torch.tensor(0.0))
+        self.log_coordinate_sharpness = nn.Parameter(torch.tensor(2.0))
         self.exon_prior_scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor, transcript_bases: int):
@@ -364,15 +366,18 @@ class MambaSplicePointerTranslator(nn.Module):
         )
         encoded = self.scan_blocks(encoded)
 
-        coordinate_step = F.softplus(self.coordinate_step_head(encoded).squeeze(-1))
-        coordinate_step = coordinate_step * exon_prior.squeeze(-1)
+        if self.use_prior_coordinate:
+            coordinate_step = exon_prior.squeeze(-1)
+        else:
+            coordinate_step = F.softplus(self.coordinate_step_head(encoded).squeeze(-1))
+            coordinate_step = coordinate_step * exon_prior.squeeze(-1)
         latent_coordinate = torch.cumsum(coordinate_step, dim=1)
-        latent_coordinate = latent_coordinate / latent_coordinate[:, -1:].clamp_min(1e-6)
 
         target_index = torch.arange(transcript_bases, device=dna_one_hot.device)
-        target_coordinate = torch.linspace(0, 1, transcript_bases, device=dna_one_hot.device)
+        target_coordinate = target_index.to(dtype=encoded.dtype) + 1.0
         target_frame = F.one_hot(target_index % 3, num_classes=3).to(dtype=encoded.dtype)
-        query_features = torch.cat([target_coordinate[:, None], target_frame], dim=-1)
+        query_coordinate = target_coordinate / float(transcript_bases)
+        query_features = torch.cat([query_coordinate[:, None], target_frame], dim=-1)
         query = self.query_projection(query_features)
         content_logits = torch.einsum("bld,td->btl", encoded, query) / math.sqrt(encoded.shape[-1])
 
@@ -626,12 +631,14 @@ def train(args: argparse.Namespace) -> None:
         f"effective batch size: {args.batch_size}; micro batch size: {effective_micro_batch_size}; "
         f"micro batch mode: {micro_batch_mode}; length bucket: {args.length_bucket_size} bp"
     )
+    print("coordinate mode: exon-prior renderer" if not args.learn_coordinate else "coordinate mode: learned Mamba coordinate")
 
     model = MambaSplicePointerTranslator(
         hidden_dim=args.hidden_dim,
         layers=args.layers,
         chunk_size=args.chunk_size,
         headdim=args.headdim,
+        use_prior_coordinate=not args.learn_coordinate,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -963,6 +970,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--headdim", type=int, default=8)
+    parser.add_argument("--learn-coordinate", action="store_true")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-5)
     parser.add_argument("--warmup-steps", type=int, default=500)
