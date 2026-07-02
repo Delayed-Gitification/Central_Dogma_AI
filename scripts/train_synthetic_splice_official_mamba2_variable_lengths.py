@@ -472,7 +472,10 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> tuple[int, float, dict[str, float | int] | None]:
-    checkpoint = torch.load(path, map_location=device)
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     if "torch_rng_state" in checkpoint:
@@ -485,6 +488,42 @@ def load_checkpoint(
     if final_metrics is not None and not isinstance(final_metrics, dict):
         final_metrics = None
     return start_step, best_loss, final_metrics
+
+
+def maybe_save_checkpoint(
+    *,
+    step: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    final_metrics: dict[str, float | int] | None,
+    best_loss: float,
+    checkpoint_dir: Path,
+    is_final_step: bool,
+) -> None:
+    should_save_latest = args.checkpoint_every > 0 and ((step + 1) % args.checkpoint_every == 0 or is_final_step)
+    should_save_numbered = args.checkpoint_keep_every > 0 and (
+        (step + 1) % args.checkpoint_keep_every == 0 or is_final_step
+    )
+    if not should_save_latest and not should_save_numbered:
+        return
+
+    payload = checkpoint_payload(
+        step=step,
+        model=model,
+        optimizer=optimizer,
+        args=args,
+        final_metrics=final_metrics,
+        best_loss=best_loss,
+    )
+    if should_save_latest:
+        latest_path = checkpoint_dir / "latest.pt"
+        save_checkpoint(latest_path, payload)
+        print(f"saved checkpoint: {latest_path}", flush=True)
+    if should_save_numbered:
+        numbered_path = checkpoint_dir / f"step_{step + 1:09d}.pt"
+        save_checkpoint(numbered_path, payload)
+        print(f"saved checkpoint: {numbered_path}", flush=True)
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -510,6 +549,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--pointer-loss-weight must be non-negative")
     if args.pointer_loss_anneal_steps < 0:
         raise ValueError("--pointer-loss-anneal-steps must be non-negative")
+    if args.print_every < 1:
+        raise ValueError("--print-every must be at least 1")
+    if args.checkpoint_every < 0:
+        raise ValueError("--checkpoint-every must be non-negative")
+    if args.checkpoint_keep_every < 0:
+        raise ValueError("--checkpoint-keep-every must be non-negative")
 
 
 def train(args: argparse.Namespace) -> None:
@@ -542,8 +587,40 @@ def train(args: argparse.Namespace) -> None:
         weight_decay=args.weight_decay,
     )
 
+    checkpoint_dir = resolve_checkpoint_path(args.checkpoint_dir)
+    checkpointing_enabled = (
+        args.checkpoint_every > 0 or args.checkpoint_keep_every > 0 or args.save_best_checkpoint
+    )
+    if checkpointing_enabled:
+        print(f"checkpoint directory: {checkpoint_dir}")
+
+    start_step = 0
+    best_loss = float("inf")
     final_metrics = None
-    for step in range(args.steps):
+    resume_path = None
+    if args.resume_from:
+        resume_path = resolve_checkpoint_path(args.resume_from)
+    elif args.auto_resume:
+        latest_path = checkpoint_dir / "latest.pt"
+        if latest_path.exists():
+            resume_path = latest_path
+
+    if resume_path is not None:
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Checkpoint does not exist: {resume_path}")
+        start_step, best_loss, final_metrics = load_checkpoint(
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            device=device,
+        )
+        print(f"resumed checkpoint: {resume_path}")
+        print(f"resuming from step={start_step} with best_loss={best_loss:.6f}")
+
+    if start_step >= args.steps:
+        print(f"checkpoint has already reached requested --steps={args.steps}; skipping training loop")
+
+    for step in range(start_step, args.steps):
         lr = get_lr(
             step=step,
             total_steps=args.steps,
@@ -640,7 +717,25 @@ def train(args: argparse.Namespace) -> None:
             "mean_exon_attention": diagnostics["mean_exon_attention"].item(),
         }
 
-        if step % args.print_every == 0 or step == args.steps - 1:
+        is_final_step = step == args.steps - 1
+        is_report_step = step % args.print_every == 0 or is_final_step
+        if args.save_best_checkpoint and is_report_step and loss.item() < best_loss:
+            best_loss = loss.item()
+            best_path = checkpoint_dir / "best.pt"
+            save_checkpoint(
+                best_path,
+                checkpoint_payload(
+                    step=step,
+                    model=model,
+                    optimizer=optimizer,
+                    args=args,
+                    final_metrics=final_metrics,
+                    best_loss=best_loss,
+                ),
+            )
+            print(f"saved best checkpoint: {best_path}", flush=True)
+
+        if is_report_step:
             print(
                 f"step={step:03d} lr={lr:.2e} loss={loss.item():.3f} "
                 f"aa_loss={aa_loss.item():.3f} nt_loss={nt_loss.item():.3f} "
@@ -655,6 +750,17 @@ def train(args: argparse.Namespace) -> None:
                 f"exon_attention={diagnostics['mean_exon_attention'].item():.3f}",
                 flush=True,
             )
+
+        maybe_save_checkpoint(
+            step=step,
+            model=model,
+            optimizer=optimizer,
+            args=args,
+            final_metrics=final_metrics,
+            best_loss=best_loss,
+            checkpoint_dir=checkpoint_dir,
+            is_final_step=is_final_step,
+        )
 
     dna, splice_tracks, _target, target_mask, base_target, base_mask, _pointer_target, transcript_bases, examples = make_batch(
         batch_size=1,
@@ -732,6 +838,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-seed-offset", type=int, default=10_000)
     parser.add_argument("--eval-seed", type=int, default=123_456)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--checkpoint-dir", default="checkpoints/synthetic_splice_official_mamba2_variable_lengths")
+    parser.add_argument("--checkpoint-every", type=int, default=1_000)
+    parser.add_argument("--checkpoint-keep-every", type=int, default=10_000)
+    parser.add_argument("--save-best-checkpoint", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--resume-from", default="")
     return parser.parse_args()
 
 
