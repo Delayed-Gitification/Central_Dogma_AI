@@ -152,6 +152,7 @@ def make_batch(
     min_exon_bases: int = 5,
     min_intron_length: int = 200,
     max_intron_length: int = 3_000,
+    length_bucket_size: int = 1_024,
     seed: int | None = None,
 ) -> tuple[
     torch.Tensor,
@@ -181,7 +182,7 @@ def make_batch(
                 min_exon_bases=min_exon_bases,
             )
         )
-    max_length = max(example["dna"].shape[0] for example in examples)
+    max_length = round_up_to_multiple(max(example["dna"].shape[0] for example in examples), length_bucket_size)
     max_target_length = max(example["target"].shape[0] for example in examples)
     max_transcript_bases = max_target_length * 3
 
@@ -437,6 +438,26 @@ def get_linear_annealed_weight(step: int, start_weight: float, end_step: int) ->
     return start_weight * (1.0 - float(step) / float(end_step))
 
 
+def round_up_to_multiple(value: int, multiple: int) -> int:
+    if multiple <= 0:
+        return value
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def estimate_max_genome_length(args: argparse.Namespace) -> int:
+    max_cds_bases = args.max_protein_codons * 3
+    max_intronic_bases = max(0, args.max_exon_count - 1) * args.max_intron_length
+    return max_cds_bases + max_intronic_bases
+
+
+def resolve_micro_batch_size(args: argparse.Namespace) -> int:
+    if args.micro_batch_size > 0:
+        return min(args.batch_size, args.micro_batch_size)
+    estimated_length = max(1, estimate_max_genome_length(args))
+    token_limited_size = max(1, args.max_micro_batch_tokens // estimated_length)
+    return min(args.batch_size, token_limited_size)
+
+
 def resolve_checkpoint_path(path: str | Path) -> Path:
     checkpoint_path = Path(path).expanduser()
     if not checkpoint_path.is_absolute():
@@ -559,8 +580,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-exon-count is too large for --eval-protein-codons and --min-exon-bases")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
-    if args.micro_batch_size < 1:
-        raise ValueError("--micro-batch-size must be at least 1")
+    if args.micro_batch_size < 0:
+        raise ValueError("--micro-batch-size must be non-negative; use 0 for auto")
+    if args.max_micro_batch_tokens < 1:
+        raise ValueError("--max-micro-batch-tokens must be at least 1")
+    if args.length_bucket_size < 0:
+        raise ValueError("--length-bucket-size must be non-negative")
     if args.pointer_loss_weight < 0:
         raise ValueError("--pointer-loss-weight must be non-negative")
     if args.pointer_loss_anneal_steps < 0:
@@ -595,7 +620,12 @@ def train(args: argparse.Namespace) -> None:
         f"exons={args.min_exon_count}-{args.max_exon_count}, "
         f"introns={args.min_intron_length}-{args.max_intron_length} bp"
     )
-    print(f"effective batch size: {args.batch_size}; micro batch size: {args.micro_batch_size}")
+    effective_micro_batch_size = resolve_micro_batch_size(args)
+    micro_batch_mode = "auto" if args.micro_batch_size == 0 else "manual"
+    print(
+        f"effective batch size: {args.batch_size}; micro batch size: {effective_micro_batch_size}; "
+        f"micro batch mode: {micro_batch_mode}; length bucket: {args.length_bucket_size} bp"
+    )
 
     model = MambaSplicePointerTranslator(
         hidden_dim=args.hidden_dim,
@@ -660,7 +690,7 @@ def train(args: argparse.Namespace) -> None:
         )
 
         optimizer.zero_grad(set_to_none=True)
-        micro_batch_count = math.ceil(args.batch_size / args.micro_batch_size)
+        micro_batch_count = math.ceil(args.batch_size / effective_micro_batch_size)
         total_examples = 0
         loss_sum = 0.0
         aa_loss_sum = 0.0
@@ -685,8 +715,8 @@ def train(args: argparse.Namespace) -> None:
 
         for micro_batch_index in range(micro_batch_count):
             micro_batch_size = min(
-                args.micro_batch_size,
-                args.batch_size - micro_batch_index * args.micro_batch_size,
+                effective_micro_batch_size,
+                args.batch_size - micro_batch_index * effective_micro_batch_size,
             )
             dna, splice_tracks, target, target_mask, base_target, base_mask, pointer_target, transcript_bases, examples = make_batch(
                 batch_size=micro_batch_size,
@@ -698,6 +728,7 @@ def train(args: argparse.Namespace) -> None:
                 min_exon_bases=args.min_exon_bases,
                 min_intron_length=args.min_intron_length,
                 max_intron_length=args.max_intron_length,
+                length_bucket_size=args.length_bucket_size,
                 seed=args.batch_seed_offset + step * micro_batch_count + micro_batch_index,
             )
             amino_acid_probs, transcript_base_probs, _attention, pointer_logits, diagnostics = model(
@@ -795,7 +826,8 @@ def train(args: argparse.Namespace) -> None:
             "nt_loss": nt_loss_value,
             "pointer_loss": pointer_loss_value,
             "pointer_loss_weight": pointer_loss_weight,
-            "micro_batch_size": args.micro_batch_size,
+            "micro_batch_size": effective_micro_batch_size,
+            "length_bucket_size": args.length_bucket_size,
             "token_accuracy": token_accuracy,
             "exact_match": exact,
             "nucleotide_accuracy": nucleotide_accuracy,
@@ -843,7 +875,7 @@ def train(args: argparse.Namespace) -> None:
                 f"aa_len_mean={mean_target_length:.1f} aa_len_max={max_target_length} "
                 f"genome_len_mean={mean_genome_length:.0f} genome_len_max={max_genome_length} "
                 f"intron_len_mean={mean_intron_length:.0f} intron_len_max={max_intron_length} "
-                f"micro_batch={args.micro_batch_size}/{args.batch_size} "
+                f"micro_batch={effective_micro_batch_size}/{args.batch_size} "
                 f"entropy={attention_entropy:.3f} "
                 f"coord_span={coordinate_span:.2f} "
                 f"coord_sharp={coordinate_sharpness:.3f} "
@@ -872,6 +904,7 @@ def train(args: argparse.Namespace) -> None:
         min_exon_bases=args.min_exon_bases,
         min_intron_length=args.min_intron_length,
         max_intron_length=args.max_intron_length,
+        length_bucket_size=args.length_bucket_size,
         seed=args.eval_seed,
     )
     model.eval()
@@ -914,7 +947,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="Device to use. Default requires CUDA via auto.")
     parser.add_argument("--steps", type=int, default=250_000)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--micro-batch-size", type=int, default=4)
+    parser.add_argument("--micro-batch-size", type=int, default=0, help="Per-forward batch size. Use 0 for auto.")
+    parser.add_argument("--max-micro-batch-tokens", type=int, default=500_000)
     parser.add_argument("--min-protein-codons", type=int, default=96)
     parser.add_argument("--max-protein-codons", type=int, default=256)
     parser.add_argument("--min-exon-count", type=int, default=3)
@@ -924,6 +958,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-exon-count", type=int, default=6)
     parser.add_argument("--min-intron-length", type=int, default=200)
     parser.add_argument("--max-intron-length", type=int, default=3_000)
+    parser.add_argument("--length-bucket-size", type=int, default=1_024)
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=32)
