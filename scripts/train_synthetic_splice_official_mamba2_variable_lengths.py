@@ -409,6 +409,7 @@ class MambaSplicePointerTranslator(nn.Module):
         ).mean()
 
         return amino_acid_probs, transcript_base_probs, attention, pointer_logits, {
+            "attention_entropy_loss": attention_entropy,
             "attention_entropy": attention_entropy.detach(),
             "coordinate_sharpness": coordinate_sharpness.detach(),
             "coordinate_span": coordinate_span.detach(),
@@ -564,6 +565,220 @@ def maybe_save_checkpoint(
         print(f"saved checkpoint: {numbered_path}", flush=True)
 
 
+def empty_failure_stats() -> dict[str, float]:
+    return {
+        "examples": 0.0,
+        "failed_examples": 0.0,
+        "failed_target_bases_sum": 0.0,
+        "failed_exon_count_sum": 0.0,
+        "failed_max_intron_sum": 0.0,
+        "failed_first_error_sum": 0.0,
+        "failed_first_error_count": 0.0,
+        "pointer_error_distance_sum": 0.0,
+        "pointer_error_count": 0.0,
+        "junction_pointer_correct": 0.0,
+        "junction_pointer_total": 0.0,
+    }
+
+
+def merge_failure_stats(total: dict[str, float], update: dict[str, float]) -> None:
+    for key, value in update.items():
+        total[key] = total.get(key, 0.0) + float(value)
+
+
+def exon_junction_positions(exon_lengths: list[int], window: int) -> set[int]:
+    if window < 0:
+        window = 0
+    junction_positions = set()
+    cursor = 0
+    for exon_length in exon_lengths[:-1]:
+        cursor += int(exon_length)
+        for position in range(cursor - window, cursor + window + 1):
+            if position >= 0:
+                junction_positions.add(position)
+    return junction_positions
+
+
+def summarize_failures(
+    *,
+    predicted_bases: torch.Tensor,
+    base_target: torch.Tensor,
+    base_mask: torch.Tensor,
+    predicted_pointer: torch.Tensor,
+    pointer_target: torch.Tensor,
+    examples: list[dict[str, object]],
+    junction_window: int,
+) -> dict[str, float]:
+    stats = empty_failure_stats()
+    stats["examples"] = float(len(examples))
+
+    predicted_bases_cpu = predicted_bases.detach().cpu()
+    base_target_cpu = base_target.detach().cpu()
+    base_mask_cpu = base_mask.detach().cpu()
+    predicted_pointer_cpu = predicted_pointer.detach().cpu()
+    pointer_target_cpu = pointer_target.detach().cpu()
+
+    base_exact = ((predicted_bases_cpu == base_target_cpu) | ~base_mask_cpu).all(dim=1)
+    for index, example in enumerate(examples):
+        valid_mask = base_mask_cpu[index]
+        valid_positions = torch.nonzero(valid_mask, as_tuple=False).flatten()
+        if valid_positions.numel() == 0:
+            continue
+
+        pointer_wrong = (predicted_pointer_cpu[index] != pointer_target_cpu[index]) & valid_mask
+        if pointer_wrong.any():
+            pointer_distances = (
+                predicted_pointer_cpu[index][pointer_wrong] - pointer_target_cpu[index][pointer_wrong]
+            ).abs()
+            stats["pointer_error_distance_sum"] += float(pointer_distances.sum().item())
+            stats["pointer_error_count"] += float(pointer_distances.numel())
+
+        junction_positions = exon_junction_positions(list(example["exon_lengths"]), junction_window)
+        if junction_positions:
+            near_junction = torch.zeros_like(valid_mask)
+            for position in junction_positions:
+                if position < near_junction.numel():
+                    near_junction[position] = True
+            near_junction &= valid_mask
+            if near_junction.any():
+                junction_correct = predicted_pointer_cpu[index][near_junction] == pointer_target_cpu[index][near_junction]
+                stats["junction_pointer_correct"] += float(junction_correct.sum().item())
+                stats["junction_pointer_total"] += float(junction_correct.numel())
+
+        if bool(base_exact[index]):
+            continue
+
+        base_wrong = (predicted_bases_cpu[index] != base_target_cpu[index]) & valid_mask
+        first_error = torch.nonzero(base_wrong, as_tuple=False).flatten()
+        stats["failed_examples"] += 1.0
+        stats["failed_target_bases_sum"] += float(valid_positions.numel())
+        stats["failed_exon_count_sum"] += float(example["exon_count"])
+        intron_lengths = list(example["intron_lengths"])
+        stats["failed_max_intron_sum"] += float(max(intron_lengths) if intron_lengths else 0)
+        if first_error.numel() > 0:
+            stats["failed_first_error_sum"] += float(first_error[0].item())
+            stats["failed_first_error_count"] += 1.0
+
+    return stats
+
+
+def failure_metrics(stats: dict[str, float]) -> dict[str, float]:
+    failed_examples = max(1.0, stats["failed_examples"])
+    pointer_error_count = max(1.0, stats["pointer_error_count"])
+    junction_total = max(1.0, stats["junction_pointer_total"])
+    first_error_count = max(1.0, stats["failed_first_error_count"])
+    return {
+        "failure_rate": stats["failed_examples"] / max(1.0, stats["examples"]),
+        "failed_target_bases_mean": stats["failed_target_bases_sum"] / failed_examples,
+        "failed_exon_count_mean": stats["failed_exon_count_sum"] / failed_examples,
+        "failed_max_intron_mean": stats["failed_max_intron_sum"] / failed_examples,
+        "failed_first_error_mean": stats["failed_first_error_sum"] / first_error_count,
+        "pointer_error_distance_mean": stats["pointer_error_distance_sum"] / pointer_error_count,
+        "junction_pointer_accuracy": stats["junction_pointer_correct"] / junction_total,
+        "junction_pointer_total": stats["junction_pointer_total"],
+    }
+
+
+def evaluate_model_batch(
+    *,
+    model: nn.Module,
+    batch: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        list[dict[str, object]],
+    ],
+    args: argparse.Namespace,
+    pointer_loss_weight: float,
+) -> dict[str, float]:
+    dna, splice_tracks, target, target_mask, base_target, base_mask, pointer_target, transcript_bases, examples = batch
+    amino_acid_probs, transcript_base_probs, attention, pointer_logits, diagnostics = model(
+        dna,
+        splice_tracks,
+        transcript_bases=transcript_bases,
+    )
+    per_token_loss = F.nll_loss(
+        torch.log(amino_acid_probs).reshape(-1, len(AMINO_ACIDS)),
+        target.reshape(-1),
+        reduction="none",
+    ).reshape_as(target)
+    aa_loss = (per_token_loss * target_mask.to(per_token_loss.dtype)).sum() / target_mask.sum().clamp_min(1)
+    per_base_loss = F.nll_loss(
+        torch.log(transcript_base_probs.clamp_min(1e-8)).reshape(-1, len(DNA_BASES)),
+        base_target.reshape(-1),
+        reduction="none",
+    ).reshape_as(base_target)
+    nt_loss = (per_base_loss * base_mask.to(per_base_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
+    per_pointer_loss = F.cross_entropy(
+        pointer_logits.reshape(-1, pointer_logits.shape[-1]),
+        pointer_target.reshape(-1),
+        reduction="none",
+    ).reshape_as(pointer_target)
+    pointer_loss = (per_pointer_loss * base_mask.to(per_pointer_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
+    loss = (
+        aa_loss
+        + args.nucleotide_loss_weight * nt_loss
+        + pointer_loss_weight * pointer_loss
+        + args.attention_entropy_weight * diagnostics["attention_entropy_loss"]
+    )
+
+    predicted = amino_acid_probs.argmax(dim=-1)
+    predicted_bases = transcript_base_probs.argmax(dim=-1)
+    predicted_pointer = pointer_logits.argmax(dim=-1)
+    token_correct = ((predicted == target) & target_mask).sum()
+    base_correct = ((predicted_bases == base_target) & base_mask).sum()
+    pointer_correct = ((predicted_pointer == pointer_target) & base_mask).sum()
+    exact = ((predicted == target) | ~target_mask).all(dim=1).float().mean()
+    nucleotide_exact = ((predicted_bases == base_target) | ~base_mask).all(dim=1).float().mean()
+    pointer_exact = ((predicted_pointer == pointer_target) | ~base_mask).all(dim=1).float().mean()
+    aa_confidence = (
+        amino_acid_probs.max(dim=-1).values * target_mask.to(amino_acid_probs.dtype)
+    ).sum() / target_mask.sum().clamp_min(1)
+    nucleotide_confidence = (
+        transcript_base_probs.max(dim=-1).values * base_mask.to(transcript_base_probs.dtype)
+    ).sum() / base_mask.sum().clamp_min(1)
+    attention_confidence = (
+        attention.max(dim=-1).values * base_mask.to(attention.dtype)
+    ).sum() / base_mask.sum().clamp_min(1)
+
+    stats = summarize_failures(
+        predicted_bases=predicted_bases,
+        base_target=base_target,
+        base_mask=base_mask,
+        predicted_pointer=predicted_pointer,
+        pointer_target=pointer_target,
+        examples=examples,
+        junction_window=args.failure_junction_window,
+    )
+    failure = failure_metrics(stats)
+
+    return {
+        "loss": float(loss.item()),
+        "aa_loss": float(aa_loss.item()),
+        "nt_loss": float(nt_loss.item()),
+        "pointer_loss": float(pointer_loss.item()),
+        "token_accuracy": float(token_correct.item()) / max(1, int(target_mask.sum().item())),
+        "exact_match": float(exact.item()),
+        "nucleotide_accuracy": float(base_correct.item()) / max(1, int(base_mask.sum().item())),
+        "nucleotide_exact_match": float(nucleotide_exact.item()),
+        "pointer_accuracy": float(pointer_correct.item()) / max(1, int(base_mask.sum().item())),
+        "pointer_exact_match": float(pointer_exact.item()),
+        "aa_confidence": float(aa_confidence.item()),
+        "nucleotide_confidence": float(nucleotide_confidence.item()),
+        "attention_confidence": float(attention_confidence.item()),
+        "attention_entropy": float(diagnostics["attention_entropy"].item()),
+        "coordinate_sharpness": float(diagnostics["coordinate_sharpness"].item()),
+        "coordinate_span": float(diagnostics["coordinate_span"].item()),
+        "mean_exon_attention": float(diagnostics["mean_exon_attention"].item()),
+        **failure,
+    }
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.min_protein_codons < 1:
         raise ValueError("--min-protein-codons must be at least 1")
@@ -587,6 +802,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-exon-count is too large for --eval-protein-codons and --min-exon-bases")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
+    if args.validation_batch_size < 0:
+        raise ValueError("--validation-batch-size must be non-negative; use 0 to disable fixed validation")
+    if args.failure_junction_window < 0:
+        raise ValueError("--failure-junction-window must be non-negative")
     if args.micro_batch_size < 0:
         raise ValueError("--micro-batch-size must be non-negative; use 0 for auto")
     if args.max_micro_batch_tokens < 1:
@@ -597,6 +816,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--pointer-loss-weight must be non-negative")
     if args.pointer_loss_anneal_steps < 0:
         raise ValueError("--pointer-loss-anneal-steps must be non-negative")
+    if args.attention_entropy_weight < 0:
+        raise ValueError("--attention-entropy-weight must be non-negative")
     if args.max_coordinate_sharpness <= 0:
         raise ValueError("--max-coordinate-sharpness must be positive")
     if not 0 <= args.loss_ema_beta < 1:
@@ -666,6 +887,26 @@ def train(args: argparse.Namespace) -> None:
     )
     if checkpointing_enabled:
         print(f"checkpoint directory: {checkpoint_dir}")
+
+    validation_batch = None
+    if args.validation_batch_size > 0:
+        validation_batch = make_batch(
+            batch_size=args.validation_batch_size,
+            device=device,
+            min_protein_codons=args.min_protein_codons,
+            max_protein_codons=args.max_protein_codons,
+            min_exon_count=args.min_exon_count,
+            max_exon_count=args.max_exon_count,
+            min_exon_bases=args.min_exon_bases,
+            min_intron_length=args.min_intron_length,
+            max_intron_length=args.max_intron_length,
+            length_bucket_size=args.length_bucket_size,
+            seed=args.validation_seed,
+        )
+        print(
+            f"fixed validation batch: size={args.validation_batch_size}; seed={args.validation_seed}; "
+            f"junction window={args.failure_junction_window} transcript bases"
+        )
 
     start_step = 0
     best_loss = float("inf")
@@ -740,9 +981,13 @@ def train(args: argparse.Namespace) -> None:
         genome_lengths = []
         intron_lengths = []
         attention_entropy_sum = 0.0
+        aa_confidence_sum = 0.0
+        nucleotide_confidence_sum = 0.0
+        attention_confidence_sum = 0.0
         coordinate_sharpness_sum = 0.0
         coordinate_span_sum = 0.0
         mean_exon_attention_sum = 0.0
+        train_failure_stats = empty_failure_stats()
 
         for micro_batch_index in range(micro_batch_count):
             micro_batch_size = min(
@@ -762,7 +1007,7 @@ def train(args: argparse.Namespace) -> None:
                 length_bucket_size=args.length_bucket_size,
                 seed=args.batch_seed_offset + step * micro_batch_count + micro_batch_index,
             )
-            amino_acid_probs, transcript_base_probs, _attention, pointer_logits, diagnostics = model(
+            amino_acid_probs, transcript_base_probs, attention, pointer_logits, diagnostics = model(
                 dna,
                 splice_tracks,
                 transcript_bases=transcript_bases,
@@ -785,17 +1030,26 @@ def train(args: argparse.Namespace) -> None:
                 reduction="none",
             ).reshape_as(pointer_target)
             pointer_loss = (per_pointer_loss * base_mask.to(per_pointer_loss.dtype)).sum() / base_mask.sum().clamp_min(1)
-            loss = aa_loss + args.nucleotide_loss_weight * nt_loss + pointer_loss_weight * pointer_loss
+            entropy_loss = args.attention_entropy_weight * diagnostics["attention_entropy_loss"]
+            loss = (
+                aa_loss
+                + args.nucleotide_loss_weight * nt_loss
+                + pointer_loss_weight * pointer_loss
+                + entropy_loss
+            )
             loss_scale = float(micro_batch_size) / float(args.batch_size)
             (loss * loss_scale).backward()
 
             with torch.no_grad():
                 predicted = amino_acid_probs.argmax(dim=-1)
                 correct = (predicted == target) & target_mask
+                aa_confidence = amino_acid_probs.max(dim=-1).values
                 predicted_bases = transcript_base_probs.argmax(dim=-1)
                 base_correct = (predicted_bases == base_target) & base_mask
+                nucleotide_confidence = transcript_base_probs.max(dim=-1).values
                 predicted_pointer = pointer_logits.argmax(dim=-1)
                 pointer_correct = (predicted_pointer == pointer_target) & base_mask
+                attention_confidence = attention.max(dim=-1).values
                 target_lengths = target_mask.sum(dim=1)
 
                 total_examples += micro_batch_size
@@ -812,6 +1066,27 @@ def train(args: argparse.Namespace) -> None:
                 pointer_correct_total += int(pointer_correct.sum().item())
                 pointer_total += int(base_mask.sum().item())
                 pointer_exact_sum += float(((predicted_pointer == pointer_target) | ~base_mask).all(dim=1).float().sum().item())
+                merge_failure_stats(
+                    train_failure_stats,
+                    summarize_failures(
+                        predicted_bases=predicted_bases,
+                        base_target=base_target,
+                        base_mask=base_mask,
+                        predicted_pointer=predicted_pointer,
+                        pointer_target=pointer_target,
+                        examples=examples,
+                        junction_window=args.failure_junction_window,
+                    ),
+                )
+                aa_confidence_sum += float(
+                    (aa_confidence * target_mask.to(aa_confidence.dtype)).sum().item()
+                )
+                nucleotide_confidence_sum += float(
+                    (nucleotide_confidence * base_mask.to(nucleotide_confidence.dtype)).sum().item()
+                )
+                attention_confidence_sum += float(
+                    (attention_confidence * base_mask.to(attention_confidence.dtype)).sum().item()
+                )
                 target_lengths_all.extend(int(length) for length in target_lengths.tolist())
                 genome_lengths.extend(len(str(example["genome"])) for example in examples)
                 intron_lengths.extend(
@@ -838,6 +1113,9 @@ def train(args: argparse.Namespace) -> None:
         nucleotide_exact = nucleotide_exact_sum / max(1, total_examples)
         pointer_accuracy = pointer_correct_total / max(1, pointer_total)
         pointer_exact = pointer_exact_sum / max(1, total_examples)
+        aa_confidence = aa_confidence_sum / max(1, token_total)
+        nucleotide_confidence = nucleotide_confidence_sum / max(1, nucleotide_total)
+        attention_confidence = attention_confidence_sum / max(1, pointer_total)
         mean_target_length = sum(target_lengths_all) / max(1, len(target_lengths_all))
         max_target_length = max(target_lengths_all) if target_lengths_all else 0
         mean_genome_length = sum(genome_lengths) / max(1, len(genome_lengths))
@@ -848,6 +1126,7 @@ def train(args: argparse.Namespace) -> None:
         coordinate_sharpness = coordinate_sharpness_sum / max(1, total_examples)
         coordinate_span = coordinate_span_sum / max(1, total_examples)
         mean_exon_attention = mean_exon_attention_sum / max(1, total_examples)
+        train_failure = failure_metrics(train_failure_stats)
         loss_ema = loss_value if loss_ema is None else args.loss_ema_beta * loss_ema + (1.0 - args.loss_ema_beta) * loss_value
         if (
             success_lr_multiplier > args.success_lr_decay
@@ -880,6 +1159,9 @@ def train(args: argparse.Namespace) -> None:
             "nucleotide_exact_match": nucleotide_exact,
             "pointer_accuracy": pointer_accuracy,
             "pointer_exact_match": pointer_exact,
+            "aa_confidence": aa_confidence,
+            "nucleotide_confidence": nucleotide_confidence,
+            "attention_confidence": attention_confidence,
             "mean_target_length": mean_target_length,
             "max_target_length": max_target_length,
             "mean_genome_length": mean_genome_length,
@@ -890,10 +1172,31 @@ def train(args: argparse.Namespace) -> None:
             "coordinate_sharpness": coordinate_sharpness,
             "coordinate_span": coordinate_span,
             "mean_exon_attention": mean_exon_attention,
+            "failure_rate": train_failure["failure_rate"],
+            "failed_target_bases_mean": train_failure["failed_target_bases_mean"],
+            "failed_exon_count_mean": train_failure["failed_exon_count_mean"],
+            "failed_max_intron_mean": train_failure["failed_max_intron_mean"],
+            "failed_first_error_mean": train_failure["failed_first_error_mean"],
+            "pointer_error_distance_mean": train_failure["pointer_error_distance_mean"],
+            "junction_pointer_accuracy": train_failure["junction_pointer_accuracy"],
+            "junction_pointer_total": train_failure["junction_pointer_total"],
         }
 
         is_final_step = step == args.steps - 1
         is_report_step = step % args.print_every == 0 or is_final_step
+        validation_metrics = None
+        if is_report_step and validation_batch is not None:
+            model.eval()
+            with torch.no_grad():
+                validation_metrics = evaluate_model_batch(
+                    model=model,
+                    batch=validation_batch,
+                    args=args,
+                    pointer_loss_weight=pointer_loss_weight,
+                )
+            model.train()
+            final_metrics.update({f"validation_{key}": value for key, value in validation_metrics.items()})
+
         if args.save_best_checkpoint and is_report_step and loss_value < best_loss:
             best_loss = loss_value
             best_path = checkpoint_dir / "best.pt"
@@ -919,6 +1222,8 @@ def train(args: argparse.Namespace) -> None:
                 f"token_acc={token_accuracy:.3f} exact={exact:.3f} "
                 f"nt_acc={nucleotide_accuracy:.3f} nt_exact={nucleotide_exact:.3f} "
                 f"ptr_acc={pointer_accuracy:.3f} ptr_exact={pointer_exact:.3f} "
+                f"aa_conf={aa_confidence:.3f} nt_conf={nucleotide_confidence:.3f} "
+                f"attn_conf={attention_confidence:.3f} "
                 f"aa_len_mean={mean_target_length:.1f} aa_len_max={max_target_length} "
                 f"genome_len_mean={mean_genome_length:.0f} genome_len_max={max_genome_length} "
                 f"intron_len_mean={mean_intron_length:.0f} intron_len_max={max_intron_length} "
@@ -929,6 +1234,49 @@ def train(args: argparse.Namespace) -> None:
                 f"exon_attention={mean_exon_attention:.3f}",
                 flush=True,
             )
+            print(
+                f"train_fail fail={train_failure['failure_rate']:.3f} "
+                f"fail_len={train_failure['failed_target_bases_mean']:.1f} "
+                f"fail_exons={train_failure['failed_exon_count_mean']:.2f} "
+                f"fail_max_intron={train_failure['failed_max_intron_mean']:.0f} "
+                f"first_nt_err={train_failure['failed_first_error_mean']:.1f} "
+                f"ptr_err_dist={train_failure['pointer_error_distance_mean']:.2f} "
+                f"junc_ptr_acc={train_failure['junction_pointer_accuracy']:.3f} "
+                f"junc_n={train_failure['junction_pointer_total']:.0f}",
+                flush=True,
+            )
+            if validation_metrics is not None:
+                print(
+                    f"fixed_val loss={validation_metrics['loss']:.3f} "
+                    f"aa_loss={validation_metrics['aa_loss']:.3f} "
+                    f"nt_loss={validation_metrics['nt_loss']:.3f} "
+                    f"ptr_loss={validation_metrics['pointer_loss']:.3f} "
+                    f"token_acc={validation_metrics['token_accuracy']:.3f} "
+                    f"exact={validation_metrics['exact_match']:.3f} "
+                    f"nt_acc={validation_metrics['nucleotide_accuracy']:.3f} "
+                    f"nt_exact={validation_metrics['nucleotide_exact_match']:.3f} "
+                    f"ptr_acc={validation_metrics['pointer_accuracy']:.3f} "
+                    f"ptr_exact={validation_metrics['pointer_exact_match']:.3f} "
+                    f"aa_conf={validation_metrics['aa_confidence']:.3f} "
+                    f"nt_conf={validation_metrics['nucleotide_confidence']:.3f} "
+                    f"attn_conf={validation_metrics['attention_confidence']:.3f} "
+                    f"entropy={validation_metrics['attention_entropy']:.3f} "
+                    f"coord_span={validation_metrics['coordinate_span']:.2f} "
+                    f"coord_sharp={validation_metrics['coordinate_sharpness']:.3f} "
+                    f"exon_attention={validation_metrics['mean_exon_attention']:.3f}",
+                    flush=True,
+                )
+                print(
+                    f"fixed_val_fail fail={validation_metrics['failure_rate']:.3f} "
+                    f"fail_len={validation_metrics['failed_target_bases_mean']:.1f} "
+                    f"fail_exons={validation_metrics['failed_exon_count_mean']:.2f} "
+                    f"fail_max_intron={validation_metrics['failed_max_intron_mean']:.0f} "
+                    f"first_nt_err={validation_metrics['failed_first_error_mean']:.1f} "
+                    f"ptr_err_dist={validation_metrics['pointer_error_distance_mean']:.2f} "
+                    f"junc_ptr_acc={validation_metrics['junction_pointer_accuracy']:.3f} "
+                    f"junc_n={validation_metrics['junction_pointer_total']:.0f}",
+                    flush=True,
+                )
 
         maybe_save_checkpoint(
             step=step,
@@ -956,7 +1304,7 @@ def train(args: argparse.Namespace) -> None:
     )
     model.eval()
     with torch.no_grad():
-        amino_acid_probs, transcript_base_probs, _attention, _pointer_logits, diagnostics = model(
+        amino_acid_probs, transcript_base_probs, attention, _pointer_logits, diagnostics = model(
             dna,
             splice_tracks,
             transcript_bases=transcript_bases,
@@ -965,6 +1313,9 @@ def train(args: argparse.Namespace) -> None:
     eval_base_length = int(base_mask[0].sum().item())
     prediction = "".join(AMINO_ACIDS[index] for index in amino_acid_probs.argmax(dim=-1)[0, :eval_length].tolist())
     predicted_cds = "".join(DNA_BASES[index] for index in transcript_base_probs.argmax(dim=-1)[0, :eval_base_length].tolist())
+    eval_aa_confidence = amino_acid_probs.max(dim=-1).values[0, :eval_length].mean().item()
+    eval_nucleotide_confidence = transcript_base_probs.max(dim=-1).values[0, :eval_base_length].mean().item()
+    eval_attention_confidence = attention.max(dim=-1).values[0, :eval_base_length].mean().item()
 
     print("\nFinal training metrics:")
     if final_metrics is not None:
@@ -982,6 +1333,9 @@ def train(args: argparse.Namespace) -> None:
     print("intron lengths:", examples[0]["intron_lengths"])
     print("genome length:", len(examples[0]["genome"]))
     print("attention entropy:", diagnostics["attention_entropy"].item())
+    print("amino-acid confidence:", eval_aa_confidence)
+    print("nucleotide confidence:", eval_nucleotide_confidence)
+    print("attention confidence:", eval_attention_confidence)
     print("coordinate span:", diagnostics["coordinate_span"].item())
     print("coordinate sharpness:", diagnostics["coordinate_sharpness"].item())
     print("mean exon attention:", diagnostics["mean_exon_attention"].item())
@@ -994,6 +1348,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="Device to use. Default requires CUDA via auto.")
     parser.add_argument("--steps", type=int, default=250_000)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--validation-batch-size", type=int, default=128)
     parser.add_argument("--micro-batch-size", type=int, default=0, help="Per-forward batch size. Use 0 for auto.")
     parser.add_argument("--max-micro-batch-tokens", type=int, default=500_000)
     parser.add_argument("--min-protein-codons", type=int, default=24)
@@ -1020,6 +1375,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nucleotide-loss-weight", type=float, default=0.5)
     parser.add_argument("--pointer-loss-weight", type=float, default=1.0)
     parser.add_argument("--pointer-loss-anneal-steps", type=int, default=1_000)
+    parser.add_argument("--attention-entropy-weight", type=float, default=0.0)
     parser.add_argument("--max-coordinate-sharpness", type=float, default=10.0)
     parser.add_argument("--loss-ema-beta", type=float, default=0.95)
     parser.add_argument("--success-lr-decay", type=float, default=0.2)
@@ -1029,7 +1385,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--batch-seed-offset", type=int, default=10_000)
+    parser.add_argument("--validation-seed", type=int, default=424_242)
     parser.add_argument("--eval-seed", type=int, default=123_456)
+    parser.add_argument("--failure-junction-window", type=int, default=3)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--checkpoint-dir", default="checkpoints/synthetic_splice_official_mamba2_variable_lengths")
     parser.add_argument("--checkpoint-every", type=int, default=1_000)
