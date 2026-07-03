@@ -64,7 +64,10 @@ def make_multitoken_batch(
     batch_size: int,
     component_count: int,
     seq_len: int,
+    typical_component_min_len: int,
+    typical_component_max_len: int,
     component_max_len: int,
+    long_example_prob: float,
     rng: random.Random,
     device: torch.device,
     generation_kwargs: dict,
@@ -90,13 +93,21 @@ def make_multitoken_batch(
     components: list[list[str]] = []
 
     for batch_index in range(batch_size):
+        example_kwargs = dict(generation_kwargs)
+        if rng.random() < long_example_prob:
+            example_kwargs["min_seq_len"] = generation_kwargs["min_seq_len"]
+            example_kwargs["max_seq_len"] = component_max_len
+        else:
+            example_kwargs["min_seq_len"] = typical_component_min_len
+            example_kwargs["max_seq_len"] = typical_component_max_len
+
         for attempt in range(200):
             parts: list[str] = []
             bits: list[float] = []
             for _ in range(component_count):
                 sequence, _kind, sequence_bits, _entropy = base.generate_single_token_curriculum_sequence(
                     rng=rng,
-                    **generation_kwargs,
+                    **example_kwargs,
                 )
                 parts.append(sequence)
                 bits.append(sequence_bits)
@@ -456,7 +467,10 @@ def evaluate(
             batch_size=args.batch_size,
             component_count=args.component_count,
             seq_len=args.seq_len,
+            typical_component_min_len=args.typical_component_min_len,
+            typical_component_max_len=args.typical_component_max_len,
             component_max_len=args.component_max_len,
+            long_example_prob=args.long_example_prob,
             rng=rng,
             device=device,
             generation_kwargs=generation_kwargs,
@@ -500,7 +514,10 @@ def run_diagnostics(
             batch_size=1,
             component_count=args.component_count,
             seq_len=args.seq_len,
+            typical_component_min_len=args.typical_component_min_len,
+            typical_component_max_len=args.typical_component_max_len,
             component_max_len=args.component_max_len,
+            long_example_prob=args.long_example_prob,
             rng=rng,
             device=device,
             generation_kwargs=generation_kwargs,
@@ -547,6 +564,12 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--max-tokens * --max-slots-per-token must be >= --seq-len")
     if args.component_max_len > args.max_slots_per_token:
         raise ValueError("--component-max-len must be <= --max-slots-per-token")
+    if args.typical_component_min_len <= 0 or args.typical_component_max_len < args.typical_component_min_len:
+        raise ValueError("--typical-component-min-len/max-len are invalid")
+    if args.typical_component_max_len > args.component_max_len:
+        raise ValueError("--typical-component-max-len must be <= --component-max-len")
+    if not 0.0 <= args.long_example_prob <= 1.0:
+        raise ValueError("--long-example-prob must be in [0, 1]")
     if args.component_count <= 1:
         raise ValueError("This stage is for multi-token training; set --component-count >= 2")
 
@@ -580,6 +603,10 @@ def train(args: argparse.Namespace) -> None:
         f"max_tokens={args.max_tokens}; slots/token={args.max_slots_per_token}; params={total}; trainable={trainable}"
     )
     print(
+        f"component lengths typical={args.typical_component_min_len}-{args.typical_component_max_len}; "
+        f"long={args.component_min_len}-{args.component_max_len}; long_prob={args.long_example_prob}"
+    )
+    print(
         f"init_checkpoint={args.init_checkpoint}; freeze_decoder={args.freeze_primitive_decoder}; "
         f"primitive_weights cos/mse/norm/len/use/count/bound={args.primitive_latent_weight}/"
         f"{args.primitive_latent_mse_weight}/{args.primitive_latent_norm_weight}/"
@@ -595,7 +622,10 @@ def train(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
             component_count=args.component_count,
             seq_len=args.seq_len,
+            typical_component_min_len=args.typical_component_min_len,
+            typical_component_max_len=args.typical_component_max_len,
             component_max_len=args.component_max_len,
+            long_example_prob=args.long_example_prob,
             rng=train_rng,
             device=device,
             generation_kwargs=generation_kwargs,
@@ -686,6 +716,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--component-count", type=int, default=2)
     parser.add_argument("--component-min-len", type=int, default=3)
     parser.add_argument("--component-max-len", type=int, default=48)
+    parser.add_argument("--typical-component-min-len", type=int, default=6)
+    parser.add_argument("--typical-component-max-len", type=int, default=28)
+    parser.add_argument("--long-example-prob", type=float, default=0.10)
     parser.add_argument("--max-tokens", type=int, default=2)
     parser.add_argument("--max-slots-per-token", type=int, default=48)
     parser.add_argument("--latent-dim", type=int, default=32)
