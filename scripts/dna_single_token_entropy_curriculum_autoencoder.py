@@ -165,7 +165,7 @@ def shannon_entropy_per_base(sequence: str) -> float:
     return entropy
 
 
-def kmer_entropy_per_base(sequence: str, k: int = 3) -> float:
+def kmer_entropy(sequence: str, k: int) -> float:
     if len(sequence) < k or k <= 1:
         return shannon_entropy_per_base(sequence)
     counts: dict[str, int] = {}
@@ -177,11 +177,52 @@ def kmer_entropy_per_base(sequence: str, k: int = 3) -> float:
     for count in counts.values():
         probability = count / total
         entropy -= probability * math.log2(probability)
-    return entropy / float(k)
+    return entropy
 
 
-def estimated_sequence_bits(sequence: str, k: int = 3) -> float:
-    return len(sequence) * kmer_entropy_per_base(sequence, k=k)
+def kmer_complexity_per_base(sequence: str, k: int) -> float:
+    if not sequence:
+        return 0.0
+    if len(sequence) < k or k <= 1:
+        return shannon_entropy_per_base(sequence)
+    window_count = len(sequence) - k + 1
+    max_observable_entropy = min(2.0 * float(k), math.log2(float(window_count)))
+    if max_observable_entropy <= 0:
+        return shannon_entropy_per_base(sequence)
+    entropy = kmer_entropy(sequence, k)
+    # Rescale by the empirical maximum for this sequence length. Without this,
+    # large k makes random DNA look artificially low-entropy because every k-mer
+    # is unique and H ~= log2(number_of_windows), not 2k.
+    return max(0.0, min(2.0, 2.0 * entropy / max_observable_entropy))
+
+
+def multiscale_kmer_complexity_per_base(
+    sequence: str,
+    k_values: list[int],
+    percentile: float,
+) -> float:
+    valid_k = sorted({k for k in k_values if k > 0 and k <= len(sequence)})
+    if not valid_k:
+        return shannon_entropy_per_base(sequence)
+    values = sorted(kmer_complexity_per_base(sequence, k) for k in valid_k)
+    if len(values) == 1:
+        return values[0]
+    percentile = max(0.0, min(1.0, percentile))
+    position = percentile * float(len(values) - 1)
+    low_index = int(math.floor(position))
+    high_index = int(math.ceil(position))
+    if low_index == high_index:
+        return values[low_index]
+    fraction = position - low_index
+    return values[low_index] * (1.0 - fraction) + values[high_index] * fraction
+
+
+def estimated_sequence_bits(sequence: str, k_values: list[int], percentile: float) -> float:
+    return len(sequence) * multiscale_kmer_complexity_per_base(
+        sequence,
+        k_values=k_values,
+        percentile=percentile,
+    )
 
 
 def generate_entropy_budget_sequence(
@@ -189,7 +230,8 @@ def generate_entropy_budget_sequence(
     max_seq_len: int,
     min_seq_len: int,
     bit_budget: float,
-    kmer_size: int,
+    kmer_sizes: list[int],
+    entropy_percentile: float,
     families: list[str],
     rng: random.Random,
     max_tries: int,
@@ -204,7 +246,11 @@ def generate_entropy_budget_sequence(
         seq_len = rng.randint(min_seq_len, max_seq_len)
         kind = rng.choice(families)
         sequence, _ = generate_family_sequence(seq_len, kind, rng)
-        entropy = kmer_entropy_per_base(sequence, k=kmer_size)
+        entropy = multiscale_kmer_complexity_per_base(
+            sequence,
+            k_values=kmer_sizes,
+            percentile=entropy_percentile,
+        )
         bits = len(sequence) * entropy
         if bits < best_bits:
             best_sequence = sequence
@@ -225,7 +271,8 @@ def make_single_token_entropy_batch(
     max_seq_len: int,
     min_seq_len: int,
     bit_budget: float,
-    kmer_size: int,
+    kmer_sizes: list[int],
+    entropy_percentile: float,
     families: list[str],
     rng: random.Random,
     device: torch.device,
@@ -242,7 +289,8 @@ def make_single_token_entropy_batch(
             max_seq_len=max_seq_len,
             min_seq_len=min_seq_len,
             bit_budget=bit_budget,
-            kmer_size=kmer_size,
+            kmer_sizes=kmer_sizes,
+            entropy_percentile=entropy_percentile,
             families=families,
             rng=rng,
             max_tries=max_tries,
@@ -977,8 +1025,21 @@ def parse_family_list(values: str) -> list[str]:
     return parsed
 
 
+def parse_kmer_sizes(values: str) -> list[int]:
+    parsed = parse_int_list(values)
+    if not parsed or any(value <= 0 for value in parsed):
+        raise ValueError("--single-token-kmer-sizes must contain positive integers.")
+    return sorted(set(parsed))
+
+
 def single_token_families(args: argparse.Namespace) -> list[str]:
     return parse_family_list(args.single_token_families)
+
+
+def single_token_kmer_sizes(args: argparse.Namespace) -> list[int]:
+    if args.single_token_kmer_size is not None:
+        return [args.single_token_kmer_size]
+    return parse_kmer_sizes(args.single_token_kmer_sizes)
 
 
 def curriculum_summary(rendered: dict[str, torch.Tensor]) -> str:
@@ -1143,7 +1204,8 @@ def evaluate(
             max_seq_len=args.seq_len,
             min_seq_len=args.single_token_min_len,
             bit_budget=args.single_token_bit_budget,
-            kmer_size=args.single_token_kmer_size,
+            kmer_sizes=single_token_kmer_sizes(args),
+            entropy_percentile=args.single_token_entropy_percentile,
             families=families,
             rng=rng,
             device=device,
@@ -1284,7 +1346,8 @@ def run_diagnostics(model: AdaptiveTokenizerAutoencoder, rng: random.Random, dev
             max_seq_len=args.seq_len,
             min_seq_len=args.single_token_min_len,
             bit_budget=args.single_token_bit_budget,
-            kmer_size=args.single_token_kmer_size,
+            kmer_sizes=single_token_kmer_sizes(args),
+            entropy_percentile=args.single_token_entropy_percentile,
             families=single_token_families(args),
             rng=rng,
             device=device,
@@ -1341,11 +1404,14 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--single-token-min-len must be in [1, seq_len].")
     if args.single_token_bit_budget <= 0:
         raise ValueError("--single-token-bit-budget must be positive.")
-    if args.single_token_kmer_size <= 0:
+    if args.single_token_kmer_size is not None and args.single_token_kmer_size <= 0:
         raise ValueError("--single-token-kmer-size must be positive.")
+    if not 0.0 <= args.single_token_entropy_percentile <= 1.0:
+        raise ValueError("--single-token-entropy-percentile must be in [0, 1].")
     if args.batch_size <= 0 or args.val_batches <= 0:
         raise ValueError("--batch-size and --val-batches must be positive.")
     families = single_token_families(args)
+    kmer_sizes = single_token_kmer_sizes(args)
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -1369,7 +1435,8 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"token_cost={args.token_cost_weight}; token_sharp={args.token_sharp_weight}; "
         f"length_weight={args.length_weight}; initial_stride={args.initial_token_stride}; "
-        f"bit_budget={args.single_token_bit_budget}; kmer={args.single_token_kmer_size}; "
+        f"bit_budget={args.single_token_bit_budget}; kmers={','.join(str(k) for k in kmer_sizes)}; "
+        f"entropy_percentile={args.single_token_entropy_percentile}; "
         f"families={','.join(families)}"
     )
 
@@ -1383,7 +1450,8 @@ def train(args: argparse.Namespace) -> None:
             max_seq_len=args.seq_len,
             min_seq_len=args.single_token_min_len,
             bit_budget=args.single_token_bit_budget,
-            kmer_size=args.single_token_kmer_size,
+            kmer_sizes=kmer_sizes,
+            entropy_percentile=args.single_token_entropy_percentile,
             families=families,
             rng=train_rng,
             device=device,
@@ -1483,7 +1551,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-min-len-frac", type=float, default=0.75)
     parser.add_argument("--single-token-min-len", type=int, default=4)
     parser.add_argument("--single-token-bit-budget", type=float, default=32.0)
-    parser.add_argument("--single-token-kmer-size", type=int, default=3)
+    parser.add_argument("--single-token-kmer-size", type=int, default=None)
+    parser.add_argument("--single-token-kmer-sizes", default="1,2,3,4,5,6,8,10,12,16")
+    parser.add_argument("--single-token-entropy-percentile", type=float, default=0.1)
     parser.add_argument("--single-token-max-tries", type=int, default=200)
     parser.add_argument("--single-token-families", default="random,gc,at,homopolymer,dinucleotide,motif")
     parser.add_argument("--max-tokens", type=int, default=1)
