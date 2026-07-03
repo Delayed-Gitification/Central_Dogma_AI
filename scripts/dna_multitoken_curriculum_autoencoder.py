@@ -160,14 +160,19 @@ def primitive_supervision_loss(
     component_count: int,
     *,
     latent_weight: float,
+    latent_mse_weight: float,
+    latent_norm_weight: float,
     length_weight: float,
     usage_weight: float,
     token_count_weight: float,
+    boundary_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     model_latents = rendered["latents"][:, :component_count, :]
     teacher_latents = teacher["latents"][:, :component_count, :]
     latent_cosine = F.cosine_similarity(model_latents, teacher_latents, dim=-1)
     latent_loss = (1.0 - latent_cosine).mean()
+    latent_mse_loss = F.mse_loss(model_latents, teacher_latents)
+    latent_norm_loss = F.smooth_l1_loss(model_latents.norm(dim=-1), teacher_latents.norm(dim=-1))
 
     model_lengths = rendered["lengths"][:, :component_count]
     primitive_length_loss = F.smooth_l1_loss(model_lengths, component_lengths[:, :component_count])
@@ -177,20 +182,47 @@ def primitive_supervision_loss(
     usage_loss = F.mse_loss(rendered["token_usage"], target_usage)
     token_count_target = torch.full_like(rendered["token_count"], float(component_count))
     token_count_loss = F.smooth_l1_loss(rendered["token_count"], token_count_target)
+    token_mass_loss = F.smooth_l1_loss(
+        rendered["token_prob"].sum(dim=1),
+        torch.full_like(rendered["token_count"], float(component_count)),
+    )
+
+    token_cumulative = rendered["token_prob"].cumsum(dim=1)
+    boundary_loss = token_cumulative.sum() * 0.0
+    if component_count > 1:
+        boundary_positions = component_lengths[:, : component_count - 1].cumsum(dim=1).round().long() - 1
+        boundary_positions = boundary_positions.clamp(0, token_cumulative.shape[1] - 1)
+        observed = token_cumulative.gather(1, boundary_positions)
+        expected = torch.arange(
+            1,
+            component_count,
+            device=component_lengths.device,
+            dtype=component_lengths.dtype,
+        )[None, :].expand_as(observed)
+        boundary_loss = F.smooth_l1_loss(observed, expected)
 
     loss = (
         latent_weight * latent_loss
+        + latent_mse_weight * latent_mse_loss
+        + latent_norm_weight * latent_norm_loss
         + length_weight * primitive_length_loss
         + usage_weight * usage_loss
         + token_count_weight * token_count_loss
+        + token_count_weight * token_mass_loss
+        + boundary_weight * boundary_loss
     )
     return loss, {
         "primitive_loss": loss.detach(),
         "primitive_latent_loss": latent_loss.detach(),
+        "primitive_latent_mse_loss": latent_mse_loss.detach(),
+        "primitive_latent_norm_loss": latent_norm_loss.detach(),
         "primitive_length_loss": primitive_length_loss.detach(),
         "primitive_usage_loss": usage_loss.detach(),
         "primitive_token_count_loss": token_count_loss.detach(),
+        "primitive_token_mass_loss": token_mass_loss.detach(),
+        "primitive_boundary_loss": boundary_loss.detach(),
         "teacher_latent_cosine": latent_cosine.mean().detach(),
+        "teacher_latent_mse": latent_mse_loss.detach(),
         "teacher_len_error": (model_lengths - component_lengths[:, :component_count]).abs().mean().detach(),
     }
 
@@ -231,18 +263,65 @@ def loss_for_multitoken_batch(
         alignment_global_window=args.alignment_global_window,
     )
     teacher_rendered = teacher_primitives(teacher, component_target, component_mask)
+    with torch.no_grad():
+        teacher_latents = teacher_rendered["latents"]
+        teacher_usage = torch.ones(
+            teacher_latents.shape[:2],
+            dtype=teacher_latents.dtype,
+            device=teacher_latents.device,
+        )
+        if teacher_latents.shape[1] < model.max_tokens:
+            pad_count = model.max_tokens - teacher_latents.shape[1]
+            teacher_latents = torch.cat(
+                [
+                    teacher_latents,
+                    torch.zeros(
+                        teacher_latents.shape[0],
+                        pad_count,
+                        teacher_latents.shape[-1],
+                        dtype=teacher_latents.dtype,
+                        device=teacher_latents.device,
+                    ),
+                ],
+                dim=1,
+            )
+            teacher_usage = torch.cat(
+                [
+                    teacher_usage,
+                    torch.zeros(
+                        teacher_usage.shape[0],
+                        pad_count,
+                        dtype=teacher_usage.dtype,
+                        device=teacher_usage.device,
+                    ),
+                ],
+                dim=1,
+            )
+        oracle = model.decode(teacher_latents, teacher_usage, target.shape[1])
+        oracle_pred = oracle["soft_dna"].argmax(dim=-1)
+        oracle_correct = oracle_pred == target
+        oracle_acc = (oracle_correct.float() * mask).sum() / mask.sum().clamp_min(1.0)
+        oracle_exact = (oracle_correct | (mask <= 0)).all(dim=1).float().mean()
     primitive_loss, primitive_metrics = primitive_supervision_loss(
         rendered,
         teacher_rendered,
         component_lengths,
         component_count,
         latent_weight=args.primitive_latent_weight,
+        latent_mse_weight=args.primitive_latent_mse_weight,
+        latent_norm_weight=args.primitive_latent_norm_weight,
         length_weight=args.primitive_length_weight,
         usage_weight=args.primitive_usage_weight,
         token_count_weight=args.primitive_token_count_weight,
+        boundary_weight=args.primitive_boundary_weight,
     )
     loss = recon_loss + primitive_loss
-    return loss, {**rendered, **primitive_metrics}
+    return loss, {
+        **rendered,
+        **primitive_metrics,
+        "teacher_oracle_accuracy": oracle_acc.detach(),
+        "teacher_oracle_exact": oracle_exact.detach(),
+    }
 
 
 def freeze_primitive_decoder(model: base.AdaptiveTokenizerAutoencoder) -> None:
@@ -329,20 +408,25 @@ def short_status(
         (
             f"\nstep {step:06d} | val loss {val_loss:.4f} acc {val_metrics['accuracy']:.3f} "
             f"exact {val_metrics['exact']:.3f} | teacher_cos {val_rendered['teacher_latent_cosine'].item():.3f} "
-            f"token_count {val_rendered['token_count'].mean().item():.2f}/{component_count}"
+            f"token_count {val_rendered['token_count'].mean().item():.2f}/{component_count} "
+            f"oracle {val_rendered['teacher_oracle_accuracy'].item():.3f}/{val_rendered['teacher_oracle_exact'].item():.3f}"
         ),
         (
             f"train loss {loss.item():.4f} ce {rendered['recon_loss'].item():.4f} "
             f"align {rendered['alignment_loss'].item():.4f} acc {train_metrics['accuracy']:.3f} "
             f"exact {train_metrics['exact']:.3f} len {rendered['length_loss'].item():.3f} "
             f"prim {rendered['primitive_loss'].item():.4f} z {rendered['primitive_latent_loss'].item():.4f} "
+            f"zmse {rendered['primitive_latent_mse_loss'].item():.4f} "
+            f"bound {rendered['primitive_boundary_loss'].item():.3f} "
             f"tok {rendered['token_count'].mean().item():.2f} out {rendered['total_len'].mean().item():.1f} "
             f"target {lengths.mean().item():.1f}"
         ),
         (
             f"val   ce {val_rendered['recon_loss'].item():.4f} align {val_rendered['alignment_loss'].item():.4f} "
             f"len {val_rendered['length_loss'].item():.3f} prim {val_rendered['primitive_loss'].item():.4f} "
-            f"z {val_rendered['primitive_latent_loss'].item():.4f} token_use "
+            f"z {val_rendered['primitive_latent_loss'].item():.4f} "
+            f"zmse {val_rendered['primitive_latent_mse_loss'].item():.4f} "
+            f"bound {val_rendered['primitive_boundary_loss'].item():.3f} token_use "
             f"{', '.join(f'{v:.2f}' for v in val_rendered['token_usage'].mean(dim=0).detach().cpu().tolist())} "
             f"emit_len {', '.join(f'{v:.1f}' for v in val_rendered['lengths'].mean(dim=0).detach().cpu().tolist())} "
             f"out {val_rendered['total_len'].mean().item():.1f}/{val_lengths.mean().item():.1f}"
@@ -443,7 +527,14 @@ def run_diagnostics(
         print("components:", " + ".join(parts[0]))
         print("target:    ", base.tensor_to_sequence(target[0, :seq_len]))
         print("decoded:   ", base.tensor_to_sequence(decoded))
-        print("loss:", f"{loss.item():.4f}", "teacher_cos:", f"{rendered['teacher_latent_cosine'].item():.3f}")
+        print(
+            "loss:",
+            f"{loss.item():.4f}",
+            "teacher_cos:",
+            f"{rendered['teacher_latent_cosine'].item():.3f}",
+            "oracle:",
+            f"{rendered['teacher_oracle_accuracy'].item():.3f}/{rendered['teacher_oracle_exact'].item():.3f}",
+        )
         print("token usage:", ", ".join(f"{value:.2f}" for value in rendered["token_usage"][0].detach().cpu().tolist()))
         print("emit lengths:", ", ".join(f"{value:.1f}" for value in rendered["lengths"][0].detach().cpu().tolist()))
     model.train()
@@ -490,8 +581,10 @@ def train(args: argparse.Namespace) -> None:
     )
     print(
         f"init_checkpoint={args.init_checkpoint}; freeze_decoder={args.freeze_primitive_decoder}; "
-        f"primitive_weights z/len/use/count={args.primitive_latent_weight}/"
-        f"{args.primitive_length_weight}/{args.primitive_usage_weight}/{args.primitive_token_count_weight}"
+        f"primitive_weights cos/mse/norm/len/use/count/bound={args.primitive_latent_weight}/"
+        f"{args.primitive_latent_mse_weight}/{args.primitive_latent_norm_weight}/"
+        f"{args.primitive_length_weight}/{args.primitive_usage_weight}/"
+        f"{args.primitive_token_count_weight}/{args.primitive_boundary_weight}"
     )
 
     for step in range(args.steps):
@@ -631,9 +724,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-sharp-warmup-frac", type=float, default=0.0)
     parser.add_argument("--latent-l2-weight", type=float, default=1e-4)
     parser.add_argument("--primitive-latent-weight", type=float, default=1.0)
+    parser.add_argument("--primitive-latent-mse-weight", type=float, default=1.0)
+    parser.add_argument("--primitive-latent-norm-weight", type=float, default=0.1)
     parser.add_argument("--primitive-length-weight", type=float, default=0.5)
     parser.add_argument("--primitive-usage-weight", type=float, default=1.0)
     parser.add_argument("--primitive-token-count-weight", type=float, default=0.5)
+    parser.add_argument("--primitive-boundary-weight", type=float, default=0.5)
 
     parser.add_argument("--alignment-loss-weight", type=float, default=0.25)
     parser.add_argument("--alignment-mode", choices=("local_window", "dp", "none"), default="local_window")
