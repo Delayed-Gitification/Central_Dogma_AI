@@ -1033,6 +1033,137 @@ def soft_alignment_nll(
     return torch.stack(losses).mean()
 
 
+def local_window_alignment_nll(
+    soft_dna: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    window: int,
+    temperature: float,
+    shift_cost: float,
+) -> torch.Tensor:
+    window = max(0, int(window))
+    temperature = max(temperature, 1e-6)
+    batch_size, seq_len, _ = soft_dna.shape
+    costs = []
+    validity = []
+    large = soft_dna.new_tensor(1e4)
+
+    for shift in range(-window, window + 1):
+        shifted_cost = soft_dna.new_full((batch_size, seq_len), 1e4)
+        shifted_valid = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=soft_dna.device)
+        if shift >= 0:
+            target_slice = target[:, : seq_len - shift]
+            prob_slice = soft_dna[:, shift:, :]
+            valid_slice = mask[:, : seq_len - shift] > 0
+            nll = -prob_slice.gather(-1, target_slice[..., None]).squeeze(-1).clamp_min(1e-8).log()
+            shifted_cost[:, : seq_len - shift] = nll + abs(shift) * shift_cost
+            shifted_valid[:, : seq_len - shift] = valid_slice
+        else:
+            offset = -shift
+            target_slice = target[:, offset:]
+            prob_slice = soft_dna[:, : seq_len - offset, :]
+            valid_slice = mask[:, offset:] > 0
+            nll = -prob_slice.gather(-1, target_slice[..., None]).squeeze(-1).clamp_min(1e-8).log()
+            shifted_cost[:, offset:] = nll + abs(shift) * shift_cost
+            shifted_valid[:, offset:] = valid_slice
+        costs.append(shifted_cost)
+        validity.append(shifted_valid)
+
+    cost_stack = torch.stack(costs, dim=1)
+    valid_stack = torch.stack(validity, dim=1)
+    cost_stack = torch.where(valid_stack, cost_stack, large)
+    weights = torch.softmax(-cost_stack / temperature, dim=1)
+    position_loss = (weights * cost_stack).sum(dim=1)
+    return (position_loss * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def global_shift_alignment_nll(
+    soft_dna: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    temperature: float,
+    shift_cost: float,
+    max_shift: int,
+) -> torch.Tensor:
+    temperature = max(temperature, 1e-6)
+    batch_size, seq_len, _ = soft_dna.shape
+    if max_shift < 0:
+        max_shift = seq_len - 1
+    max_shift = min(max_shift, seq_len - 1)
+    costs = []
+    large = soft_dna.new_tensor(1e4)
+
+    for shift in range(-max_shift, max_shift + 1):
+        if shift >= 0:
+            target_slice = target[:, : seq_len - shift]
+            prob_slice = soft_dna[:, shift:, :]
+            valid = mask[:, : seq_len - shift]
+        else:
+            offset = -shift
+            target_slice = target[:, offset:]
+            prob_slice = soft_dna[:, : seq_len - offset, :]
+            valid = mask[:, offset:]
+        nll = -prob_slice.gather(-1, target_slice[..., None]).squeeze(-1).clamp_min(1e-8).log()
+        denom = valid.sum(dim=1).clamp_min(1.0)
+        cost = (nll * valid).sum(dim=1) / denom
+        cost = cost + abs(shift) * shift_cost
+        cost = torch.where(valid.sum(dim=1) > 0, cost, large.expand(batch_size))
+        costs.append(cost)
+
+    cost_stack = torch.stack(costs, dim=1)
+    weights = torch.softmax(-cost_stack / temperature, dim=1)
+    return (weights * cost_stack).sum(dim=1).mean()
+
+
+def alignment_nll(
+    soft_dna: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    target_lengths: torch.Tensor,
+    *,
+    mode: str,
+    temperature: float,
+    gap_cost: float,
+    window: int,
+    shift_cost: float,
+    global_weight: float,
+    global_window: int,
+) -> torch.Tensor:
+    if mode == "local_window":
+        local_loss = local_window_alignment_nll(
+            soft_dna,
+            target,
+            mask,
+            window=window,
+            temperature=temperature,
+            shift_cost=shift_cost,
+        )
+        if global_weight <= 0:
+            return local_loss
+        global_loss = global_shift_alignment_nll(
+            soft_dna,
+            target,
+            mask,
+            temperature=temperature,
+            shift_cost=shift_cost,
+            max_shift=global_window,
+        )
+        return local_loss + global_weight * global_loss
+    if mode == "dp":
+        return soft_alignment_nll(
+            soft_dna,
+            target,
+            target_lengths,
+            temperature=temperature,
+            gap_cost=gap_cost,
+        )
+    if mode == "none":
+        return soft_dna.sum() * 0.0
+    raise ValueError(f"Unknown alignment mode: {mode}")
+
+
 def loss_for_batch(
     *,
     model: AdaptiveTokenizerAutoencoder,
@@ -1045,20 +1176,31 @@ def loss_for_batch(
     decoder_sharp_weight: float,
     latent_l2_weight: float,
     alignment_loss_weight: float = 0.0,
+    alignment_mode: str = "local_window",
     alignment_temperature: float = 0.1,
     alignment_gap_cost: float = 0.75,
+    alignment_window: int = 3,
+    alignment_shift_cost: float = 0.02,
+    alignment_global_weight: float = 0.5,
+    alignment_global_window: int = -1,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     rendered = model(target, mask)
     soft_dna = rendered["soft_dna"].clamp_min(1e-8)
     token_nll = -soft_dna.gather(-1, target[..., None]).squeeze(-1).log()
     recon_loss = (token_nll * mask).sum() / mask.sum().clamp_min(1.0)
     alignment_loss = (
-        soft_alignment_nll(
+        alignment_nll(
             soft_dna,
             target,
+            mask,
             target_lengths,
+            mode=alignment_mode,
             temperature=alignment_temperature,
             gap_cost=alignment_gap_cost,
+            window=alignment_window,
+            shift_cost=alignment_shift_cost,
+            global_weight=alignment_global_weight,
+            global_window=alignment_global_window,
         )
         if alignment_loss_weight > 0
         else recon_loss.detach() * 0.0
@@ -1231,8 +1373,13 @@ def loss_for_positive_pair_batch(
     manifold_position_weight: float,
     manifold_temperature: float,
     alignment_loss_weight: float = 0.0,
+    alignment_mode: str = "local_window",
     alignment_temperature: float = 0.1,
     alignment_gap_cost: float = 0.75,
+    alignment_window: int = 3,
+    alignment_shift_cost: float = 0.02,
+    alignment_global_weight: float = 0.5,
+    alignment_global_window: int = -1,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     loss_a, rendered_a = loss_for_batch(
         model=model,
@@ -1245,8 +1392,13 @@ def loss_for_positive_pair_batch(
         decoder_sharp_weight=decoder_sharp_weight,
         latent_l2_weight=latent_l2_weight,
         alignment_loss_weight=alignment_loss_weight,
+        alignment_mode=alignment_mode,
         alignment_temperature=alignment_temperature,
         alignment_gap_cost=alignment_gap_cost,
+        alignment_window=alignment_window,
+        alignment_shift_cost=alignment_shift_cost,
+        alignment_global_weight=alignment_global_weight,
+        alignment_global_window=alignment_global_window,
     )
     loss_b, rendered_b = loss_for_batch(
         model=model,
@@ -1259,8 +1411,13 @@ def loss_for_positive_pair_batch(
         token_sharp_weight=token_sharp_weight,
         latent_l2_weight=latent_l2_weight,
         alignment_loss_weight=alignment_loss_weight,
+        alignment_mode=alignment_mode,
         alignment_temperature=alignment_temperature,
         alignment_gap_cost=alignment_gap_cost,
+        alignment_window=alignment_window,
+        alignment_shift_cost=alignment_shift_cost,
+        alignment_global_weight=alignment_global_weight,
+        alignment_global_window=alignment_global_window,
     )
     manifold_loss, manifold_metrics = soft_position_aligned_latent_loss(
         rendered_a,
@@ -1297,8 +1454,13 @@ def loss_for_family_geometry_batch(
     within_family_only: bool,
     similarity_margin: float,
     alignment_loss_weight: float = 0.0,
+    alignment_mode: str = "local_window",
     alignment_temperature: float = 0.1,
     alignment_gap_cost: float = 0.75,
+    alignment_window: int = 3,
+    alignment_shift_cost: float = 0.02,
+    alignment_global_weight: float = 0.5,
+    alignment_global_window: int = -1,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     recon_loss, rendered = loss_for_batch(
         model=model,
@@ -1311,8 +1473,13 @@ def loss_for_family_geometry_batch(
         decoder_sharp_weight=decoder_sharp_weight,
         latent_l2_weight=latent_l2_weight,
         alignment_loss_weight=alignment_loss_weight,
+        alignment_mode=alignment_mode,
         alignment_temperature=alignment_temperature,
         alignment_gap_cost=alignment_gap_cost,
+        alignment_window=alignment_window,
+        alignment_shift_cost=alignment_shift_cost,
+        alignment_global_weight=alignment_global_weight,
+        alignment_global_window=alignment_global_window,
     )
     geometry_loss, geometry_metrics = rapidfuzz_geometry_loss(
         rendered,
@@ -1608,8 +1775,13 @@ def evaluate(
                 within_family_only=args.rapidfuzz_within_family_only,
                 similarity_margin=args.rapidfuzz_similarity_margin,
                 alignment_loss_weight=args.alignment_loss_weight,
+                alignment_mode=args.alignment_mode,
                 alignment_temperature=args.alignment_temperature,
                 alignment_gap_cost=args.alignment_gap_cost,
+                alignment_window=args.alignment_window,
+                alignment_shift_cost=args.alignment_shift_cost,
+                alignment_global_weight=args.alignment_global_weight,
+                alignment_global_window=args.alignment_global_window,
             )
         else:
             target, mask, lengths, bits, entropies, _ = make_single_token_entropy_batch(
@@ -1629,8 +1801,13 @@ def evaluate(
                 decoder_sharp_weight=decoder_sharp_weight,
                 latent_l2_weight=args.latent_l2_weight,
                 alignment_loss_weight=args.alignment_loss_weight,
+                alignment_mode=args.alignment_mode,
                 alignment_temperature=args.alignment_temperature,
                 alignment_gap_cost=args.alignment_gap_cost,
+                alignment_window=args.alignment_window,
+                alignment_shift_cost=args.alignment_shift_cost,
+                alignment_global_weight=args.alignment_global_weight,
+                alignment_global_window=args.alignment_global_window,
             )
         rendered["info_bits"] = bits.detach()
         rendered["entropy_per_base"] = entropies.detach()
@@ -1828,6 +2005,14 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--alignment-temperature must be positive.")
     if args.alignment_gap_cost < 0:
         raise ValueError("--alignment-gap-cost must be non-negative.")
+    if args.alignment_window < 0:
+        raise ValueError("--alignment-window must be non-negative.")
+    if args.alignment_shift_cost < 0:
+        raise ValueError("--alignment-shift-cost must be non-negative.")
+    if args.alignment_global_weight < 0:
+        raise ValueError("--alignment-global-weight must be non-negative.")
+    if args.alignment_global_window < -1:
+        raise ValueError("--alignment-global-window must be -1 or non-negative.")
     if args.batch_size <= 0 or args.val_batches <= 0:
         raise ValueError("--batch-size and --val-batches must be positive.")
     families = single_token_families(args)
@@ -1861,7 +2046,9 @@ def train(args: argparse.Namespace) -> None:
         f"entropy_percentile={args.single_token_entropy_percentile}; "
         f"families={','.join(families)}; manifold_weight={args.manifold_weight}; "
         f"manifold_family_size={max(2, args.manifold_family_size)}; manifold_warmup={args.manifold_warmup_frac}; "
-        f"alignment_weight={args.alignment_loss_weight}; alignment_gap={args.alignment_gap_cost}"
+        f"alignment_weight={args.alignment_loss_weight}; alignment_mode={args.alignment_mode}; "
+        f"alignment_window={args.alignment_window}; alignment_global_weight={args.alignment_global_weight}; "
+        f"alignment_gap={args.alignment_gap_cost}"
     )
 
     for step in range(args.steps):
@@ -1899,8 +2086,13 @@ def train(args: argparse.Namespace) -> None:
                 within_family_only=args.rapidfuzz_within_family_only,
                 similarity_margin=args.rapidfuzz_similarity_margin,
                 alignment_loss_weight=args.alignment_loss_weight,
+                alignment_mode=args.alignment_mode,
                 alignment_temperature=args.alignment_temperature,
                 alignment_gap_cost=args.alignment_gap_cost,
+                alignment_window=args.alignment_window,
+                alignment_shift_cost=args.alignment_shift_cost,
+                alignment_global_weight=args.alignment_global_weight,
+                alignment_global_window=args.alignment_global_window,
             )
         else:
             target, mask, lengths, bits, entropies, _ = make_single_token_entropy_batch(
@@ -1920,8 +2112,13 @@ def train(args: argparse.Namespace) -> None:
                 decoder_sharp_weight=decoder_sharp_weight,
                 latent_l2_weight=args.latent_l2_weight,
                 alignment_loss_weight=args.alignment_loss_weight,
+                alignment_mode=args.alignment_mode,
                 alignment_temperature=args.alignment_temperature,
                 alignment_gap_cost=args.alignment_gap_cost,
+                alignment_window=args.alignment_window,
+                alignment_shift_cost=args.alignment_shift_cost,
+                alignment_global_weight=args.alignment_global_weight,
+                alignment_global_window=args.alignment_global_window,
             )
         rendered["info_bits"] = bits.detach()
         rendered["entropy_per_base"] = entropies.detach()
@@ -2034,8 +2231,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-sharp-warmup-frac", type=float, default=0.1)
     parser.add_argument("--latent-l2-weight", type=float, default=1e-4)
     parser.add_argument("--alignment-loss-weight", type=float, default=1.0)
+    parser.add_argument("--alignment-mode", choices=("local_window", "dp", "none"), default="local_window")
     parser.add_argument("--alignment-temperature", type=float, default=0.1)
     parser.add_argument("--alignment-gap-cost", type=float, default=0.75)
+    parser.add_argument("--alignment-window", type=int, default=3)
+    parser.add_argument("--alignment-shift-cost", type=float, default=0.02)
+    parser.add_argument("--alignment-global-weight", type=float, default=0.5)
+    parser.add_argument("--alignment-global-window", type=int, default=-1)
     parser.add_argument("--manifold-weight", type=float, default=0.05)
     parser.add_argument("--manifold-warmup-frac", type=float, default=0.0)
     parser.add_argument("--manifold-position-weight", type=float, default=0.05)
