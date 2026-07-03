@@ -215,7 +215,7 @@ def loss_for_batch(
     }
 
 
-def hard_decode_from_latents(
+def hard_decode(
     model: SegmentalSoftpackAutodecoder,
     z: torch.Tensor,
     out_len: int | None = None,
@@ -331,18 +331,18 @@ def run_diagnostics(
     with torch.no_grad():
         index = torch.tensor([0], dtype=torch.long, device=device)
         z = model.latents_for_indices(index)
-        original = hard_decode_from_latents(model, z, out_len=seq_len)
+        original = hard_decode(model, z, out_len=seq_len)
         target = tensor_to_sequence(train_data[0])
 
         content_perturbed_z = z.clone()
         content_perturbed_z[:, 0, :] = content_perturbed_z[:, 0, :] + torch.randn_like(content_perturbed_z[:, 0, :]) * 0.5
-        perturbed = hard_decode_from_latents(model, content_perturbed_z, out_len=seq_len)
+        perturbed = hard_decode(model, content_perturbed_z, out_len=seq_len)
         changed = changed_positions(original, perturbed)
 
         length_delta = torch.zeros(1, model.num_segments, device=device)
         segment_index = min(1, model.num_segments - 1)
         length_delta[:, segment_index] = 10.0
-        length_modified = hard_decode_from_latents(model, z, out_len=seq_len + 10, length_delta=length_delta)
+        length_modified = hard_decode(model, z, out_len=seq_len + 10, length_delta=length_delta)
         rendered = model.render_from_latents(z, seq_len)
         lengths = rendered["lengths"][0].detach().cpu()
 
