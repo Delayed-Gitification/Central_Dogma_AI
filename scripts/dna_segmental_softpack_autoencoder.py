@@ -257,7 +257,7 @@ def loss_for_batch(
     latent_l2 = z.pow(2).mean()
     sharp_loss = (rendered["keep"] * (1.0 - rendered["keep"])).mean()
     active_segments = torch.sigmoid((rendered["lengths"] - active_segment_threshold) / active_segment_temperature)
-    active_segment_loss = active_segments.mean()
+    active_segment_loss = active_segments.sum(dim=1).mean()
     loss = (
         recon_loss
         + length_weight * length_loss
@@ -458,6 +458,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--gate-temperature and --pack-temperature must be positive.")
     if args.batch_size <= 0 or args.val_batches <= 0:
         raise ValueError("--batch-size and --val-batches must be positive.")
+    if args.active_segment_temperature <= 0:
+        raise ValueError("--active-segment-temperature must be positive.")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -501,6 +503,9 @@ def train(args: argparse.Namespace) -> None:
             length_weight=args.length_weight,
             latent_l2_weight=args.latent_l2_weight,
             sharp_weight=sharp_weight,
+            active_segment_weight=args.active_segment_weight,
+            active_segment_threshold=args.active_segment_threshold,
+            active_segment_temperature=args.active_segment_temperature,
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -521,6 +526,9 @@ def train(args: argparse.Namespace) -> None:
                     length_weight=args.length_weight,
                     latent_l2_weight=args.latent_l2_weight,
                     sharp_weight=sharp_weight,
+                    active_segment_weight=args.active_segment_weight,
+                    active_segment_threshold=args.active_segment_threshold,
+                    active_segment_temperature=args.active_segment_temperature,
                 )
             model.train()
 
@@ -543,6 +551,7 @@ def train(args: argparse.Namespace) -> None:
             print(format_metrics("train", loss, rendered, batch))
             print(format_metrics("val", torch.tensor(val_loss), val_rendered, val_batch))
             print(summarise_lengths(val_rendered["lengths"], val_rendered["total_len"]))
+            print(summarise_active_segments(val_rendered["active_segments"]))
 
     torch.save(
         {
@@ -572,6 +581,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pack-temperature", type=float, default=0.1)
     parser.add_argument("--sharp-weight", type=float, default=0.002)
     parser.add_argument("--sharp-warmup-frac", type=float, default=0.2)
+    parser.add_argument("--active-segment-weight", type=float, default=0.0)
+    parser.add_argument("--active-segment-threshold", type=float, default=1.0)
+    parser.add_argument("--active-segment-temperature", type=float, default=0.5)
     parser.add_argument("--encoder-hidden-dim", type=int, default=96)
     parser.add_argument("--encoder-layers", type=int, default=2)
     parser.add_argument("--decoder-hidden-dim", type=int, default=64)
