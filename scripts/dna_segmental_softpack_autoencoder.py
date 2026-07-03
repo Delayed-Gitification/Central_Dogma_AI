@@ -246,6 +246,9 @@ def loss_for_batch(
     length_weight: float,
     latent_l2_weight: float,
     sharp_weight: float,
+    active_segment_weight: float,
+    active_segment_threshold: float,
+    active_segment_temperature: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     z, rendered = model(target, seq_len)
     soft_dna = rendered["soft_dna"].clamp_min(1e-8)
@@ -253,7 +256,15 @@ def loss_for_batch(
     length_loss = F.smooth_l1_loss(rendered["total_len"], torch.full_like(rendered["total_len"], float(seq_len)))
     latent_l2 = z.pow(2).mean()
     sharp_loss = (rendered["keep"] * (1.0 - rendered["keep"])).mean()
-    loss = recon_loss + length_weight * length_loss + latent_l2_weight * latent_l2 + sharp_weight * sharp_loss
+    active_segments = torch.sigmoid((rendered["lengths"] - active_segment_threshold) / active_segment_temperature)
+    active_segment_loss = active_segments.mean()
+    loss = (
+        recon_loss
+        + length_weight * length_loss
+        + latent_l2_weight * latent_l2
+        + sharp_weight * sharp_loss
+        + active_segment_weight * active_segment_loss
+    )
     return loss, {
         **rendered,
         "z": z.detach(),
@@ -261,6 +272,8 @@ def loss_for_batch(
         "length_loss": length_loss.detach(),
         "latent_l2": latent_l2.detach(),
         "sharp_loss": sharp_loss.detach(),
+        "active_segment_loss": active_segment_loss.detach(),
+        "active_segments": active_segments.detach(),
     }
 
 
@@ -329,12 +342,21 @@ def summarise_lengths(lengths: torch.Tensor, total_len: torch.Tensor) -> str:
     )
 
 
+def summarise_active_segments(active_segments: torch.Tensor) -> str:
+    active_count = active_segments.detach().sum(dim=1)
+    return (
+        f"active {active_count.mean().item():.1f}/{active_count.std(unbiased=False).item():.1f} "
+        f"range {active_count.min().item():.1f}-{active_count.max().item():.1f}"
+    )
+
+
 def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Tensor], target: torch.Tensor) -> str:
     metrics = reconstruction_metrics(rendered["soft_dna"], target)
     return (
         f"{prefix:<5} loss {loss.item():.4f} ce {rendered['recon_loss'].item():.4f} "
         f"acc {metrics['accuracy']:.3f} exact {metrics['exact']:.3f} "
         f"len {rendered['length_loss'].item():.3f} "
+        f"active_loss {rendered['active_segment_loss'].item():.3f} "
         f"base_ent {rendered['base_entropy'].item():.3f} "
         f"pack_ent {rendered['pack_entropy'].item():.3f} "
         f"pack_conf {rendered['pack_confidence'].item():.3f}"
@@ -352,6 +374,9 @@ def evaluate_fresh_batches(
     length_weight: float,
     latent_l2_weight: float,
     sharp_weight: float,
+    active_segment_weight: float,
+    active_segment_threshold: float,
+    active_segment_temperature: float,
 ) -> tuple[float, dict[str, float], dict[str, torch.Tensor], torch.Tensor]:
     total_loss = 0.0
     total_accuracy = 0.0
@@ -367,6 +392,9 @@ def evaluate_fresh_batches(
             length_weight=length_weight,
             latent_l2_weight=latent_l2_weight,
             sharp_weight=sharp_weight,
+            active_segment_weight=active_segment_weight,
+            active_segment_threshold=active_segment_threshold,
+            active_segment_temperature=active_segment_temperature,
         )
         metrics = reconstruction_metrics(rendered["soft_dna"], batch)
         total_loss += loss.item()
