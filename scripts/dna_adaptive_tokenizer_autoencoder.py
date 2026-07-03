@@ -823,15 +823,15 @@ def train(args: argparse.Namespace) -> None:
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "args": vars(args),
-                        "step": step,
-                        "validation_loss": best_val_loss,
-                    },
-                    checkpoint_dir / "best.pt",
-                )
+                checkpoint_payload = {
+                    "model_state_dict": model.state_dict(),
+                    "args": vars(args),
+                    "step": step,
+                    "validation_loss": best_val_loss,
+                }
+                torch.save(checkpoint_payload, checkpoint_dir / "best.pt")
+                if args.save_all_bests:
+                    torch.save(checkpoint_payload, checkpoint_dir / f"best_step_{step:09d}.pt")
 
             for line in compact_status(
                 step=step,
@@ -909,6 +909,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose-probe", action="store_true")
     parser.add_argument("--verbose-metrics", action="store_true")
     parser.add_argument("--checkpoint-dir", default="checkpoints/dna_adaptive_tokenizer_autoencoder")
+    parser.add_argument("--save-all-bests", action="store_true")
     parser.add_argument("--mps", action="store_true")
     parser.add_argument("--seed", type=int, default=1)
     return parser.parse_args()
