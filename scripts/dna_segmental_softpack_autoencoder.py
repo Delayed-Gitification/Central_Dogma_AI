@@ -148,9 +148,7 @@ class QuerySegmentEncoder(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.segment_queries = nn.Parameter(torch.empty(num_segments, hidden_dim))
         self.to_latent = nn.Linear(hidden_dim, latent_dim)
-        self.segment_embedding = nn.Parameter(torch.zeros(num_segments, latent_dim))
         nn.init.normal_(self.segment_queries, mean=0.0, std=hidden_dim**-0.5)
-        nn.init.normal_(self.segment_embedding, mean=0.0, std=0.02)
 
     def forward(self, target: torch.Tensor) -> torch.Tensor:
         one_hot = F.one_hot(target, num_classes=4).to(dtype=torch.float32)
@@ -169,7 +167,7 @@ class QuerySegmentEncoder(nn.Module):
 
         attention = logits.softmax(dim=-1)
         context = torch.einsum("bml,bld->bmd", attention, features)
-        return self.to_latent(context) + self.segment_embedding[None, :, :]
+        return self.to_latent(context)
 
 
 class SegmentalSoftpackAutoencoder(nn.Module):
@@ -221,22 +219,13 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         self.usage_head = nn.Linear(latent_dim, 1)
         initial_raw_length = seq_len / float(num_segments * initial_active_fraction)
         initial_raw_length = min(max(initial_raw_length, 1e-3), max_slots_per_segment - 1e-3)
-        self.segment_length_logit_bias = nn.Parameter(torch.empty(num_segments))
-        self.segment_usage_logit_bias = nn.Parameter(torch.empty(num_segments))
-        nn.init.zeros_(self.length_head.weight)
-        nn.init.zeros_(self.length_head.bias)
+        # Keep the jitter args for CLI/checkpoint compatibility, but do not create
+        # trainable per-segment length templates. Length/usage must come from z.
+        _ = initial_length_jitter, initial_usage_jitter
+        nn.init.normal_(self.length_head.weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.length_head.bias, logit(initial_raw_length / float(max_slots_per_segment)))
         nn.init.normal_(self.usage_head.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.usage_head.bias)
-        nn.init.normal_(
-            self.segment_length_logit_bias,
-            mean=logit(initial_raw_length / float(max_slots_per_segment)),
-            std=initial_length_jitter,
-        )
-        nn.init.normal_(
-            self.segment_usage_logit_bias,
-            mean=logit(initial_active_fraction),
-            std=initial_usage_jitter,
-        )
+        nn.init.constant_(self.usage_head.bias, logit(initial_active_fraction))
 
     def encode(self, target: torch.Tensor) -> torch.Tensor:
         return self.encoder(target)
@@ -258,8 +247,8 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         base_logits = self.decoder(decoder_input)
         base_probs = base_logits.softmax(dim=-1)
 
-        raw_length_logits = self.length_head(z).squeeze(-1) + self.segment_length_logit_bias[None, :]
-        usage_logits = self.usage_head(z).squeeze(-1) + self.segment_usage_logit_bias[None, :]
+        raw_length_logits = self.length_head(z).squeeze(-1)
+        usage_logits = self.usage_head(z).squeeze(-1)
         raw_lengths = self.max_slots_per_segment * torch.sigmoid(raw_length_logits)
         segment_usage = torch.sigmoid(usage_logits)
         lengths = raw_lengths * segment_usage
@@ -504,6 +493,15 @@ def summarise_lengths(lengths: torch.Tensor, total_len: torch.Tensor) -> str:
     )
 
 
+def summarise_length_conditioning(lengths: torch.Tensor, segment_usage: torch.Tensor) -> str:
+    lengths = lengths.detach()
+    segment_usage = segment_usage.detach()
+    return (
+        f"length_input_std {lengths.std(dim=0, unbiased=False).mean().item():.2f} "
+        f"usage_input_std {segment_usage.std(dim=0, unbiased=False).mean().item():.3f}"
+    )
+
+
 def summarise_active_segments(active_segments: torch.Tensor) -> str:
     active_count = active_segments.detach().sum(dim=1)
     return (
@@ -568,22 +566,33 @@ def tensor_correlation(first: torch.Tensor, second: torch.Tensor) -> float:
     return float((first * second).sum().div(denom).item())
 
 
-def summarise_segment_entropy(rendered: dict[str, torch.Tensor], target: torch.Tensor) -> str:
+def local_base_entropy(target: torch.Tensor, radius: int = 6) -> torch.Tensor:
+    one_hot = F.one_hot(target, num_classes=4).to(dtype=torch.float32).transpose(1, 2)
+    kernel_size = 2 * radius + 1
+    base_kernel = torch.ones(4, 1, kernel_size, device=target.device, dtype=one_hot.dtype)
+    mask_kernel = torch.ones(1, 1, kernel_size, device=target.device, dtype=one_hot.dtype)
+    padded_bases = F.pad(one_hot, (radius, radius))
+    padded_mask = F.pad(torch.ones(target.shape[0], 1, target.shape[1], device=target.device), (radius, radius))
+    counts = F.conv1d(padded_bases, base_kernel, groups=4)
+    totals = F.conv1d(padded_mask, mask_kernel).clamp_min(1.0)
+    probs = counts / totals
+    entropy = -(probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()).sum(dim=1) / math.log(4.0)
+    return entropy
+
+
+def summarise_segment_entropy(rendered: dict[str, torch.Tensor], target: torch.Tensor, radius: int = 6) -> str:
     lengths = rendered["lengths"].detach()
     weights = rendered["weights"].detach()
     batch_size, num_segments = lengths.shape
     max_slots_per_segment = weights.shape[1] // num_segments
     segment_weights = weights.reshape(batch_size, num_segments, max_slots_per_segment, target.shape[1]).sum(dim=2)
     segment_mass = segment_weights.sum(dim=-1)
-
-    one_hot = F.one_hot(target, num_classes=4).to(dtype=segment_weights.dtype)
-    base_mass = torch.einsum("bml,blc->bmc", segment_weights, one_hot)
-    base_probs = base_mass / (base_mass.sum(dim=-1, keepdim=True) + 1e-8)
-    entropy = -(base_probs.clamp_min(1e-8) * base_probs.clamp_min(1e-8).log()).sum(dim=-1) / math.log(4.0)
+    position_entropy = local_base_entropy(target, radius=radius).to(dtype=segment_weights.dtype)
+    entropy = (segment_weights * position_entropy[:, None, :]).sum(dim=-1) / segment_mass.clamp_min(1e-8)
 
     mask = segment_mass > 0.25
     if not mask.any():
-        return "seg_entropy n/a"
+        return "local_seg_entropy n/a"
 
     length_values = lengths[mask].detach().float().cpu()
     entropy_values = entropy[mask].detach().float().cpu()
@@ -592,9 +601,9 @@ def summarise_segment_entropy(rendered: dict[str, torch.Tensor], target: torch.T
     short_entropy = entropy_values[order[:group_size]].mean()
     long_entropy = entropy_values[order[-group_size:]].mean()
     return (
-        f"seg_entropy {entropy_values.mean().item():.3f} "
-        f"len_entropy_corr {tensor_correlation(length_values, entropy_values):.3f} "
-        f"short_entropy {short_entropy.item():.3f} long_entropy {long_entropy.item():.3f}"
+        f"local_seg_entropy {entropy_values.mean().item():.3f} "
+        f"len_local_entropy_corr {tensor_correlation(length_values, entropy_values):.3f} "
+        f"short_local_entropy {short_entropy.item():.3f} long_local_entropy {long_entropy.item():.3f}"
     )
 
 
@@ -963,8 +972,13 @@ def train(args: argparse.Namespace) -> None:
 
     model = build_model_from_args(args).to(device)
     if checkpoint is not None:
-        model.load_state_dict(checkpoint["model_state_dict"])
+        load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         print(f"loaded checkpoint: {args.load_checkpoint}")
+        if load_result.missing_keys or load_result.unexpected_keys:
+            print(
+                "checkpoint compatibility: "
+                f"missing={len(load_result.missing_keys)} unexpected={len(load_result.unexpected_keys)}"
+            )
 
     if args.diagnostics_only:
         run_manifold_diagnostics(
@@ -1094,6 +1108,7 @@ def train(args: argparse.Namespace) -> None:
             print(format_metrics("train", loss, rendered, batch))
             print(format_metrics("val", torch.tensor(val_loss), val_rendered, val_batch))
             print(summarise_lengths(val_rendered["lengths"], val_rendered["total_len"]))
+            print(summarise_length_conditioning(val_rendered["lengths"], val_rendered["segment_usage"]))
             print(summarise_active_segments(val_rendered["active_segments"]))
             print(summarise_segment_usage(val_rendered["segment_usage"]))
             print(summarise_true_blocks(val_block_lengths))
