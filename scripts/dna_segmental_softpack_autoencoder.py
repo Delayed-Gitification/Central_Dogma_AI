@@ -50,21 +50,24 @@ def motif_repeat_block(rng: random.Random, length: int) -> str:
     return (motif * ((length + motif_length - 1) // motif_length))[:length]
 
 
+BLOCK_SPECS = (
+    ("random", random_dna_block, 3, 8),
+    ("homopolymer", homopolymer_block, 16, 48),
+    ("dinucleotide", dinucleotide_repeat_block, 14, 40),
+    ("pyrimidine", pyrimidine_rich_block, 8, 28),
+    ("motif", motif_repeat_block, 10, 36),
+)
+BLOCK_BUILDERS = {block_type: builder for block_type, builder, _, _ in BLOCK_SPECS}
+
+
 def generate_segmental_sequence_with_blocks(seq_len: int, rng: random.Random) -> tuple[str, list[int], list[str]]:
-    builders = [
-        ("random", random_dna_block, 3, 8),
-        ("homopolymer", homopolymer_block, 16, 48),
-        ("dinucleotide", dinucleotide_repeat_block, 14, 40),
-        ("pyrimidine", pyrimidine_rich_block, 8, 28),
-        ("motif", motif_repeat_block, 10, 36),
-    ]
     parts = []
     block_lengths = []
     block_types = []
     total_length = 0
     while total_length < seq_len:
         remaining = seq_len - total_length
-        block_type, builder, min_len, max_len = rng.choice(builders)
+        block_type, builder, min_len, max_len = rng.choice(BLOCK_SPECS)
         length = min(remaining, rng.randint(min_len, max_len))
         part = builder(rng, length)
         parts.append(part)
@@ -72,6 +75,31 @@ def generate_segmental_sequence_with_blocks(seq_len: int, rng: random.Random) ->
         block_types.append(block_type)
         total_length += len(part)
     return "".join(parts)[:seq_len], block_lengths, block_types
+
+
+def generate_controlled_block_sequence(
+    *,
+    seq_len: int,
+    rng: random.Random,
+    block_type: str,
+    block_len: int,
+) -> tuple[str, list[int], list[str]]:
+    if block_type not in BLOCK_BUILDERS:
+        raise ValueError(f"Unknown block type for probe: {block_type}")
+    if block_len <= 0:
+        raise ValueError("Probe block length must be positive.")
+    builder = BLOCK_BUILDERS[block_type]
+    parts = []
+    block_lengths = []
+    block_types = []
+    total_length = 0
+    while total_length < seq_len:
+        length = min(block_len, seq_len - total_length)
+        parts.append(builder(rng, length))
+        block_lengths.append(length)
+        block_types.append(block_type)
+        total_length += length
+    return "".join(parts), block_lengths, block_types
 
 
 def generate_segmental_sequence(seq_len: int, rng: random.Random) -> str:
@@ -607,6 +635,79 @@ def summarise_segment_entropy(rendered: dict[str, torch.Tensor], target: torch.T
     )
 
 
+def controlled_probe_diagnostics(
+    *,
+    model: SegmentalSoftpackAutoencoder,
+    seed: int,
+    device: torch.device,
+    seq_len: int,
+    examples_per_condition: int,
+    block_lengths: list[int],
+    block_types: list[str],
+    active_segment_threshold: float,
+    active_segment_temperature: float,
+) -> list[str]:
+    if examples_per_condition <= 0 or not block_lengths or not block_types:
+        return []
+
+    probe_rng = random.Random(seed)
+    sequences = []
+    labels: list[tuple[str, int]] = []
+    for block_type in block_types:
+        for block_len in block_lengths:
+            for _ in range(examples_per_condition):
+                sequence, _, _ = generate_controlled_block_sequence(
+                    seq_len=seq_len,
+                    rng=probe_rng,
+                    block_type=block_type,
+                    block_len=block_len,
+                )
+                sequences.append(sequence_to_tensor(sequence))
+                labels.append((block_type, block_len))
+    if not sequences:
+        return []
+
+    batch = torch.stack(sequences).to(device)
+    _, rendered = model(batch, seq_len)
+    predicted = rendered["soft_dna"].argmax(dim=-1)
+    correct = predicted == batch
+    per_example_accuracy = correct.float().mean(dim=1)
+    per_example_exact = correct.all(dim=1).float()
+    length_active = torch.sigmoid(
+        (rendered["lengths"] - active_segment_threshold) / active_segment_temperature
+    )
+    active_segments = rendered["segment_usage"] * length_active
+    active_count = active_segments.sum(dim=1)
+    mean_active_length = rendered["total_len"] / active_count.clamp_min(1e-6)
+    max_length = rendered["lengths"].max(dim=1).values
+    length_std = rendered["lengths"].std(dim=1, unbiased=False)
+
+    lines = ["probe fixed entropy/length:"]
+    label_to_indices: dict[tuple[str, int], list[int]] = {}
+    for index, label in enumerate(labels):
+        label_to_indices.setdefault(label, []).append(index)
+
+    for block_type in block_types:
+        parts = []
+        for block_len in block_lengths:
+            indices = label_to_indices.get((block_type, block_len), [])
+            if not indices:
+                continue
+            index_tensor = torch.tensor(indices, device=device)
+            parts.append(
+                f"b{block_len:02d} "
+                f"acc{per_example_accuracy[index_tensor].mean().item():.2f} "
+                f"ex{per_example_exact[index_tensor].mean().item():.2f} "
+                f"act{active_count[index_tensor].mean().item():.1f} "
+                f"seg{mean_active_length[index_tensor].mean().item():.1f} "
+                f"max{max_length[index_tensor].mean().item():.1f} "
+                f"std{length_std[index_tensor].mean().item():.1f}"
+            )
+        if parts:
+            lines.append(f"probe {block_type:<12} " + " | ".join(parts))
+    return lines
+
+
 def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Tensor], target: torch.Tensor) -> str:
     metrics = reconstruction_metrics(rendered["soft_dna"], target)
     return (
@@ -743,6 +844,19 @@ def run_diagnostics(
 
 def parse_float_list(values: str) -> list[float]:
     return [float(value.strip()) for value in values.split(",") if value.strip()]
+
+
+def parse_int_list(values: str) -> list[int]:
+    return [int(value.strip()) for value in values.split(",") if value.strip()]
+
+
+def parse_block_type_list(values: str) -> list[str]:
+    block_types = [value.strip() for value in values.split(",") if value.strip()]
+    unknown = [block_type for block_type in block_types if block_type not in BLOCK_BUILDERS]
+    if unknown:
+        known = ", ".join(sorted(BLOCK_BUILDERS))
+        raise ValueError(f"Unknown --probe-block-types value(s): {unknown}. Known types: {known}.")
+    return block_types
 
 
 def sequence_change_fraction(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
@@ -959,8 +1073,24 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--length-std-target and --length-std-weight must be non-negative.")
     if args.initial_length_jitter < 0 or args.initial_usage_jitter < 0:
         raise ValueError("--initial-length-jitter and --initial-usage-jitter must be non-negative.")
+    if args.probe_examples < 0:
+        raise ValueError("--probe-examples must be non-negative.")
     if args.diagnostics_only and checkpoint is None:
         raise ValueError("--diagnostics-only requires --load-checkpoint.")
+
+    raw_probe_block_lengths = parse_int_list(args.probe_block_lengths)
+    probe_block_lengths = []
+    seen_probe_lengths = set()
+    for block_len in raw_probe_block_lengths:
+        if block_len <= 0:
+            raise ValueError("--probe-block-lengths must contain positive integers.")
+        block_len = min(block_len, args.seq_len)
+        if block_len not in seen_probe_lengths:
+            probe_block_lengths.append(block_len)
+            seen_probe_lengths.add(block_len)
+    probe_block_types = parse_block_type_list(args.probe_block_types)
+    if args.probe_examples > 0 and (not probe_block_lengths or not probe_block_types):
+        raise ValueError("--probe-block-lengths and --probe-block-types must be non-empty when probes are enabled.")
 
     checkpoint_dir = Path(args.checkpoint_dir)
     if not args.diagnostics_only:
@@ -1013,6 +1143,13 @@ def train(args: argparse.Namespace) -> None:
         f"length_std_target={args.length_std_target}; "
         f"length_std_weight={args.length_std_weight}"
     )
+    if args.probe_examples > 0:
+        print(
+            "probe diagnostics: "
+            f"examples_per_condition={args.probe_examples}; "
+            f"block_lengths={','.join(str(value) for value in probe_block_lengths)}; "
+            f"block_types={','.join(probe_block_types)}"
+        )
 
     for step in range(args.steps):
         batch, block_lengths, block_mask, _, _ = make_batch_with_blocks(
@@ -1086,6 +1223,17 @@ def train(args: argparse.Namespace) -> None:
                     active_budget_weight=active_budget_weight,
                     usage_sharp_weight=usage_sharp_weight,
                 )
+                probe_lines = controlled_probe_diagnostics(
+                    model=model,
+                    seed=args.seed + 3_000_000,
+                    device=device,
+                    seq_len=args.seq_len,
+                    examples_per_condition=args.probe_examples,
+                    block_lengths=probe_block_lengths,
+                    block_types=probe_block_types,
+                    active_segment_threshold=args.active_segment_threshold,
+                    active_segment_temperature=args.active_segment_temperature,
+                )
             model.train()
 
             if val_loss < best_val_loss:
@@ -1114,6 +1262,8 @@ def train(args: argparse.Namespace) -> None:
             print(summarise_true_blocks(val_block_lengths))
             print(f"block_len_corr {block_length_correlation(val_rendered['lengths'], val_block_lengths):.3f}")
             print(summarise_segment_entropy(val_rendered, val_batch))
+            for probe_line in probe_lines:
+                print(probe_line)
 
     torch.save(
         {
@@ -1173,6 +1323,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial-length-jitter", type=float, default=0.05)
     parser.add_argument("--initial-usage-jitter", type=float, default=0.25)
     parser.add_argument("--decoder-hidden-dim", type=int, default=64)
+    parser.add_argument("--probe-examples", type=int, default=4)
+    parser.add_argument("--probe-block-lengths", default="4,8,16,32,48")
+    parser.add_argument("--probe-block-types", default="random,homopolymer,dinucleotide,motif")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--val-batches", type=int, default=4)
     parser.add_argument("--print-every", type=int, default=500)
