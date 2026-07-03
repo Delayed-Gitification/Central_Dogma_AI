@@ -225,6 +225,99 @@ def estimated_sequence_bits(sequence: str, k_values: list[int], percentile: floa
     )
 
 
+def sample_poisson(rng: random.Random, lam: float) -> int:
+    if lam <= 0:
+        return 0
+    threshold = math.exp(-lam)
+    product = 1.0
+    count = 0
+    while product > threshold:
+        count += 1
+        product *= rng.random()
+    return count - 1
+
+
+def sample_program_repeat_count(
+    *,
+    rng: random.Random,
+    max_repeat: int,
+    single_repeat_prob: float,
+    long_repeat_prob: float,
+    repeat_lambda: float,
+    long_repeat_lambda: float,
+) -> int:
+    if max_repeat <= 1:
+        return 1
+    draw = rng.random()
+    if draw < single_repeat_prob:
+        repeat = 1
+    elif draw < single_repeat_prob + long_repeat_prob:
+        repeat = 1 + sample_poisson(rng, long_repeat_lambda)
+    else:
+        repeat = 1 + sample_poisson(rng, repeat_lambda)
+    return max(1, min(max_repeat, repeat))
+
+
+def generate_motif_program_sequence(
+    *,
+    max_seq_len: int,
+    min_seq_len: int,
+    max_motifs: int,
+    max_motif_len: int,
+    repeat_lambda: float,
+    long_repeat_lambda: float,
+    long_repeat_prob: float,
+    single_repeat_prob: float,
+    rng: random.Random,
+    max_tries: int,
+) -> tuple[str, str, float, float]:
+    best_sequence = ""
+    best_bits = float("inf")
+    max_motifs = max(1, max_motifs)
+    max_motif_len = max(1, max_motif_len)
+
+    for _ in range(max_tries):
+        motif_count = rng.choices(
+            population=list(range(1, max_motifs + 1)),
+            weights=[1.0 / float(index) for index in range(1, max_motifs + 1)],
+            k=1,
+        )[0]
+        parts = []
+        program_bits = math.log2(float(motif_count + 1))
+        for motif_index in range(motif_count):
+            remaining = max_seq_len - sum(len(part) for part in parts)
+            remaining_motifs = motif_count - motif_index
+            if remaining <= 0:
+                break
+            motif_len = rng.randint(1, min(max_motif_len, remaining))
+            motif = random_dna_block(rng, motif_len)
+            max_repeat = max(1, (remaining - (remaining_motifs - 1)) // motif_len)
+            repeat = sample_program_repeat_count(
+                rng=rng,
+                max_repeat=max_repeat,
+                single_repeat_prob=single_repeat_prob,
+                long_repeat_prob=long_repeat_prob,
+                repeat_lambda=repeat_lambda,
+                long_repeat_lambda=long_repeat_lambda,
+            )
+            parts.append(motif * repeat)
+            program_bits += 2.0 * motif_len + math.log2(float(repeat + 1))
+
+        sequence = "".join(parts)[:max_seq_len]
+        if not sequence:
+            continue
+        if len(sequence) >= min_seq_len:
+            return sequence, f"program{motif_count}", program_bits, program_bits / float(len(sequence))
+        if not best_sequence or len(sequence) > len(best_sequence):
+            best_sequence = sequence
+            best_bits = program_bits
+
+    if not best_sequence:
+        best_sequence = rng.choice(DNA_BASES)
+        best_bits = 2.0
+    return best_sequence, "program_fallback", best_bits, best_bits / float(len(best_sequence))
+
+
 def generate_entropy_budget_sequence(
     *,
     max_seq_len: int,
@@ -265,9 +358,55 @@ def generate_entropy_budget_sequence(
     return best_sequence, best_kind, best_bits, best_entropy
 
 
+def generate_single_token_curriculum_sequence(
+    *,
+    curriculum_mode: str,
+    max_seq_len: int,
+    min_seq_len: int,
+    bit_budget: float,
+    kmer_sizes: list[int],
+    entropy_percentile: float,
+    families: list[str],
+    rng: random.Random,
+    max_tries: int,
+    program_max_motifs: int,
+    program_max_motif_len: int,
+    program_repeat_lambda: float,
+    program_long_repeat_lambda: float,
+    program_long_repeat_prob: float,
+    program_single_repeat_prob: float,
+) -> tuple[str, str, float, float]:
+    if curriculum_mode == "program":
+        return generate_motif_program_sequence(
+            max_seq_len=max_seq_len,
+            min_seq_len=min_seq_len,
+            max_motifs=program_max_motifs,
+            max_motif_len=program_max_motif_len,
+            repeat_lambda=program_repeat_lambda,
+            long_repeat_lambda=program_long_repeat_lambda,
+            long_repeat_prob=program_long_repeat_prob,
+            single_repeat_prob=program_single_repeat_prob,
+            rng=rng,
+            max_tries=max_tries,
+        )
+    if curriculum_mode == "entropy":
+        return generate_entropy_budget_sequence(
+            max_seq_len=max_seq_len,
+            min_seq_len=min_seq_len,
+            bit_budget=bit_budget,
+            kmer_sizes=kmer_sizes,
+            entropy_percentile=entropy_percentile,
+            families=families,
+            rng=rng,
+            max_tries=max_tries,
+        )
+    raise ValueError(f"Unknown curriculum mode: {curriculum_mode}")
+
+
 def make_single_token_entropy_batch(
     *,
     batch_size: int,
+    curriculum_mode: str,
     max_seq_len: int,
     min_seq_len: int,
     bit_budget: float,
@@ -277,6 +416,12 @@ def make_single_token_entropy_batch(
     rng: random.Random,
     device: torch.device,
     max_tries: int,
+    program_max_motifs: int,
+    program_max_motif_len: int,
+    program_repeat_lambda: float,
+    program_long_repeat_lambda: float,
+    program_long_repeat_prob: float,
+    program_single_repeat_prob: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
     target = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
     mask = torch.zeros(batch_size, max_seq_len, dtype=torch.float32)
@@ -285,7 +430,8 @@ def make_single_token_entropy_batch(
     entropies = torch.zeros(batch_size, dtype=torch.float32)
     kinds = []
     for batch_index in range(batch_size):
-        sequence, kind, sequence_bits, entropy = generate_entropy_budget_sequence(
+        sequence, kind, sequence_bits, entropy = generate_single_token_curriculum_sequence(
+            curriculum_mode=curriculum_mode,
             max_seq_len=max_seq_len,
             min_seq_len=min_seq_len,
             bit_budget=bit_budget,
@@ -294,6 +440,12 @@ def make_single_token_entropy_batch(
             families=families,
             rng=rng,
             max_tries=max_tries,
+            program_max_motifs=program_max_motifs,
+            program_max_motif_len=program_max_motif_len,
+            program_repeat_lambda=program_repeat_lambda,
+            program_long_repeat_lambda=program_long_repeat_lambda,
+            program_long_repeat_prob=program_long_repeat_prob,
+            program_single_repeat_prob=program_single_repeat_prob,
         )
         sequence_tensor = sequence_to_tensor(sequence)
         seq_len = len(sequence)
@@ -317,6 +469,7 @@ def make_single_token_entropy_family_batch(
     *,
     seed_count: int,
     family_size: int,
+    curriculum_mode: str,
     max_seq_len: int,
     min_seq_len: int,
     bit_budget: float,
@@ -330,6 +483,12 @@ def make_single_token_entropy_family_batch(
     indel_rate: float,
     repeat_rate: float,
     max_edits: int,
+    program_max_motifs: int,
+    program_max_motif_len: int,
+    program_repeat_lambda: float,
+    program_long_repeat_lambda: float,
+    program_long_repeat_prob: float,
+    program_single_repeat_prob: float,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -353,7 +512,8 @@ def make_single_token_entropy_family_batch(
     family_ids = torch.zeros(total, dtype=torch.long)
     row = 0
     for family_index in range(seed_count):
-        seed_sequence, kind, _seed_bits, _seed_entropy = generate_entropy_budget_sequence(
+        seed_sequence, kind, _seed_bits, _seed_entropy = generate_single_token_curriculum_sequence(
+            curriculum_mode=curriculum_mode,
             max_seq_len=max_seq_len,
             min_seq_len=min_seq_len,
             bit_budget=bit_budget,
@@ -362,6 +522,12 @@ def make_single_token_entropy_family_batch(
             families=families,
             rng=rng,
             max_tries=max_tries,
+            program_max_motifs=program_max_motifs,
+            program_max_motif_len=program_max_motif_len,
+            program_repeat_lambda=program_repeat_lambda,
+            program_long_repeat_lambda=program_long_repeat_lambda,
+            program_long_repeat_prob=program_long_repeat_prob,
+            program_single_repeat_prob=program_single_repeat_prob,
         )
         variants = [seed_sequence]
         for variant_index in range(1, family_size):
@@ -806,6 +972,67 @@ def reconstruction_metrics(soft_dna: torch.Tensor, target: torch.Tensor, mask: t
     return {"accuracy": float(accuracy.item()), "exact": float(exact.item())}
 
 
+def softmin(values: torch.Tensor, temperature: float) -> torch.Tensor:
+    temperature = max(temperature, 1e-6)
+    weights = torch.softmax(-values / temperature, dim=0)
+    return (weights * values).sum()
+
+
+def soft_alignment_nll_one(
+    soft_dna: torch.Tensor,
+    target: torch.Tensor,
+    target_len: int,
+    *,
+    temperature: float,
+    gap_cost: float,
+) -> torch.Tensor:
+    target_len = max(1, min(target_len, soft_dna.shape[0]))
+    probs = soft_dna[:target_len].clamp_min(1e-8)
+    target_slice = target[:target_len]
+    pair_cost = -probs[:, None, :].expand(target_len, target_len, 4).gather(
+        -1,
+        target_slice[None, :, None].expand(target_len, target_len, 1),
+    ).squeeze(-1).log()
+
+    gap = pair_cost.new_tensor(gap_cost)
+    previous = [pair_cost.new_tensor(float(j) * gap_cost) for j in range(target_len + 1)]
+    for out_index in range(1, target_len + 1):
+        current = [pair_cost.new_tensor(float(out_index) * gap_cost)]
+        for target_index in range(1, target_len + 1):
+            candidates = torch.stack(
+                [
+                    previous[target_index - 1] + pair_cost[out_index - 1, target_index - 1],
+                    previous[target_index] + gap,
+                    current[target_index - 1] + gap,
+                ]
+            )
+            current.append(softmin(candidates, temperature))
+        previous = current
+    return previous[target_len] / float(target_len)
+
+
+def soft_alignment_nll(
+    soft_dna: torch.Tensor,
+    target: torch.Tensor,
+    target_lengths: torch.Tensor,
+    *,
+    temperature: float,
+    gap_cost: float,
+) -> torch.Tensor:
+    losses = []
+    for batch_index in range(soft_dna.shape[0]):
+        losses.append(
+            soft_alignment_nll_one(
+                soft_dna[batch_index],
+                target[batch_index],
+                int(round(float(target_lengths[batch_index].detach().cpu().item()))),
+                temperature=temperature,
+                gap_cost=gap_cost,
+            )
+        )
+    return torch.stack(losses).mean()
+
+
 def loss_for_batch(
     *,
     model: AdaptiveTokenizerAutoencoder,
@@ -817,11 +1044,25 @@ def loss_for_batch(
     token_sharp_weight: float,
     decoder_sharp_weight: float,
     latent_l2_weight: float,
+    alignment_loss_weight: float = 0.0,
+    alignment_temperature: float = 0.1,
+    alignment_gap_cost: float = 0.75,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     rendered = model(target, mask)
     soft_dna = rendered["soft_dna"].clamp_min(1e-8)
     token_nll = -soft_dna.gather(-1, target[..., None]).squeeze(-1).log()
     recon_loss = (token_nll * mask).sum() / mask.sum().clamp_min(1.0)
+    alignment_loss = (
+        soft_alignment_nll(
+            soft_dna,
+            target,
+            target_lengths,
+            temperature=alignment_temperature,
+            gap_cost=alignment_gap_cost,
+        )
+        if alignment_loss_weight > 0
+        else recon_loss.detach() * 0.0
+    )
     length_loss = F.smooth_l1_loss(rendered["total_len"], target_lengths)
     token_count = rendered["token_usage"].sum(dim=1)
     token_cost = token_count.mean()
@@ -830,6 +1071,7 @@ def loss_for_batch(
     latent_l2 = rendered["latents"].pow(2).mean()
     loss = (
         recon_loss
+        + alignment_loss_weight * alignment_loss
         + length_weight * length_loss
         + token_cost_weight * token_cost
         + token_sharp_weight * token_sharp
@@ -839,6 +1081,7 @@ def loss_for_batch(
     return loss, {
         **rendered,
         "recon_loss": recon_loss.detach(),
+        "alignment_loss": alignment_loss.detach(),
         "length_loss": length_loss.detach(),
         "token_cost": token_cost.detach(),
         "token_sharp": token_sharp.detach(),
@@ -987,6 +1230,9 @@ def loss_for_positive_pair_batch(
     manifold_weight: float,
     manifold_position_weight: float,
     manifold_temperature: float,
+    alignment_loss_weight: float = 0.0,
+    alignment_temperature: float = 0.1,
+    alignment_gap_cost: float = 0.75,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     loss_a, rendered_a = loss_for_batch(
         model=model,
@@ -998,6 +1244,9 @@ def loss_for_positive_pair_batch(
         token_sharp_weight=token_sharp_weight,
         decoder_sharp_weight=decoder_sharp_weight,
         latent_l2_weight=latent_l2_weight,
+        alignment_loss_weight=alignment_loss_weight,
+        alignment_temperature=alignment_temperature,
+        alignment_gap_cost=alignment_gap_cost,
     )
     loss_b, rendered_b = loss_for_batch(
         model=model,
@@ -1009,6 +1258,9 @@ def loss_for_positive_pair_batch(
         decoder_sharp_weight=decoder_sharp_weight,
         token_sharp_weight=token_sharp_weight,
         latent_l2_weight=latent_l2_weight,
+        alignment_loss_weight=alignment_loss_weight,
+        alignment_temperature=alignment_temperature,
+        alignment_gap_cost=alignment_gap_cost,
     )
     manifold_loss, manifold_metrics = soft_position_aligned_latent_loss(
         rendered_a,
@@ -1044,6 +1296,9 @@ def loss_for_family_geometry_batch(
     manifold_weight: float,
     within_family_only: bool,
     similarity_margin: float,
+    alignment_loss_weight: float = 0.0,
+    alignment_temperature: float = 0.1,
+    alignment_gap_cost: float = 0.75,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     recon_loss, rendered = loss_for_batch(
         model=model,
@@ -1055,6 +1310,9 @@ def loss_for_family_geometry_batch(
         token_sharp_weight=token_sharp_weight,
         decoder_sharp_weight=decoder_sharp_weight,
         latent_l2_weight=latent_l2_weight,
+        alignment_loss_weight=alignment_loss_weight,
+        alignment_temperature=alignment_temperature,
+        alignment_gap_cost=alignment_gap_cost,
     )
     geometry_loss, geometry_metrics = rapidfuzz_geometry_loss(
         rendered,
@@ -1135,6 +1393,30 @@ def single_token_kmer_sizes(args: argparse.Namespace) -> list[int]:
     return parse_kmer_sizes(args.single_token_kmer_sizes)
 
 
+def single_token_generation_kwargs(
+    args: argparse.Namespace,
+    *,
+    families: list[str] | None = None,
+    kmer_sizes: list[int] | None = None,
+) -> dict:
+    return {
+        "curriculum_mode": args.curriculum_mode,
+        "max_seq_len": args.seq_len,
+        "min_seq_len": args.single_token_min_len,
+        "bit_budget": args.single_token_bit_budget,
+        "kmer_sizes": kmer_sizes if kmer_sizes is not None else single_token_kmer_sizes(args),
+        "entropy_percentile": args.single_token_entropy_percentile,
+        "families": families if families is not None else single_token_families(args),
+        "max_tries": args.single_token_max_tries,
+        "program_max_motifs": args.program_max_motifs,
+        "program_max_motif_len": args.program_max_motif_len,
+        "program_repeat_lambda": args.program_repeat_lambda,
+        "program_long_repeat_lambda": args.program_long_repeat_lambda,
+        "program_long_repeat_prob": args.program_long_repeat_prob,
+        "program_single_repeat_prob": args.program_single_repeat_prob,
+    }
+
+
 def curriculum_summary(rendered: dict[str, torch.Tensor]) -> str:
     if "info_bits" not in rendered or "entropy_per_base" not in rendered:
         return ""
@@ -1209,6 +1491,7 @@ def compact_status(
         ),
         (
             f"train loss {train_loss.item():.4f} ce {train_rendered['recon_loss'].item():.4f} "
+            f"align {train_rendered['alignment_loss'].item():.4f} "
             f"acc {train_metrics['accuracy']:.3f} exact {train_metrics['exact']:.3f} "
             f"len_loss {train_rendered['length_loss'].item():.3f} "
             f"tokens {train_tokens.mean().item():.2f}/{train_tokens.std(unbiased=False).item():.2f} "
@@ -1219,6 +1502,7 @@ def compact_status(
         ),
         (
             f"val   ce {val_rendered['recon_loss'].item():.4f} "
+            f"align {val_rendered['alignment_loss'].item():.4f} "
             f"len_loss {val_rendered['length_loss'].item():.3f} "
             f"tokens {val_tokens.mean().item():.2f}/{val_tokens.std(unbiased=False).item():.2f} "
             f"range {val_tokens.min().item():.1f}-{val_tokens.max().item():.1f} "
@@ -1247,6 +1531,7 @@ def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Te
             )
     return (
         f"{prefix:<5} loss {loss.item():.4f} ce {rendered['recon_loss'].item():.4f} "
+        f"align {rendered['alignment_loss'].item():.4f} "
         f"acc {metrics['accuracy']:.3f} exact {metrics['exact']:.3f} "
         f"len {rendered['length_loss'].item():.3f} "
         f"token_cost {rendered['token_cost'].item():.3f} "
@@ -1299,19 +1584,13 @@ def evaluate(
             target, mask, lengths, bits, entropies, sequences, _kinds, family_ids = make_single_token_entropy_family_batch(
                 seed_count=seed_count,
                 family_size=family_size,
-                max_seq_len=args.seq_len,
-                min_seq_len=args.single_token_min_len,
-                bit_budget=args.single_token_bit_budget,
-                kmer_sizes=kmer_sizes,
-                entropy_percentile=args.single_token_entropy_percentile,
-                families=families,
                 rng=rng,
                 device=device,
-                max_tries=args.single_token_max_tries,
                 substitution_rate=args.augment_substitution_rate,
                 indel_rate=args.augment_indel_rate,
                 repeat_rate=args.augment_repeat_rate,
                 max_edits=args.augment_max_edits,
+                **single_token_generation_kwargs(args, families=families, kmer_sizes=kmer_sizes),
             )
             loss, rendered = loss_for_family_geometry_batch(
                 model=model,
@@ -1328,19 +1607,16 @@ def evaluate(
                 manifold_weight=manifold_weight,
                 within_family_only=args.rapidfuzz_within_family_only,
                 similarity_margin=args.rapidfuzz_similarity_margin,
+                alignment_loss_weight=args.alignment_loss_weight,
+                alignment_temperature=args.alignment_temperature,
+                alignment_gap_cost=args.alignment_gap_cost,
             )
         else:
             target, mask, lengths, bits, entropies, _ = make_single_token_entropy_batch(
                 batch_size=args.batch_size,
-                max_seq_len=args.seq_len,
-                min_seq_len=args.single_token_min_len,
-                bit_budget=args.single_token_bit_budget,
-                kmer_sizes=kmer_sizes,
-                entropy_percentile=args.single_token_entropy_percentile,
-                families=families,
                 rng=rng,
                 device=device,
-                max_tries=args.single_token_max_tries,
+                **single_token_generation_kwargs(args, families=families, kmer_sizes=kmer_sizes),
             )
             loss, rendered = loss_for_batch(
                 model=model,
@@ -1352,6 +1628,9 @@ def evaluate(
                 token_sharp_weight=token_sharp_weight,
                 decoder_sharp_weight=decoder_sharp_weight,
                 latent_l2_weight=args.latent_l2_weight,
+                alignment_loss_weight=args.alignment_loss_weight,
+                alignment_temperature=args.alignment_temperature,
+                alignment_gap_cost=args.alignment_gap_cost,
             )
         rendered["info_bits"] = bits.detach()
         rendered["entropy_per_base"] = entropies.detach()
@@ -1474,15 +1753,9 @@ def run_diagnostics(model: AdaptiveTokenizerAutoencoder, rng: random.Random, dev
     with torch.no_grad():
         target, mask, lengths, bits, entropies, kinds = make_single_token_entropy_batch(
             batch_size=1,
-            max_seq_len=args.seq_len,
-            min_seq_len=args.single_token_min_len,
-            bit_budget=args.single_token_bit_budget,
-            kmer_sizes=single_token_kmer_sizes(args),
-            entropy_percentile=args.single_token_entropy_percentile,
-            families=single_token_families(args),
             rng=rng,
             device=device,
-            max_tries=args.single_token_max_tries,
+            **single_token_generation_kwargs(args),
         )
         rendered = model(target, mask)
         seq_len = int(lengths[0].item())
@@ -1539,6 +1812,22 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--single-token-kmer-size must be positive.")
     if not 0.0 <= args.single_token_entropy_percentile <= 1.0:
         raise ValueError("--single-token-entropy-percentile must be in [0, 1].")
+    if args.program_max_motifs <= 0 or args.program_max_motif_len <= 0:
+        raise ValueError("--program-max-motifs and --program-max-motif-len must be positive.")
+    if args.program_repeat_lambda < 0 or args.program_long_repeat_lambda < 0:
+        raise ValueError("--program-repeat-lambda values must be non-negative.")
+    if not 0.0 <= args.program_single_repeat_prob <= 1.0:
+        raise ValueError("--program-single-repeat-prob must be in [0, 1].")
+    if not 0.0 <= args.program_long_repeat_prob <= 1.0:
+        raise ValueError("--program-long-repeat-prob must be in [0, 1].")
+    if args.program_single_repeat_prob + args.program_long_repeat_prob > 1.0:
+        raise ValueError("program single-repeat and long-repeat probabilities must sum to <= 1.")
+    if args.alignment_loss_weight < 0:
+        raise ValueError("--alignment-loss-weight must be non-negative.")
+    if args.alignment_temperature <= 0:
+        raise ValueError("--alignment-temperature must be positive.")
+    if args.alignment_gap_cost < 0:
+        raise ValueError("--alignment-gap-cost must be non-negative.")
     if args.batch_size <= 0 or args.val_batches <= 0:
         raise ValueError("--batch-size and --val-batches must be positive.")
     families = single_token_families(args)
@@ -1566,10 +1855,13 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"token_cost={args.token_cost_weight}; token_sharp={args.token_sharp_weight}; "
         f"length_weight={args.length_weight}; initial_stride={args.initial_token_stride}; "
+        f"mode={args.curriculum_mode}; program_motifs<= {args.program_max_motifs}; "
+        f"program_motif_len<= {args.program_max_motif_len}; "
         f"bit_budget={args.single_token_bit_budget}; kmers={','.join(str(k) for k in kmer_sizes)}; "
         f"entropy_percentile={args.single_token_entropy_percentile}; "
         f"families={','.join(families)}; manifold_weight={args.manifold_weight}; "
-        f"manifold_family_size={max(2, args.manifold_family_size)}; manifold_warmup={args.manifold_warmup_frac}"
+        f"manifold_family_size={max(2, args.manifold_family_size)}; manifold_warmup={args.manifold_warmup_frac}; "
+        f"alignment_weight={args.alignment_loss_weight}; alignment_gap={args.alignment_gap_cost}"
     )
 
     for step in range(args.steps):
@@ -1583,19 +1875,13 @@ def train(args: argparse.Namespace) -> None:
             target, mask, lengths, bits, entropies, sequences, _kinds, family_ids = make_single_token_entropy_family_batch(
                 seed_count=seed_count,
                 family_size=family_size,
-                max_seq_len=args.seq_len,
-                min_seq_len=args.single_token_min_len,
-                bit_budget=args.single_token_bit_budget,
-                kmer_sizes=kmer_sizes,
-                entropy_percentile=args.single_token_entropy_percentile,
-                families=families,
                 rng=train_rng,
                 device=device,
-                max_tries=args.single_token_max_tries,
                 substitution_rate=args.augment_substitution_rate,
                 indel_rate=args.augment_indel_rate,
                 repeat_rate=args.augment_repeat_rate,
                 max_edits=args.augment_max_edits,
+                **single_token_generation_kwargs(args, families=families, kmer_sizes=kmer_sizes),
             )
             loss, rendered = loss_for_family_geometry_batch(
                 model=model,
@@ -1612,19 +1898,16 @@ def train(args: argparse.Namespace) -> None:
                 manifold_weight=manifold_weight,
                 within_family_only=args.rapidfuzz_within_family_only,
                 similarity_margin=args.rapidfuzz_similarity_margin,
+                alignment_loss_weight=args.alignment_loss_weight,
+                alignment_temperature=args.alignment_temperature,
+                alignment_gap_cost=args.alignment_gap_cost,
             )
         else:
             target, mask, lengths, bits, entropies, _ = make_single_token_entropy_batch(
                 batch_size=args.batch_size,
-                max_seq_len=args.seq_len,
-                min_seq_len=args.single_token_min_len,
-                bit_budget=args.single_token_bit_budget,
-                kmer_sizes=kmer_sizes,
-                entropy_percentile=args.single_token_entropy_percentile,
-                families=families,
                 rng=train_rng,
                 device=device,
-                max_tries=args.single_token_max_tries,
+                **single_token_generation_kwargs(args, families=families, kmer_sizes=kmer_sizes),
             )
             loss, rendered = loss_for_batch(
                 model=model,
@@ -1636,6 +1919,9 @@ def train(args: argparse.Namespace) -> None:
                 token_sharp_weight=token_sharp_weight,
                 decoder_sharp_weight=decoder_sharp_weight,
                 latent_l2_weight=args.latent_l2_weight,
+                alignment_loss_weight=args.alignment_loss_weight,
+                alignment_temperature=args.alignment_temperature,
+                alignment_gap_cost=args.alignment_gap_cost,
             )
         rendered["info_bits"] = bits.detach()
         rendered["entropy_per_base"] = entropies.detach()
@@ -1721,10 +2007,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--single-token-min-len", type=int, default=4)
     parser.add_argument("--single-token-bit-budget", type=float, default=32.0)
     parser.add_argument("--single-token-kmer-size", type=int, default=None)
-    parser.add_argument("--single-token-kmer-sizes", default="1,2,3,4,5,6,8,10,12,16")
+    parser.add_argument("--single-token-kmer-sizes", default="1,2,3,4,5")
     parser.add_argument("--single-token-entropy-percentile", type=float, default=0.1)
     parser.add_argument("--single-token-max-tries", type=int, default=200)
     parser.add_argument("--single-token-families", default="random,gc,at,homopolymer,dinucleotide,motif")
+    parser.add_argument("--curriculum-mode", choices=("program", "entropy"), default="program")
+    parser.add_argument("--program-max-motifs", type=int, default=3)
+    parser.add_argument("--program-max-motif-len", type=int, default=5)
+    parser.add_argument("--program-repeat-lambda", type=float, default=0.8)
+    parser.add_argument("--program-long-repeat-lambda", type=float, default=12.0)
+    parser.add_argument("--program-long-repeat-prob", type=float, default=0.15)
+    parser.add_argument("--program-single-repeat-prob", type=float, default=0.55)
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--latent-dim", type=int, default=32)
     parser.add_argument("--max-slots-per-token", type=int, default=64)
@@ -1740,6 +2033,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-sharp-weight", type=float, default=0.001)
     parser.add_argument("--decoder-sharp-warmup-frac", type=float, default=0.1)
     parser.add_argument("--latent-l2-weight", type=float, default=1e-4)
+    parser.add_argument("--alignment-loss-weight", type=float, default=1.0)
+    parser.add_argument("--alignment-temperature", type=float, default=0.1)
+    parser.add_argument("--alignment-gap-cost", type=float, default=0.75)
     parser.add_argument("--manifold-weight", type=float, default=0.05)
     parser.add_argument("--manifold-warmup-frac", type=float, default=0.0)
     parser.add_argument("--manifold-position-weight", type=float, default=0.05)
@@ -1764,7 +2060,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--val-batches", type=int, default=4)
     parser.add_argument("--print-every", type=int, default=500)
-    parser.add_argument("--probe-examples", type=int, default=4)
+    parser.add_argument("--probe-examples", type=int, default=0)
     parser.add_argument("--probe-seq-lengths", default="8,16,32,48,64")
     parser.add_argument("--probe-block-lengths", default="4,16,48")
     parser.add_argument("--probe-block-types", default="random,gc,at,homopolymer,dinucleotide,motif")
