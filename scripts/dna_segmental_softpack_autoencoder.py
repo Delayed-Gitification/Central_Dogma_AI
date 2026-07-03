@@ -689,6 +689,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size and --val-batches must be positive.")
     if args.active_segment_temperature <= 0:
         raise ValueError("--active-segment-temperature must be positive.")
+    if args.active_budget < 0 or args.active_budget_weight < 0:
+        raise ValueError("--active-budget and --active-budget-weight must be non-negative.")
     if args.block_length_weight < 0:
         raise ValueError("--block-length-weight must be non-negative.")
     if args.initial_length_jitter < 0 or args.initial_usage_jitter < 0:
@@ -734,6 +736,8 @@ def train(args: argparse.Namespace) -> None:
         f"query_position_bias={args.query_position_bias}; "
         f"initial_active_fraction={args.initial_active_fraction}; "
         f"active_segment_weight={args.active_segment_weight}; "
+        f"active_budget={args.active_budget}; "
+        f"active_budget_weight={args.active_budget_weight}; "
         f"block_length_weight={args.block_length_weight}"
     )
 
@@ -752,6 +756,12 @@ def train(args: argparse.Namespace) -> None:
             args.usage_sharp_weight,
             args.usage_sharp_warmup_frac,
         )
+        active_budget_weight = current_sharp_weight(
+            step,
+            args.steps,
+            args.active_budget_weight,
+            args.active_budget_warmup_frac,
+        )
         loss, rendered = loss_for_batch(
             model=model,
             target=batch,
@@ -765,6 +775,8 @@ def train(args: argparse.Namespace) -> None:
             active_segment_weight=args.active_segment_weight,
             active_segment_threshold=args.active_segment_threshold,
             active_segment_temperature=args.active_segment_temperature,
+            active_budget=args.active_budget,
+            active_budget_weight=active_budget_weight,
             usage_sharp_weight=usage_sharp_weight,
         )
         optimizer.zero_grad(set_to_none=True)
@@ -791,6 +803,8 @@ def train(args: argparse.Namespace) -> None:
                     active_segment_weight=args.active_segment_weight,
                     active_segment_threshold=args.active_segment_threshold,
                     active_segment_temperature=args.active_segment_temperature,
+                    active_budget=args.active_budget,
+                    active_budget_weight=active_budget_weight,
                     usage_sharp_weight=usage_sharp_weight,
                 )
             model.train()
@@ -809,6 +823,7 @@ def train(args: argparse.Namespace) -> None:
 
             print(
                 f"\nstep {step:06d} sharp_w {sharp_weight:.2e} usage_sharp_w {usage_sharp_weight:.2e} "
+                f"budget_w {active_budget_weight:.2e} "
                 f"val_loss {val_loss:.4f} val_acc {val_metrics['accuracy']:.3f} val_exact {val_metrics['exact']:.3f}"
             )
             print(format_metrics("train", loss, rendered, batch))
@@ -852,6 +867,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-segment-weight", type=float, default=0.0)
     parser.add_argument("--active-segment-threshold", type=float, default=1.0)
     parser.add_argument("--active-segment-temperature", type=float, default=0.5)
+    parser.add_argument("--active-budget", type=float, default=0.0)
+    parser.add_argument("--active-budget-weight", type=float, default=0.0)
+    parser.add_argument("--active-budget-warmup-frac", type=float, default=0.3)
     parser.add_argument("--usage-sharp-weight", type=float, default=0.0)
     parser.add_argument("--usage-sharp-warmup-frac", type=float, default=0.2)
     parser.add_argument("--encoder-hidden-dim", type=int, default=96)
