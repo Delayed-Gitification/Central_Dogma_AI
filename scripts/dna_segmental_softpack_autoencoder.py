@@ -685,6 +685,7 @@ def controlled_probe_diagnostics(
     mean_active_length = rendered["total_len"] / active_count.clamp_min(1e-6)
     max_length = rendered["lengths"].max(dim=1).values
     length_std = rendered["lengths"].std(dim=1, unbiased=False)
+    hard_active_count = (rendered["lengths"] > active_segment_threshold).float().sum(dim=1)
 
     lines = ["probe fixed entropy/length:"]
     label_to_indices: dict[tuple[str, int], list[int]] = {}
@@ -698,15 +699,20 @@ def controlled_probe_diagnostics(
             if not indices:
                 continue
             index_tensor = torch.tensor(indices, device=device)
+            sample_index = indices[0]
+            sample_lengths = rendered["lengths"][sample_index].detach().cpu().tolist()
+            sample_lengths_text = ",".join(f"{value:.1f}" for value in sample_lengths)
             parts.append(
                 f"b{block_len:02d} "
                 f"acc{per_example_accuracy[index_tensor].mean().item():.2f} "
                 f"ex{per_example_exact[index_tensor].mean().item():.2f} "
                 f"act{active_count[index_tensor].mean().item():.1f} "
+                f"hact{hard_active_count[index_tensor].mean().item():.1f} "
                 f"uact{usage_weighted_active_count[index_tensor].mean().item():.1f} "
                 f"seg{mean_active_length[index_tensor].mean().item():.1f} "
                 f"max{max_length[index_tensor].mean().item():.1f} "
-                f"std{length_std[index_tensor].mean().item():.1f}"
+                f"std{length_std[index_tensor].mean().item():.1f} "
+                f"lens[{sample_lengths_text}]"
             )
         if parts:
             lines.append(f"probe {block_type:<12} " + " | ".join(parts))
