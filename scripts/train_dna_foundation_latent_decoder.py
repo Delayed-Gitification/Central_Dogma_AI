@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import math
+import os
 import random
 from pathlib import Path
 
@@ -122,14 +123,43 @@ class TinyFrozenDNAEncoder(nn.Module):
 
 
 class HFDNAEncoder(nn.Module):
-    def __init__(self, model_name: str, device: torch.device, trust_remote_code: bool):
+    def __init__(
+        self,
+        model_name: str,
+        device: torch.device,
+        trust_remote_code: bool,
+        token: str | None,
+        local_files_only: bool,
+    ):
         super().__init__()
         try:
             from transformers import AutoModel, AutoTokenizer
         except ImportError as exc:
             raise RuntimeError("Install transformers to use --encoder hf.") from exc
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-        self.model = AutoModel.from_pretrained(model_name, trust_remote_code=trust_remote_code).to(device)
+        hf_kwargs = {
+            "trust_remote_code": trust_remote_code,
+            "local_files_only": local_files_only,
+        }
+        if token:
+            hf_kwargs["token"] = token
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, **hf_kwargs)
+            self.model = AutoModel.from_pretrained(model_name, **hf_kwargs).to(device)
+        except Exception as exc:
+            raise RuntimeError(
+                "\nCould not load Hugging Face encoder:\n"
+                f"  {model_name}\n\n"
+                "Likely causes:\n"
+                "  1. The repo id is wrong or the model has moved.\n"
+                "  2. The repo is private/gated and the cluster is not authenticated.\n"
+                "  3. The cluster has no internet and the model is not cached locally.\n\n"
+                "Fixes to try:\n"
+                "  - login once on the cluster: huggingface-cli login\n"
+                "  - or pass a token: --hf-token-env HF_TOKEN\n"
+                "  - or pass a local downloaded model folder to --hf-model\n"
+                "  - or use a public fallback such as --hf-model zhihan1996/DNABERT-2-117M\n"
+                "  - or smoke-test without HF using --encoder tiny\n"
+            ) from exc
         self.model.eval()
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
@@ -339,7 +369,14 @@ def current_corruption(step: int, steps: int, max_corruption: float, warmup_frac
 
 def load_encoder(args: argparse.Namespace, device: torch.device) -> tuple[nn.Module | HFDNAEncoder, int]:
     if args.encoder == "hf":
-        encoder = HFDNAEncoder(args.hf_model, device=device, trust_remote_code=args.trust_remote_code)
+        token = args.hf_token or (os.environ.get(args.hf_token_env) if args.hf_token_env else None)
+        encoder = HFDNAEncoder(
+            args.hf_model,
+            device=device,
+            trust_remote_code=args.trust_remote_code,
+            token=token,
+            local_files_only=args.hf_local_files_only,
+        )
         return encoder, encoder.hidden_dim
     encoder = TinyFrozenDNAEncoder(args.encoder_hidden_dim, args.encoder_layers).to(device)
     if args.freeze_encoder:
@@ -488,6 +525,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder", choices=("tiny", "hf"), default="tiny")
     parser.add_argument("--hf-model", default="kuleshov-group/caduceus-ps_seqlen-1k_d_model-118_n_layer-4")
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hf-token", default="")
+    parser.add_argument("--hf-token-env", default="")
+    parser.add_argument("--hf-local-files-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--freeze-encoder", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--embedding-mode", choices=("per_token", "mean"), default="per_token")
     parser.add_argument("--encoder-hidden-dim", type=int, default=96)

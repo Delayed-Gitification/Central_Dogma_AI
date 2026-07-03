@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import math
 import random
 from pathlib import Path
@@ -8,6 +9,11 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from rapidfuzz import fuzz as rapidfuzz_fuzz
+except ImportError:
+    rapidfuzz_fuzz = None
 
 
 DNA_BASES = "ACGT"
@@ -282,6 +288,66 @@ def make_augmented_pair_batch(
         lengths_b.to(device),
         kinds,
     )
+
+
+def make_augmented_family_batch(
+    *,
+    seed_count: int,
+    family_size: int,
+    max_seq_len: int,
+    min_seq_len: int,
+    short_max_len_frac: float,
+    long_min_len_frac: float,
+    rng: random.Random,
+    device: torch.device,
+    substitution_rate: float,
+    indel_rate: float,
+    repeat_rate: float,
+    max_edits: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str], torch.Tensor]:
+    if seed_count <= 0 or family_size <= 0:
+        raise ValueError("seed_count and family_size must be positive.")
+    total = seed_count * family_size
+    target = torch.zeros(total, max_seq_len, dtype=torch.long)
+    mask = torch.zeros(total, max_seq_len, dtype=torch.float32)
+    lengths = torch.zeros(total, dtype=torch.float32)
+    sequences: list[str] = []
+    family_ids = torch.zeros(total, dtype=torch.long)
+    row = 0
+    for family_index in range(seed_count):
+        seed_sequence, _kind = generate_variable_sequence(
+            max_seq_len=max_seq_len,
+            min_seq_len=min_seq_len,
+            short_max_len_frac=short_max_len_frac,
+            long_min_len_frac=long_min_len_frac,
+            rng=rng,
+        )
+        variants = [seed_sequence]
+        for variant_index in range(1, family_size):
+            # Later variants get slightly more opportunity to drift, producing a
+            # useful within-family range of RapidFuzz similarities.
+            scale = 1.0 + float(variant_index - 1) / float(max(1, family_size - 1))
+            variants.append(
+                augment_sequence(
+                    seed_sequence,
+                    max_seq_len=max_seq_len,
+                    rng=rng,
+                    substitution_rate=substitution_rate * scale,
+                    indel_rate=indel_rate * scale,
+                    repeat_rate=min(1.0, repeat_rate * scale),
+                    max_edits=max_edits,
+                )
+            )
+        for sequence in variants:
+            sequence_tensor = sequence_to_tensor(sequence)
+            seq_len = len(sequence)
+            target[row, :seq_len] = sequence_tensor
+            mask[row, :seq_len] = 1.0
+            lengths[row] = seq_len
+            sequences.append(sequence)
+            family_ids[row] = family_index
+            row += 1
+    return target.to(device), mask.to(device), lengths.to(device), sequences, family_ids.to(device)
 
 
 def make_probe_batch(
@@ -582,6 +648,75 @@ def soft_position_aligned_latent_loss(
     }
 
 
+def rapidfuzz_ratio01(a: str, b: str) -> float:
+    if rapidfuzz_fuzz is not None:
+        return float(rapidfuzz_fuzz.ratio(a, b)) / 100.0
+    return float(difflib.SequenceMatcher(None, a, b).ratio())
+
+
+def rapidfuzz_similarity_matrix(sequences: list[str], device: torch.device) -> torch.Tensor:
+    count = len(sequences)
+    matrix = torch.eye(count, dtype=torch.float32)
+    for i in range(count):
+        for j in range(i + 1, count):
+            value = rapidfuzz_ratio01(sequences[i], sequences[j])
+            matrix[i, j] = value
+            matrix[j, i] = value
+    return matrix.to(device)
+
+
+def sequence_latent_embeddings(rendered: dict[str, torch.Tensor]) -> torch.Tensor:
+    latents = rendered["latents"]
+    usage = rendered["token_usage"].to(dtype=latents.dtype)
+    weighted = (latents * usage[..., None]).sum(dim=1) / usage.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return F.normalize(weighted, dim=-1)
+
+
+def centred_correlation(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a = a - a.mean()
+    b = b - b.mean()
+    return (a * b).mean() / (a.square().mean().sqrt() * b.square().mean().sqrt()).clamp_min(1e-8)
+
+
+def rapidfuzz_geometry_loss(
+    rendered: dict[str, torch.Tensor],
+    sequences: list[str],
+    family_ids: torch.Tensor,
+    *,
+    within_family_only: bool,
+    margin: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    target_similarity = rapidfuzz_similarity_matrix(sequences, rendered["latents"].device)
+    embeddings = sequence_latent_embeddings(rendered)
+    latent_similarity = embeddings @ embeddings.transpose(0, 1)
+    latent_similarity = 0.5 * (latent_similarity + 1.0)
+
+    count = len(sequences)
+    pair_mask = ~torch.eye(count, dtype=torch.bool, device=latent_similarity.device)
+    if within_family_only:
+        pair_mask = pair_mask & (family_ids[:, None] == family_ids[None, :])
+    if margin > 0:
+        pair_mask = pair_mask & (target_similarity >= margin)
+    if pair_mask.sum() == 0:
+        zero = latent_similarity.sum() * 0.0
+        return zero, {
+            "rapidfuzz_geometry_loss": zero.detach(),
+            "rapidfuzz_corr": zero.detach(),
+            "rapidfuzz_target_mean": zero.detach(),
+            "latent_similarity_mean": zero.detach(),
+        }
+    target_pairs = target_similarity[pair_mask]
+    latent_pairs = latent_similarity[pair_mask]
+    loss = F.mse_loss(latent_pairs, target_pairs)
+    corr = centred_correlation(latent_pairs.detach(), target_pairs.detach())
+    return loss, {
+        "rapidfuzz_geometry_loss": loss.detach(),
+        "rapidfuzz_corr": corr.detach(),
+        "rapidfuzz_target_mean": target_pairs.detach().mean(),
+        "latent_similarity_mean": latent_pairs.detach().mean(),
+    }
+
+
 def loss_for_positive_pair_batch(
     *,
     model: AdaptiveTokenizerAutoencoder,
@@ -638,6 +773,51 @@ def loss_for_positive_pair_batch(
         **manifold_metrics,
     }
     return loss, rendered_a
+
+
+def loss_for_family_geometry_batch(
+    *,
+    model: AdaptiveTokenizerAutoencoder,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    lengths: torch.Tensor,
+    sequences: list[str],
+    family_ids: torch.Tensor,
+    length_weight: float,
+    token_cost_weight: float,
+    token_sharp_weight: float,
+    decoder_sharp_weight: float,
+    latent_l2_weight: float,
+    manifold_weight: float,
+    within_family_only: bool,
+    similarity_margin: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    recon_loss, rendered = loss_for_batch(
+        model=model,
+        target=target,
+        mask=mask,
+        target_lengths=lengths,
+        length_weight=length_weight,
+        token_cost_weight=token_cost_weight,
+        token_sharp_weight=token_sharp_weight,
+        decoder_sharp_weight=decoder_sharp_weight,
+        latent_l2_weight=latent_l2_weight,
+    )
+    geometry_loss, geometry_metrics = rapidfuzz_geometry_loss(
+        rendered,
+        sequences,
+        family_ids,
+        within_family_only=within_family_only,
+        margin=similarity_margin,
+    )
+    loss = recon_loss + manifold_weight * geometry_loss
+    return loss, {
+        **rendered,
+        "manifold_loss": geometry_loss.detach(),
+        "manifold_position_shift": torch.zeros((), device=target.device),
+        "manifold_latent_distance": (1.0 - geometry_metrics["latent_similarity_mean"]).detach(),
+        **geometry_metrics,
+    }
 
 
 def pick_device(args: argparse.Namespace) -> torch.device:
@@ -720,6 +900,12 @@ def compact_status(
             f" pos {train_rendered['manifold_position_shift'].item():.3f}"
             f" zdist {train_rendered['manifold_latent_distance'].item():.3f}"
         )
+        if "rapidfuzz_corr" in train_rendered:
+            manifold_text += (
+                f" rf_corr {train_rendered['rapidfuzz_corr'].item():.3f}"
+                f" rf_mean {train_rendered['rapidfuzz_target_mean'].item():.3f}"
+                f" lat_mean {train_rendered['latent_similarity_mean'].item():.3f}"
+            )
     return [
         (
             f"\nstep {step:06d} | "
@@ -757,6 +943,12 @@ def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Te
             f" pos {rendered['manifold_position_shift'].item():.3f}"
             f" zdist {rendered['manifold_latent_distance'].item():.3f}"
         )
+        if "rapidfuzz_corr" in rendered:
+            manifold_text += (
+                f" rf_corr {rendered['rapidfuzz_corr'].item():.3f}"
+                f" rf_mean {rendered['rapidfuzz_target_mean'].item():.3f}"
+                f" lat_mean {rendered['latent_similarity_mean'].item():.3f}"
+            )
     return (
         f"{prefix:<5} loss {loss.item():.4f} ce {rendered['recon_loss'].item():.4f} "
         f"acc {metrics['accuracy']:.3f} exact {metrics['exact']:.3f} "
@@ -803,7 +995,39 @@ def evaluate(
     last_mask: torch.Tensor | None = None
     last_lengths: torch.Tensor | None = None
     for _ in range(args.val_batches):
-        if manifold_weight > 0:
+        if manifold_weight > 0 and args.manifold_family_size > 0:
+            seed_count = args.manifold_seed_count if args.manifold_seed_count > 0 else args.batch_size
+            target, mask, lengths, sequences, family_ids = make_augmented_family_batch(
+                seed_count=seed_count,
+                family_size=args.manifold_family_size,
+                max_seq_len=args.seq_len,
+                min_seq_len=args.variable_min_len,
+                short_max_len_frac=args.short_max_len_frac,
+                long_min_len_frac=args.long_min_len_frac,
+                rng=rng,
+                device=device,
+                substitution_rate=args.augment_substitution_rate,
+                indel_rate=args.augment_indel_rate,
+                repeat_rate=args.augment_repeat_rate,
+                max_edits=args.augment_max_edits,
+            )
+            loss, rendered = loss_for_family_geometry_batch(
+                model=model,
+                target=target,
+                mask=mask,
+                lengths=lengths,
+                sequences=sequences,
+                family_ids=family_ids,
+                length_weight=args.length_weight,
+                token_cost_weight=token_cost_weight,
+                token_sharp_weight=token_sharp_weight,
+                decoder_sharp_weight=decoder_sharp_weight,
+                latent_l2_weight=args.latent_l2_weight,
+                manifold_weight=manifold_weight,
+                within_family_only=args.rapidfuzz_within_family_only,
+                similarity_margin=args.rapidfuzz_similarity_margin,
+            )
+        elif manifold_weight > 0:
             target, mask, lengths, target_b, mask_b, lengths_b, _ = make_augmented_pair_batch(
                 batch_size=args.batch_size,
                 max_seq_len=args.seq_len,
@@ -1050,7 +1274,39 @@ def train(args: argparse.Namespace) -> None:
         token_sharp_weight = current_weight(step, args.steps, args.token_sharp_weight, args.token_sharp_warmup_frac)
         decoder_sharp_weight = current_weight(step, args.steps, args.decoder_sharp_weight, args.decoder_sharp_warmup_frac)
         manifold_weight = current_weight(step, args.steps, args.manifold_weight, args.manifold_warmup_frac)
-        if manifold_weight > 0:
+        if manifold_weight > 0 and args.manifold_family_size > 0:
+            seed_count = args.manifold_seed_count if args.manifold_seed_count > 0 else args.batch_size
+            target, mask, lengths, sequences, family_ids = make_augmented_family_batch(
+                seed_count=seed_count,
+                family_size=args.manifold_family_size,
+                max_seq_len=args.seq_len,
+                min_seq_len=args.variable_min_len,
+                short_max_len_frac=args.short_max_len_frac,
+                long_min_len_frac=args.long_min_len_frac,
+                rng=train_rng,
+                device=device,
+                substitution_rate=args.augment_substitution_rate,
+                indel_rate=args.augment_indel_rate,
+                repeat_rate=args.augment_repeat_rate,
+                max_edits=args.augment_max_edits,
+            )
+            loss, rendered = loss_for_family_geometry_batch(
+                model=model,
+                target=target,
+                mask=mask,
+                lengths=lengths,
+                sequences=sequences,
+                family_ids=family_ids,
+                length_weight=args.length_weight,
+                token_cost_weight=token_cost_weight,
+                token_sharp_weight=token_sharp_weight,
+                decoder_sharp_weight=decoder_sharp_weight,
+                latent_l2_weight=args.latent_l2_weight,
+                manifold_weight=manifold_weight,
+                within_family_only=args.rapidfuzz_within_family_only,
+                similarity_margin=args.rapidfuzz_similarity_margin,
+            )
+        elif manifold_weight > 0:
             target, mask, lengths, target_b, mask_b, lengths_b, _ = make_augmented_pair_batch(
                 batch_size=args.batch_size,
                 max_seq_len=args.seq_len,
@@ -1198,6 +1454,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifold-warmup-frac", type=float, default=0.1)
     parser.add_argument("--manifold-position-weight", type=float, default=0.05)
     parser.add_argument("--manifold-temperature", type=float, default=0.08)
+    parser.add_argument("--manifold-seed-count", type=int, default=0)
+    parser.add_argument("--manifold-family-size", type=int, default=0)
+    parser.add_argument("--rapidfuzz-similarity-margin", type=float, default=0.0)
+    parser.add_argument("--rapidfuzz-within-family-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--augment-substitution-rate", type=float, default=0.02)
     parser.add_argument("--augment-indel-rate", type=float, default=0.01)
     parser.add_argument("--augment-repeat-rate", type=float, default=0.25)
