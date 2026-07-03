@@ -247,9 +247,12 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         self.usage_head = nn.Linear(latent_dim, 1)
         initial_raw_length = seq_len / float(num_segments * initial_active_fraction)
         initial_raw_length = min(max(initial_raw_length, 1e-3), max_slots_per_segment - 1e-3)
-        # Keep the jitter args for CLI/checkpoint compatibility, but do not create
-        # trainable per-segment length templates. Length/usage must come from z.
-        _ = initial_length_jitter, initial_usage_jitter
+        length_jitter = torch.randn(num_segments) * initial_length_jitter
+        usage_jitter = torch.randn(num_segments) * initial_usage_jitter
+        length_jitter = length_jitter - length_jitter.mean()
+        usage_jitter = usage_jitter - usage_jitter.mean()
+        self.segment_length_logit_bias = nn.Parameter(length_jitter)
+        self.segment_usage_logit_bias = nn.Parameter(usage_jitter)
         nn.init.normal_(self.length_head.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.length_head.bias, logit(initial_raw_length / float(max_slots_per_segment)))
         nn.init.normal_(self.usage_head.weight, mean=0.0, std=0.01)
@@ -275,8 +278,8 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         base_logits = self.decoder(decoder_input)
         base_probs = base_logits.softmax(dim=-1)
 
-        raw_length_logits = self.length_head(z).squeeze(-1)
-        usage_logits = self.usage_head(z).squeeze(-1)
+        raw_length_logits = self.length_head(z).squeeze(-1) + self.segment_length_logit_bias[None, :]
+        usage_logits = self.usage_head(z).squeeze(-1) + self.segment_usage_logit_bias[None, :]
         raw_lengths = self.max_slots_per_segment * torch.sigmoid(raw_length_logits)
         segment_usage = torch.sigmoid(usage_logits)
         lengths = raw_lengths * segment_usage
@@ -1146,6 +1149,8 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"query_position_bias={args.query_position_bias}; "
         f"initial_active_fraction={args.initial_active_fraction}; "
+        f"initial_length_jitter={args.initial_length_jitter}; "
+        f"initial_usage_jitter={args.initial_usage_jitter}; "
         f"active_segment_weight={args.active_segment_weight}; "
         f"active_budget={args.active_budget}; "
         f"active_budget_weight={args.active_budget_weight}; "
