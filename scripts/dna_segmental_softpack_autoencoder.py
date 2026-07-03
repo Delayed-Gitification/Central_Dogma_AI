@@ -102,6 +102,59 @@ def generate_controlled_block_sequence(
     return "".join(parts), block_lengths, block_types
 
 
+def generate_low_entropy_sequence(seq_len: int, rng: random.Random) -> tuple[str, list[int], list[str]]:
+    builders = [
+        ("homopolymer", homopolymer_block, 18, 72),
+        ("dinucleotide", dinucleotide_repeat_block, 18, 72),
+        ("motif", motif_repeat_block, 18, 72),
+    ]
+    parts = []
+    block_lengths = []
+    block_types = []
+    total_length = 0
+    while total_length < seq_len:
+        remaining = seq_len - total_length
+        block_type, builder, min_len, max_len = rng.choice(builders)
+        length = min(remaining, rng.randint(min_len, max_len))
+        parts.append(builder(rng, length))
+        block_lengths.append(length)
+        block_types.append(block_type)
+        total_length += length
+    return "".join(parts), block_lengths, block_types
+
+
+def generate_high_entropy_sequence(seq_len: int, rng: random.Random) -> tuple[str, list[int], list[str]]:
+    parts = []
+    block_lengths = []
+    block_types = []
+    total_length = 0
+    while total_length < seq_len:
+        remaining = seq_len - total_length
+        length = min(remaining, rng.randint(3, 8))
+        parts.append(random_dna_block(rng, length))
+        block_lengths.append(length)
+        block_types.append("random")
+        total_length += length
+    return "".join(parts), block_lengths, block_types
+
+
+def generate_variable_entropy_length_sequence(
+    *,
+    max_seq_len: int,
+    min_seq_len: int,
+    short_max_len_frac: float,
+    long_min_len_frac: float,
+    rng: random.Random,
+) -> tuple[str, list[int], list[str]]:
+    short_max_len = max(min_seq_len, int(round(max_seq_len * short_max_len_frac)))
+    long_min_len = min(max_seq_len, max(min_seq_len, int(round(max_seq_len * long_min_len_frac))))
+    if rng.random() < 0.5:
+        seq_len = rng.randint(min_seq_len, short_max_len)
+        return generate_high_entropy_sequence(seq_len, rng)
+    seq_len = rng.randint(long_min_len, max_seq_len)
+    return generate_low_entropy_sequence(seq_len, rng)
+
+
 def generate_segmental_sequence(seq_len: int, rng: random.Random) -> str:
     sequence, _, _ = generate_segmental_sequence_with_blocks(seq_len, rng)
     return sequence
@@ -118,15 +171,20 @@ def make_batch_with_blocks(
     num_segments: int,
     rng: random.Random,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]], list[list[str]]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]], list[list[str]]]:
     sequences = []
+    target_lengths = torch.zeros(batch_size, dtype=torch.float32)
+    target_mask = torch.zeros(batch_size, seq_len, dtype=torch.float32)
     all_block_lengths = []
     all_block_types = []
     block_length_targets = torch.zeros(batch_size, num_segments, dtype=torch.float32)
     block_length_mask = torch.zeros(batch_size, num_segments, dtype=torch.float32)
     for batch_index in range(batch_size):
         sequence, block_lengths, block_types = generate_segmental_sequence_with_blocks(seq_len, rng)
-        sequences.append(sequence_to_tensor(sequence))
+        sequence_tensor = sequence_to_tensor(sequence)
+        sequences.append(sequence_tensor)
+        target_lengths[batch_index] = len(sequence)
+        target_mask[batch_index, : len(sequence)] = 1.0
         all_block_lengths.append(block_lengths)
         all_block_types.append(block_types)
         usable_blocks = min(num_segments, len(block_lengths))
@@ -135,6 +193,55 @@ def make_batch_with_blocks(
             block_length_mask[batch_index, :usable_blocks] = 1.0
     return (
         torch.stack(sequences).to(device),
+        target_mask.to(device),
+        target_lengths.to(device),
+        block_length_targets.to(device),
+        block_length_mask.to(device),
+        all_block_lengths,
+        all_block_types,
+    )
+
+
+def make_variable_length_batch_with_blocks(
+    batch_size: int,
+    max_seq_len: int,
+    num_segments: int,
+    min_seq_len: int,
+    short_max_len_frac: float,
+    long_min_len_frac: float,
+    rng: random.Random,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]], list[list[str]]]:
+    sequences = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
+    target_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.float32)
+    target_lengths = torch.zeros(batch_size, dtype=torch.float32)
+    all_block_lengths = []
+    all_block_types = []
+    block_length_targets = torch.zeros(batch_size, num_segments, dtype=torch.float32)
+    block_length_mask = torch.zeros(batch_size, num_segments, dtype=torch.float32)
+    for batch_index in range(batch_size):
+        sequence, block_lengths, block_types = generate_variable_entropy_length_sequence(
+            max_seq_len=max_seq_len,
+            min_seq_len=min_seq_len,
+            short_max_len_frac=short_max_len_frac,
+            long_min_len_frac=long_min_len_frac,
+            rng=rng,
+        )
+        sequence_tensor = sequence_to_tensor(sequence)
+        sequence_length = len(sequence)
+        sequences[batch_index, :sequence_length] = sequence_tensor
+        target_mask[batch_index, :sequence_length] = 1.0
+        target_lengths[batch_index] = sequence_length
+        all_block_lengths.append(block_lengths)
+        all_block_types.append(block_types)
+        usable_blocks = min(num_segments, len(block_lengths))
+        if usable_blocks > 0:
+            block_length_targets[batch_index, :usable_blocks] = torch.tensor(block_lengths[:usable_blocks], dtype=torch.float32)
+            block_length_mask[batch_index, :usable_blocks] = 1.0
+    return (
+        sequences.to(device),
+        target_mask.to(device),
+        target_lengths.to(device),
         block_length_targets.to(device),
         block_length_mask.to(device),
         all_block_lengths,
@@ -161,7 +268,7 @@ class QuerySegmentEncoder(nn.Module):
         self.query_position_bias = query_position_bias
         self.query_position_width = query_position_width
         blocks = []
-        in_channels = 5
+        in_channels = 6
         for _ in range(layers):
             blocks.extend(
                 [
@@ -178,15 +285,20 @@ class QuerySegmentEncoder(nn.Module):
         self.to_latent = nn.Linear(hidden_dim, latent_dim)
         nn.init.normal_(self.segment_queries, mean=0.0, std=hidden_dim**-0.5)
 
-    def forward(self, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, target: torch.Tensor, target_mask: torch.Tensor | None = None) -> torch.Tensor:
         one_hot = F.one_hot(target, num_classes=4).to(dtype=torch.float32)
+        if target_mask is None:
+            target_mask = torch.ones(target.shape, device=target.device, dtype=one_hot.dtype)
+        else:
+            target_mask = target_mask.to(device=target.device, dtype=one_hot.dtype)
         positions = torch.linspace(-1.0, 1.0, target.shape[1], device=target.device, dtype=one_hot.dtype)
         positions = positions[None, :, None].expand(target.shape[0], -1, -1)
-        encoder_input = torch.cat([one_hot, positions], dim=-1)
+        encoder_input = torch.cat([one_hot * target_mask[..., None], positions, target_mask[..., None]], dim=-1)
         features = self.net(encoder_input.transpose(1, 2)).transpose(1, 2)
         features = self.norm(features)
 
         logits = torch.einsum("bld,md->bml", features, self.segment_queries) / math.sqrt(float(features.shape[-1]))
+        logits = logits.masked_fill(target_mask[:, None, :] <= 0, -1e4)
         if self.query_position_bias > 0:
             centres = torch.linspace(-1.0, 1.0, self.segment_queries.shape[0], device=target.device, dtype=features.dtype)
             position_values = positions[:, :, 0]
@@ -215,12 +327,15 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         decoder_hidden_dim: int = 64,
         slot_dim: int = 16,
         initial_active_fraction: float = 1.0,
+        initial_total_len_frac: float = 1.0,
         initial_length_jitter: float = 0.05,
         initial_usage_jitter: float = 0.25,
     ):
         super().__init__()
         if not 0.0 < initial_active_fraction <= 1.0:
             raise ValueError("--initial-active-fraction must be in (0, 1].")
+        if initial_total_len_frac <= 0:
+            raise ValueError("--initial-total-len-frac must be positive.")
         self.num_segments = num_segments
         self.latent_dim = latent_dim
         self.max_slots_per_segment = max_slots_per_segment
@@ -245,7 +360,7 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         )
         self.length_head = nn.Linear(latent_dim, 1)
         self.usage_head = nn.Linear(latent_dim, 1)
-        initial_raw_length = seq_len / float(num_segments * initial_active_fraction)
+        initial_raw_length = (seq_len * initial_total_len_frac) / float(num_segments * initial_active_fraction)
         initial_raw_length = min(max(initial_raw_length, 1e-3), max_slots_per_segment - 1e-3)
         length_jitter = torch.randn(num_segments) * initial_length_jitter
         usage_jitter = torch.randn(num_segments) * initial_usage_jitter
@@ -258,8 +373,8 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         nn.init.normal_(self.usage_head.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.usage_head.bias, logit(initial_active_fraction))
 
-    def encode(self, target: torch.Tensor) -> torch.Tensor:
-        return self.encoder(target)
+    def encode(self, target: torch.Tensor, target_mask: torch.Tensor | None = None) -> torch.Tensor:
+        return self.encoder(target, target_mask=target_mask)
 
     def segment_outputs(
         self,
@@ -334,15 +449,30 @@ class SegmentalSoftpackAutoencoder(nn.Module):
             "pack_confidence": weights_norm.max(dim=1).values.mean(),
         }
 
-    def forward(self, target: torch.Tensor, out_len: int) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        z = self.encode(target)
+    def forward(
+        self,
+        target: torch.Tensor,
+        out_len: int,
+        target_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        z = self.encode(target, target_mask=target_mask)
         return z, self.render_from_latents(z, out_len)
 
 
-def reconstruction_metrics(soft_dna: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+def reconstruction_metrics(
+    soft_dna: torch.Tensor,
+    target: torch.Tensor,
+    target_mask: torch.Tensor | None = None,
+) -> dict[str, float]:
     predicted = soft_dna.argmax(dim=-1)
-    accuracy = (predicted == target).float().mean()
-    exact = (predicted == target).all(dim=1).float().mean()
+    correct = predicted == target
+    if target_mask is None:
+        accuracy = correct.float().mean()
+        exact = correct.all(dim=1).float().mean()
+    else:
+        mask = target_mask.to(device=target.device, dtype=torch.float32)
+        accuracy = (correct.float() * mask).sum() / mask.sum().clamp_min(1.0)
+        exact = (correct | (mask <= 0)).all(dim=1).float().mean()
     return {
         "accuracy": float(accuracy.item()),
         "exact": float(exact.item()),
@@ -366,7 +496,9 @@ def loss_for_batch(
     *,
     model: SegmentalSoftpackAutoencoder,
     target: torch.Tensor,
-    seq_len: int,
+    target_mask: torch.Tensor,
+    target_lengths: torch.Tensor,
+    max_seq_len: int,
     block_lengths: torch.Tensor | None,
     block_length_mask: torch.Tensor | None,
     length_weight: float,
@@ -383,10 +515,13 @@ def loss_for_batch(
     active_budget_weight: float,
     usage_sharp_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    z, rendered = model(target, seq_len)
+    z, rendered = model(target, max_seq_len, target_mask=target_mask)
     soft_dna = rendered["soft_dna"].clamp_min(1e-8)
-    recon_loss = -soft_dna.gather(-1, target[..., None]).squeeze(-1).log().mean()
-    length_loss = F.smooth_l1_loss(rendered["total_len"], torch.full_like(rendered["total_len"], float(seq_len)))
+    target_mask = target_mask.to(device=target.device, dtype=soft_dna.dtype)
+    target_lengths = target_lengths.to(device=target.device, dtype=soft_dna.dtype)
+    token_nll = -soft_dna.gather(-1, target[..., None]).squeeze(-1).log()
+    recon_loss = (token_nll * target_mask).sum() / target_mask.sum().clamp_min(1.0)
+    length_loss = F.smooth_l1_loss(rendered["total_len"], target_lengths)
     if block_length_weight > 0 and block_lengths is not None and block_length_mask is not None:
         block_lengths = block_lengths.to(dtype=rendered["lengths"].dtype)
         block_length_mask = block_length_mask.to(dtype=rendered["lengths"].dtype)
@@ -416,7 +551,7 @@ def loss_for_batch(
     active_count = active_segments.sum(dim=1)
     active_segment_loss = active_count.mean()
     if active_budget > 0 and active_budget_weight > 0:
-        active_budget_loss = (active_count.mean() - active_budget).pow(2)
+        active_budget_loss = (active_count - active_budget).pow(2).mean()
     else:
         active_budget_loss = rendered["lengths"].new_zeros(())
     usage_sharp_loss = (rendered["segment_usage"] * (1.0 - rendered["segment_usage"])).sum(dim=1).mean()
@@ -514,16 +649,28 @@ def current_sharp_weight(step: int, steps: int, sharp_weight: float, warmup_frac
     return sharp_weight * min(1.0, float(step - warmup_steps + 1) / float(ramp_steps))
 
 
-def summarise_lengths(lengths: torch.Tensor, total_len: torch.Tensor) -> str:
+def summarise_lengths(
+    lengths: torch.Tensor,
+    total_len: torch.Tensor,
+    target_lengths: torch.Tensor | None = None,
+) -> str:
     flat_lengths = lengths.detach().flatten()
     zero_segments = (lengths.detach() < 1.0).float().sum(dim=1).mean()
-    return (
+    summary = (
         f"total_len {total_len.mean().item():.1f}/{total_len.std(unbiased=False).item():.1f} "
         f"range {total_len.min().item():.1f}-{total_len.max().item():.1f} | "
         f"seg_len {flat_lengths.mean().item():.1f}/{flat_lengths.std(unbiased=False).item():.1f} "
         f"range {flat_lengths.min().item():.1f}-{flat_lengths.max().item():.1f} | "
         f"near_zero {zero_segments.item():.2f}"
     )
+    if target_lengths is not None:
+        target_lengths = target_lengths.detach().float()
+        summary += (
+            f" | target_len {target_lengths.mean().item():.1f}/"
+            f"{target_lengths.std(unbiased=False).item():.1f} "
+            f"range {target_lengths.min().item():.0f}-{target_lengths.max().item():.0f}"
+        )
+    return summary
 
 
 def summarise_length_conditioning(lengths: torch.Tensor, segment_usage: torch.Tensor) -> str:
@@ -599,13 +746,22 @@ def tensor_correlation(first: torch.Tensor, second: torch.Tensor) -> float:
     return float((first * second).sum().div(denom).item())
 
 
-def local_base_entropy(target: torch.Tensor, radius: int = 6) -> torch.Tensor:
+def local_base_entropy(
+    target: torch.Tensor,
+    target_mask: torch.Tensor | None = None,
+    radius: int = 6,
+) -> torch.Tensor:
     one_hot = F.one_hot(target, num_classes=4).to(dtype=torch.float32).transpose(1, 2)
+    if target_mask is None:
+        target_mask = torch.ones(target.shape, device=target.device, dtype=one_hot.dtype)
+    else:
+        target_mask = target_mask.to(device=target.device, dtype=one_hot.dtype)
+    one_hot = one_hot * target_mask[:, None, :]
     kernel_size = 2 * radius + 1
     base_kernel = torch.ones(4, 1, kernel_size, device=target.device, dtype=one_hot.dtype)
     mask_kernel = torch.ones(1, 1, kernel_size, device=target.device, dtype=one_hot.dtype)
     padded_bases = F.pad(one_hot, (radius, radius))
-    padded_mask = F.pad(torch.ones(target.shape[0], 1, target.shape[1], device=target.device), (radius, radius))
+    padded_mask = F.pad(target_mask[:, None, :], (radius, radius))
     counts = F.conv1d(padded_bases, base_kernel, groups=4)
     totals = F.conv1d(padded_mask, mask_kernel).clamp_min(1.0)
     probs = counts / totals
@@ -613,14 +769,25 @@ def local_base_entropy(target: torch.Tensor, radius: int = 6) -> torch.Tensor:
     return entropy
 
 
-def summarise_segment_entropy(rendered: dict[str, torch.Tensor], target: torch.Tensor, radius: int = 6) -> str:
+def summarise_segment_entropy(
+    rendered: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_mask: torch.Tensor | None = None,
+    radius: int = 6,
+) -> str:
     lengths = rendered["lengths"].detach()
     weights = rendered["weights"].detach()
     batch_size, num_segments = lengths.shape
     max_slots_per_segment = weights.shape[1] // num_segments
     segment_weights = weights.reshape(batch_size, num_segments, max_slots_per_segment, target.shape[1]).sum(dim=2)
     segment_mass = segment_weights.sum(dim=-1)
-    position_entropy = local_base_entropy(target, radius=radius).to(dtype=segment_weights.dtype)
+    if target_mask is None:
+        target_mask = torch.ones(target.shape, device=target.device, dtype=segment_weights.dtype)
+    else:
+        target_mask = target_mask.to(device=target.device, dtype=segment_weights.dtype)
+    segment_weights = segment_weights * target_mask[:, None, :]
+    segment_mass = segment_weights.sum(dim=-1)
+    position_entropy = local_base_entropy(target, target_mask=target_mask, radius=radius).to(dtype=segment_weights.dtype)
     entropy = (segment_weights * position_entropy[:, None, :]).sum(dim=-1) / segment_mass.clamp_min(1e-8)
 
     mask = segment_mass > 0.25
@@ -647,37 +814,52 @@ def controlled_probe_diagnostics(
     device: torch.device,
     seq_len: int,
     examples_per_condition: int,
+    sequence_lengths: list[int],
     block_lengths: list[int],
     block_types: list[str],
     active_segment_threshold: float,
     active_segment_temperature: float,
 ) -> list[str]:
-    if examples_per_condition <= 0 or not block_lengths or not block_types:
+    if examples_per_condition <= 0 or not sequence_lengths or not block_lengths or not block_types:
         return []
 
     probe_rng = random.Random(seed)
-    sequences = []
-    labels: list[tuple[str, int]] = []
+    sequences = torch.zeros(
+        len(block_types) * len(sequence_lengths) * len(block_lengths) * examples_per_condition,
+        seq_len,
+        dtype=torch.long,
+    )
+    target_mask = torch.zeros_like(sequences, dtype=torch.float32)
+    target_lengths = torch.zeros(sequences.shape[0], dtype=torch.float32)
+    labels: list[tuple[str, int, int]] = []
+    sample_index = 0
     for block_type in block_types:
-        for block_len in block_lengths:
-            for _ in range(examples_per_condition):
-                sequence, _, _ = generate_controlled_block_sequence(
-                    seq_len=seq_len,
-                    rng=probe_rng,
-                    block_type=block_type,
-                    block_len=block_len,
-                )
-                sequences.append(sequence_to_tensor(sequence))
-                labels.append((block_type, block_len))
-    if not sequences:
+        for probe_seq_len in sequence_lengths:
+            for block_len in block_lengths:
+                for _ in range(examples_per_condition):
+                    sequence, _, _ = generate_controlled_block_sequence(
+                        seq_len=probe_seq_len,
+                        rng=probe_rng,
+                        block_type=block_type,
+                        block_len=min(block_len, probe_seq_len),
+                    )
+                    sequence_tensor = sequence_to_tensor(sequence)
+                    sequences[sample_index, :probe_seq_len] = sequence_tensor
+                    target_mask[sample_index, :probe_seq_len] = 1.0
+                    target_lengths[sample_index] = probe_seq_len
+                    labels.append((block_type, probe_seq_len, block_len))
+                    sample_index += 1
+    if sample_index == 0:
         return []
 
-    batch = torch.stack(sequences).to(device)
-    _, rendered = model(batch, seq_len)
+    batch = sequences[:sample_index].to(device)
+    target_mask = target_mask[:sample_index].to(device)
+    target_lengths = target_lengths[:sample_index].to(device)
+    _, rendered = model(batch, seq_len, target_mask=target_mask)
     predicted = rendered["soft_dna"].argmax(dim=-1)
     correct = predicted == batch
-    per_example_accuracy = correct.float().mean(dim=1)
-    per_example_exact = correct.all(dim=1).float()
+    per_example_accuracy = (correct.float() * target_mask).sum(dim=1) / target_mask.sum(dim=1).clamp_min(1.0)
+    per_example_exact = (correct | (target_mask <= 0)).all(dim=1).float()
     length_active = torch.sigmoid(
         (rendered["lengths"] - active_segment_threshold) / active_segment_temperature
     )
@@ -690,40 +872,48 @@ def controlled_probe_diagnostics(
     length_std = rendered["lengths"].std(dim=1, unbiased=False)
     hard_active_count = (rendered["lengths"] > active_segment_threshold).float().sum(dim=1)
 
-    lines = ["probe fixed entropy/length:"]
-    label_to_indices: dict[tuple[str, int], list[int]] = {}
+    lines = ["probe controlled length/entropy:"]
+    label_to_indices: dict[tuple[str, int, int], list[int]] = {}
     for index, label in enumerate(labels):
         label_to_indices.setdefault(label, []).append(index)
 
     for block_type in block_types:
-        parts = []
-        for block_len in block_lengths:
-            indices = label_to_indices.get((block_type, block_len), [])
-            if not indices:
-                continue
-            index_tensor = torch.tensor(indices, device=device)
-            sample_index = indices[0]
-            sample_lengths = rendered["lengths"][sample_index].detach().cpu().tolist()
-            sample_lengths_text = ",".join(f"{value:.1f}" for value in sample_lengths)
-            parts.append(
-                f"b{block_len:02d} "
-                f"acc{per_example_accuracy[index_tensor].mean().item():.2f} "
-                f"ex{per_example_exact[index_tensor].mean().item():.2f} "
-                f"act{active_count[index_tensor].mean().item():.1f} "
-                f"hact{hard_active_count[index_tensor].mean().item():.1f} "
-                f"uact{usage_weighted_active_count[index_tensor].mean().item():.1f} "
-                f"seg{mean_active_length[index_tensor].mean().item():.1f} "
-                f"max{max_length[index_tensor].mean().item():.1f} "
-                f"std{length_std[index_tensor].mean().item():.1f} "
-                f"lens[{sample_lengths_text}]"
-            )
-        if parts:
-            lines.append(f"probe {block_type:<12} " + " | ".join(parts))
+        for probe_seq_len in sequence_lengths:
+            parts = []
+            for block_len in block_lengths:
+                indices = label_to_indices.get((block_type, probe_seq_len, block_len), [])
+                if not indices:
+                    continue
+                index_tensor = torch.tensor(indices, device=device)
+                first_index = indices[0]
+                sample_lengths = rendered["lengths"][first_index].detach().cpu().tolist()
+                sample_lengths_text = ",".join(f"{value:.1f}" for value in sample_lengths)
+                parts.append(
+                    f"b{block_len:02d} "
+                    f"acc{per_example_accuracy[index_tensor].mean().item():.2f} "
+                    f"ex{per_example_exact[index_tensor].mean().item():.2f} "
+                    f"out{rendered['total_len'][index_tensor].mean().item():.1f} "
+                    f"act{active_count[index_tensor].mean().item():.1f} "
+                    f"hact{hard_active_count[index_tensor].mean().item():.1f} "
+                    f"uact{usage_weighted_active_count[index_tensor].mean().item():.1f} "
+                    f"seg{mean_active_length[index_tensor].mean().item():.1f} "
+                    f"max{max_length[index_tensor].mean().item():.1f} "
+                    f"std{length_std[index_tensor].mean().item():.1f} "
+                    f"lens[{sample_lengths_text}]"
+                )
+            if parts:
+                lines.append(f"probe {block_type:<12} L{probe_seq_len:03d} " + " | ".join(parts))
     return lines
 
 
-def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Tensor], target: torch.Tensor) -> str:
-    metrics = reconstruction_metrics(rendered["soft_dna"], target)
+def format_metrics(
+    prefix: str,
+    loss: torch.Tensor,
+    rendered: dict[str, torch.Tensor],
+    target: torch.Tensor,
+    target_mask: torch.Tensor | None = None,
+) -> str:
+    metrics = reconstruction_metrics(rendered["soft_dna"], target, target_mask=target_mask)
     return (
         f"{prefix:<5} loss {loss.item():.4f} ce {rendered['recon_loss'].item():.4f} "
         f"acc {metrics['accuracy']:.3f} exact {metrics['exact']:.3f} "
@@ -749,6 +939,10 @@ def evaluate_fresh_batches(
     batch_size: int,
     batches: int,
     num_segments: int,
+    variable_length: bool,
+    variable_min_len: int,
+    short_max_len_frac: float,
+    long_min_len_frac: float,
     length_weight: float,
     block_length_weight: float,
     sorted_block_length_weight: float,
@@ -762,25 +956,43 @@ def evaluate_fresh_batches(
     active_budget: float,
     active_budget_weight: float,
     usage_sharp_weight: float,
-) -> tuple[float, dict[str, float], dict[str, torch.Tensor], torch.Tensor, list[list[int]]]:
+) -> tuple[float, dict[str, float], dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]]]:
     total_loss = 0.0
     total_accuracy = 0.0
     total_exact = 0.0
     last_rendered: dict[str, torch.Tensor] | None = None
     last_batch: torch.Tensor | None = None
+    last_target_mask: torch.Tensor | None = None
+    last_target_lengths: torch.Tensor | None = None
     last_block_lengths_list: list[list[int]] | None = None
     for _ in range(batches):
-        batch, block_lengths, block_mask, block_lengths_list, _ = make_batch_with_blocks(
-            batch_size,
-            seq_len,
-            num_segments,
-            rng,
-            device,
-        )
+        if variable_length:
+            batch, target_mask, target_lengths, block_lengths, block_mask, block_lengths_list, _ = (
+                make_variable_length_batch_with_blocks(
+                    batch_size,
+                    seq_len,
+                    num_segments,
+                    variable_min_len,
+                    short_max_len_frac,
+                    long_min_len_frac,
+                    rng,
+                    device,
+                )
+            )
+        else:
+            batch, target_mask, target_lengths, block_lengths, block_mask, block_lengths_list, _ = make_batch_with_blocks(
+                batch_size,
+                seq_len,
+                num_segments,
+                rng,
+                device,
+            )
         loss, rendered = loss_for_batch(
             model=model,
             target=batch,
-            seq_len=seq_len,
+            target_mask=target_mask,
+            target_lengths=target_lengths,
+            max_seq_len=seq_len,
             block_lengths=block_lengths,
             block_length_mask=block_mask,
             length_weight=length_weight,
@@ -797,14 +1009,22 @@ def evaluate_fresh_batches(
             active_budget_weight=active_budget_weight,
             usage_sharp_weight=usage_sharp_weight,
         )
-        metrics = reconstruction_metrics(rendered["soft_dna"], batch)
+        metrics = reconstruction_metrics(rendered["soft_dna"], batch, target_mask=target_mask)
         total_loss += loss.item()
         total_accuracy += metrics["accuracy"]
         total_exact += metrics["exact"]
         last_rendered = rendered
         last_batch = batch
+        last_target_mask = target_mask
+        last_target_lengths = target_lengths
         last_block_lengths_list = block_lengths_list
-    assert last_rendered is not None and last_batch is not None and last_block_lengths_list is not None
+    assert (
+        last_rendered is not None
+        and last_batch is not None
+        and last_target_mask is not None
+        and last_target_lengths is not None
+        and last_block_lengths_list is not None
+    )
     return (
         total_loss / float(batches),
         {
@@ -813,6 +1033,8 @@ def evaluate_fresh_batches(
         },
         last_rendered,
         last_batch,
+        last_target_mask,
+        last_target_lengths,
         last_block_lengths_list,
     )
 
@@ -1033,6 +1255,7 @@ def build_model_from_args(args: argparse.Namespace) -> SegmentalSoftpackAutoenco
         query_position_width=args.query_position_width,
         decoder_hidden_dim=args.decoder_hidden_dim,
         initial_active_fraction=args.initial_active_fraction,
+        initial_total_len_frac=args.initial_total_len_frac,
         initial_length_jitter=args.initial_length_jitter,
         initial_usage_jitter=args.initial_usage_jitter,
     )
@@ -1075,6 +1298,12 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--gate-temperature and --pack-temperature must be positive.")
     if args.batch_size <= 0 or args.val_batches <= 0:
         raise ValueError("--batch-size and --val-batches must be positive.")
+    if args.variable_min_len <= 0 or args.variable_min_len > args.seq_len:
+        raise ValueError("--variable-min-len must be in [1, seq_len].")
+    if not 0 < args.short_max_len_frac <= 1 or not 0 < args.long_min_len_frac <= 1:
+        raise ValueError("--short-max-len-frac and --long-min-len-frac must be in (0, 1].")
+    if args.short_max_len_frac > args.long_min_len_frac:
+        raise ValueError("--short-max-len-frac should be <= --long-min-len-frac.")
     if args.active_segment_temperature <= 0:
         raise ValueError("--active-segment-temperature must be positive.")
     if args.active_budget < 0 or args.active_budget_weight < 0:
@@ -1087,6 +1316,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--length-std-target and --length-std-weight must be non-negative.")
     if args.initial_length_jitter < 0 or args.initial_usage_jitter < 0:
         raise ValueError("--initial-length-jitter and --initial-usage-jitter must be non-negative.")
+    if args.initial_total_len_frac <= 0:
+        raise ValueError("--initial-total-len-frac must be positive.")
     if args.probe_examples < 0:
         raise ValueError("--probe-examples must be non-negative.")
     if args.diagnostics_only and checkpoint is None:
@@ -1105,6 +1336,25 @@ def train(args: argparse.Namespace) -> None:
     probe_block_types = parse_block_type_list(args.probe_block_types)
     if args.probe_examples > 0 and (not probe_block_lengths or not probe_block_types):
         raise ValueError("--probe-block-lengths and --probe-block-types must be non-empty when probes are enabled.")
+    if args.probe_seq_lengths:
+        raw_probe_seq_lengths = parse_int_list(args.probe_seq_lengths)
+    elif args.variable_length:
+        raw_probe_seq_lengths = [
+            args.variable_min_len,
+            max(args.variable_min_len, int(round(args.seq_len * args.short_max_len_frac))),
+            args.seq_len,
+        ]
+    else:
+        raw_probe_seq_lengths = [args.seq_len]
+    probe_seq_lengths = []
+    seen_probe_seq_lengths = set()
+    for probe_seq_len in raw_probe_seq_lengths:
+        if probe_seq_len <= 0:
+            raise ValueError("--probe-seq-lengths must contain positive integers.")
+        probe_seq_len = min(probe_seq_len, args.seq_len)
+        if probe_seq_len not in seen_probe_seq_lengths:
+            probe_seq_lengths.append(probe_seq_len)
+            seen_probe_seq_lengths.add(probe_seq_len)
 
     checkpoint_dir = Path(args.checkpoint_dir)
     if not args.diagnostics_only:
@@ -1142,6 +1392,13 @@ def train(args: argparse.Namespace) -> None:
     param_count = sum(parameter.numel() for parameter in model.parameters())
     print(f"device: {device}")
     print(f"fresh synthetic batches; seq_len={args.seq_len}; batch_size={args.batch_size}")
+    if args.variable_length:
+        print(
+            "variable length mode: "
+            f"min_len={args.variable_min_len}; "
+            f"short_max_frac={args.short_max_len_frac}; "
+            f"long_min_frac={args.long_min_len_frac}"
+        )
     print(
         f"segments={args.num_segments}; latent_dim={args.latent_dim}; "
         f"max_slots_per_segment={args.max_slots_per_segment}; params={param_count}"
@@ -1149,6 +1406,7 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"query_position_bias={args.query_position_bias}; "
         f"initial_active_fraction={args.initial_active_fraction}; "
+        f"initial_total_len_frac={args.initial_total_len_frac}; "
         f"initial_length_jitter={args.initial_length_jitter}; "
         f"initial_usage_jitter={args.initial_usage_jitter}; "
         f"active_segment_weight={args.active_segment_weight}; "
@@ -1163,18 +1421,31 @@ def train(args: argparse.Namespace) -> None:
         print(
             "probe diagnostics: "
             f"examples_per_condition={args.probe_examples}; "
+            f"seq_lengths={','.join(str(value) for value in probe_seq_lengths)}; "
             f"block_lengths={','.join(str(value) for value in probe_block_lengths)}; "
             f"block_types={','.join(probe_block_types)}"
         )
 
     for step in range(args.steps):
-        batch, block_lengths, block_mask, _, _ = make_batch_with_blocks(
-            args.batch_size,
-            args.seq_len,
-            args.num_segments,
-            train_rng,
-            device,
-        )
+        if args.variable_length:
+            batch, target_mask, target_lengths, block_lengths, block_mask, _, _ = make_variable_length_batch_with_blocks(
+                args.batch_size,
+                args.seq_len,
+                args.num_segments,
+                args.variable_min_len,
+                args.short_max_len_frac,
+                args.long_min_len_frac,
+                train_rng,
+                device,
+            )
+        else:
+            batch, target_mask, target_lengths, block_lengths, block_mask, _, _ = make_batch_with_blocks(
+                args.batch_size,
+                args.seq_len,
+                args.num_segments,
+                train_rng,
+                device,
+            )
         sharp_weight = current_sharp_weight(step, args.steps, args.sharp_weight, args.sharp_warmup_frac)
         usage_sharp_weight = current_sharp_weight(
             step,
@@ -1191,7 +1462,9 @@ def train(args: argparse.Namespace) -> None:
         loss, rendered = loss_for_batch(
             model=model,
             target=batch,
-            seq_len=args.seq_len,
+            target_mask=target_mask,
+            target_lengths=target_lengths,
+            max_seq_len=args.seq_len,
             block_lengths=block_lengths,
             block_length_mask=block_mask,
             length_weight=args.length_weight,
@@ -1217,7 +1490,15 @@ def train(args: argparse.Namespace) -> None:
         if step % args.print_every == 0 or step == args.steps - 1:
             model.eval()
             with torch.no_grad():
-                val_loss, val_metrics, val_rendered, val_batch, val_block_lengths = evaluate_fresh_batches(
+                (
+                    val_loss,
+                    val_metrics,
+                    val_rendered,
+                    val_batch,
+                    val_target_mask,
+                    val_target_lengths,
+                    val_block_lengths,
+                ) = evaluate_fresh_batches(
                     model=model,
                     rng=val_rng,
                     device=device,
@@ -1225,6 +1506,10 @@ def train(args: argparse.Namespace) -> None:
                     batch_size=args.batch_size,
                     batches=args.val_batches,
                     num_segments=args.num_segments,
+                    variable_length=args.variable_length,
+                    variable_min_len=args.variable_min_len,
+                    short_max_len_frac=args.short_max_len_frac,
+                    long_min_len_frac=args.long_min_len_frac,
                     length_weight=args.length_weight,
                     block_length_weight=args.block_length_weight,
                     sorted_block_length_weight=args.sorted_block_length_weight,
@@ -1245,6 +1530,7 @@ def train(args: argparse.Namespace) -> None:
                     device=device,
                     seq_len=args.seq_len,
                     examples_per_condition=args.probe_examples,
+                    sequence_lengths=probe_seq_lengths,
                     block_lengths=probe_block_lengths,
                     block_types=probe_block_types,
                     active_segment_threshold=args.active_segment_threshold,
@@ -1269,15 +1555,15 @@ def train(args: argparse.Namespace) -> None:
                 f"budget_w {active_budget_weight:.2e} "
                 f"val_loss {val_loss:.4f} val_acc {val_metrics['accuracy']:.3f} val_exact {val_metrics['exact']:.3f}"
             )
-            print(format_metrics("train", loss, rendered, batch))
-            print(format_metrics("val", torch.tensor(val_loss), val_rendered, val_batch))
-            print(summarise_lengths(val_rendered["lengths"], val_rendered["total_len"]))
+            print(format_metrics("train", loss, rendered, batch, target_mask=target_mask))
+            print(format_metrics("val", torch.tensor(val_loss), val_rendered, val_batch, target_mask=val_target_mask))
+            print(summarise_lengths(val_rendered["lengths"], val_rendered["total_len"], val_target_lengths))
             print(summarise_length_conditioning(val_rendered["lengths"], val_rendered["segment_usage"]))
             print(summarise_active_segments(val_rendered["active_segments"]))
             print(summarise_segment_usage(val_rendered["segment_usage"]))
             print(summarise_true_blocks(val_block_lengths))
             print(f"block_len_corr {block_length_correlation(val_rendered['lengths'], val_block_lengths):.3f}")
-            print(summarise_segment_entropy(val_rendered, val_batch))
+            print(summarise_segment_entropy(val_rendered, val_batch, target_mask=val_target_mask))
             for probe_line in probe_lines:
                 print(probe_line)
 
@@ -1306,6 +1592,10 @@ def train(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fresh-batch segmental SoftPack DNA autoencoder.")
     parser.add_argument("--seq-len", type=int, default=100)
+    parser.add_argument("--variable-length", action="store_true")
+    parser.add_argument("--variable-min-len", type=int, default=20)
+    parser.add_argument("--short-max-len-frac", type=float, default=0.4)
+    parser.add_argument("--long-min-len-frac", type=float, default=0.75)
     parser.add_argument("--num-segments", type=int, default=10)
     parser.add_argument("--latent-dim", type=int, default=48)
     parser.add_argument("--max-slots-per-segment", type=int, default=32)
@@ -1336,10 +1626,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-position-bias", type=float, default=1.5)
     parser.add_argument("--query-position-width", type=float, default=0.35)
     parser.add_argument("--initial-active-fraction", type=float, default=1.0)
+    parser.add_argument("--initial-total-len-frac", type=float, default=1.0)
     parser.add_argument("--initial-length-jitter", type=float, default=0.05)
     parser.add_argument("--initial-usage-jitter", type=float, default=0.25)
     parser.add_argument("--decoder-hidden-dim", type=int, default=64)
     parser.add_argument("--probe-examples", type=int, default=4)
+    parser.add_argument("--probe-seq-lengths", default="")
     parser.add_argument("--probe-block-lengths", default="4,8,16,32,48")
     parser.add_argument("--probe-block-types", default="random,homopolymer,dinucleotide,motif")
     parser.add_argument("--grad-clip", type=float, default=1.0)
