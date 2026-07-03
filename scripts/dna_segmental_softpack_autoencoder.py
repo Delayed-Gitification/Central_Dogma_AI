@@ -408,7 +408,8 @@ def loss_for_batch(
     latent_l2 = z.pow(2).mean()
     sharp_loss = (rendered["keep"] * (1.0 - rendered["keep"])).mean()
     length_active = torch.sigmoid((rendered["lengths"] - active_segment_threshold) / active_segment_temperature)
-    active_segments = rendered["segment_usage"] * length_active
+    active_segments = length_active
+    usage_weighted_active_segments = rendered["segment_usage"] * length_active
     active_count = active_segments.sum(dim=1)
     active_segment_loss = active_count.mean()
     if active_budget > 0 and active_budget_weight > 0:
@@ -441,6 +442,7 @@ def loss_for_batch(
         "active_segment_loss": active_segment_loss.detach(),
         "active_budget_loss": active_budget_loss.detach(),
         "active_segments": active_segments.detach(),
+        "usage_weighted_active_segments": usage_weighted_active_segments.detach(),
         "length_active": length_active.detach(),
         "usage_sharp_loss": usage_sharp_loss.detach(),
     }
@@ -676,8 +678,10 @@ def controlled_probe_diagnostics(
     length_active = torch.sigmoid(
         (rendered["lengths"] - active_segment_threshold) / active_segment_temperature
     )
-    active_segments = rendered["segment_usage"] * length_active
+    active_segments = length_active
+    usage_weighted_active_segments = rendered["segment_usage"] * length_active
     active_count = active_segments.sum(dim=1)
+    usage_weighted_active_count = usage_weighted_active_segments.sum(dim=1)
     mean_active_length = rendered["total_len"] / active_count.clamp_min(1e-6)
     max_length = rendered["lengths"].max(dim=1).values
     length_std = rendered["lengths"].std(dim=1, unbiased=False)
@@ -699,6 +703,7 @@ def controlled_probe_diagnostics(
                 f"acc{per_example_accuracy[index_tensor].mean().item():.2f} "
                 f"ex{per_example_exact[index_tensor].mean().item():.2f} "
                 f"act{active_count[index_tensor].mean().item():.1f} "
+                f"uact{usage_weighted_active_count[index_tensor].mean().item():.1f} "
                 f"seg{mean_active_length[index_tensor].mean().item():.1f} "
                 f"max{max_length[index_tensor].mean().item():.1f} "
                 f"std{length_std[index_tensor].mean().item():.1f}"
