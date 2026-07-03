@@ -610,11 +610,13 @@ def short_status(
     val_len_exact = val_rendered["total_len"].round() == val_lengths.round()
     train_strict_exact = (train_base_exact & train_len_exact).float().mean().item()
     val_strict_exact = (val_base_exact & val_len_exact).float().mean().item()
+    train_len_ok = train_len_exact.float().mean().item()
+    val_len_ok = val_len_exact.float().mean().item()
     return [
         (
             f"\nstep {step:06d} | val loss {val_loss:.4f} acc {val_metrics['accuracy']:.3f} "
             f"exact {val_metrics['exact']:.3f} strict {val_strict_exact:.3f} "
-            f"len_ok {val_len_exact.mean().item():.3f} | "
+            f"len_ok {val_len_ok:.3f} | "
             f"span_mix {val_rendered['span_mix'].item():.2f} "
             f"teacher_cos {val_rendered['teacher_latent_cosine'].item():.3f} "
             f"token_count {val_rendered['token_count'].mean().item():.2f}/{val_component_counts.mean().item():.2f} "
