@@ -408,6 +408,14 @@ def hard_decode(
     return tensor_to_sequence(rendered["soft_dna"].argmax(dim=-1)[0])
 
 
+def decode_tensor(
+    model: SegmentalSoftpackAutoencoder,
+    z: torch.Tensor,
+    out_len: int,
+) -> torch.Tensor:
+    return model.render_from_latents(z, out_len)["soft_dna"].argmax(dim=-1)
+
+
 def edit_distance(first: str, second: str) -> int:
     previous = list(range(len(second) + 1))
     for i, first_char in enumerate(first, start=1):
@@ -680,33 +688,158 @@ def run_diagnostics(
     model.train()
 
 
-def train(args: argparse.Namespace) -> None:
-    if args.num_segments * args.max_slots_per_segment < args.seq_len:
-        raise ValueError("--num-segments * --max-slots-per-segment must be at least --seq-len.")
-    if args.gate_temperature <= 0 or args.pack_temperature <= 0:
-        raise ValueError("--gate-temperature and --pack-temperature must be positive.")
-    if args.batch_size <= 0 or args.val_batches <= 0:
-        raise ValueError("--batch-size and --val-batches must be positive.")
-    if args.active_segment_temperature <= 0:
-        raise ValueError("--active-segment-temperature must be positive.")
-    if args.active_budget < 0 or args.active_budget_weight < 0:
-        raise ValueError("--active-budget and --active-budget-weight must be non-negative.")
-    if args.block_length_weight < 0:
-        raise ValueError("--block-length-weight must be non-negative.")
-    if args.initial_length_jitter < 0 or args.initial_usage_jitter < 0:
-        raise ValueError("--initial-length-jitter and --initial-usage-jitter must be non-negative.")
+def parse_float_list(values: str) -> list[float]:
+    return [float(value.strip()) for value in values.split(",") if value.strip()]
 
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    device = pick_device(args)
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    train_rng = random.Random(args.seed)
-    val_rng = random.Random(args.seed + 1_000_000)
-    diagnostic_rng = random.Random(args.seed + 2_000_000)
+def sequence_change_fraction(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    return (first != second).float().mean(dim=1)
 
-    model = SegmentalSoftpackAutoencoder(
+
+def manifold_noise_diagnostics(
+    *,
+    model: SegmentalSoftpackAutoencoder,
+    z: torch.Tensor,
+    target: torch.Tensor,
+    noise_scales: list[float],
+) -> None:
+    baseline = decode_tensor(model, z, target.shape[1])
+    print("\nLatent noise curve:")
+    for scale in noise_scales:
+        noisy = z + torch.randn_like(z) * scale
+        decoded = decode_tensor(model, noisy, target.shape[1])
+        changed = sequence_change_fraction(baseline, decoded)
+        target_acc = (decoded == target).float().mean(dim=1)
+        print(
+            f"noise {scale:.4f} | "
+            f"changed {changed.mean().item():.3f}/{changed.std(unbiased=False).item():.3f} "
+            f"range {changed.min().item():.3f}-{changed.max().item():.3f} | "
+            f"target_acc {target_acc.mean().item():.3f}"
+        )
+
+
+def manifold_interpolation_diagnostics(
+    *,
+    model: SegmentalSoftpackAutoencoder,
+    z: torch.Tensor,
+    target: torch.Tensor,
+    steps: int,
+) -> None:
+    if z.shape[0] < 2:
+        return
+    steps = max(2, steps)
+    z_start = z[:1]
+    z_end = z[1:2]
+    decoded_strings = []
+    length_means = []
+    for index in range(steps):
+        alpha = float(index) / float(steps - 1)
+        z_interp = (1.0 - alpha) * z_start + alpha * z_end
+        rendered = model.render_from_latents(z_interp, target.shape[1])
+        decoded_strings.append(tensor_to_sequence(rendered["soft_dna"].argmax(dim=-1)[0]))
+        length_means.append(rendered["lengths"].mean().item())
+
+    consecutive = [
+        edit_distance(decoded_strings[index], decoded_strings[index + 1]) / float(target.shape[1])
+        for index in range(steps - 1)
+    ]
+    to_start = [edit_distance(decoded_strings[0], decoded) / float(target.shape[1]) for decoded in decoded_strings]
+    to_end = [edit_distance(decoded_strings[-1], decoded) / float(target.shape[1]) for decoded in decoded_strings]
+
+    print("\nLatent interpolation:")
+    print(
+        f"consecutive_edit {sum(consecutive) / len(consecutive):.3f} "
+        f"range {min(consecutive):.3f}-{max(consecutive):.3f}"
+    )
+    print("alpha path:")
+    for index in range(steps):
+        alpha = float(index) / float(steps - 1)
+        print(
+            f"  a={alpha:.2f} dist_start={to_start[index]:.3f} "
+            f"dist_end={to_end[index]:.3f} mean_seg_len={length_means[index]:.2f} "
+            f"{decoded_strings[index][:80]}"
+        )
+
+
+def manifold_segment_swap_diagnostics(
+    *,
+    model: SegmentalSoftpackAutoencoder,
+    z: torch.Tensor,
+    target: torch.Tensor,
+) -> None:
+    if z.shape[0] < 2:
+        return
+    rendered = model.render_from_latents(z[:2], target.shape[1])
+    usage = rendered["segment_usage"]
+    segment_index = int(usage[0].argmax().item())
+    original = decode_tensor(model, z[:1], target.shape[1])[0]
+    swapped_z = z[:1].clone()
+    swapped_z[:, segment_index, :] = z[1:2, segment_index, :]
+    swapped = decode_tensor(model, swapped_z, target.shape[1])[0]
+    changed = (original != swapped).nonzero(as_tuple=False).flatten().detach().cpu().tolist()
+
+    print("\nSegment swap:")
+    print(
+        f"segment {segment_index} usage_a={usage[0, segment_index].item():.3f} "
+        f"usage_b={usage[1, segment_index].item():.3f} "
+        f"changed_frac={(original != swapped).float().mean().item():.3f}"
+    )
+    print("changed positions:", changed[:40], "..." if len(changed) > 40 else "")
+    print("original:", tensor_to_sequence(original)[:100])
+    print("swapped: ", tensor_to_sequence(swapped)[:100])
+
+
+def manifold_neighbor_diagnostics(z: torch.Tensor, target: torch.Tensor) -> None:
+    if z.shape[0] < 4:
+        return
+    flat_z = z.detach().flatten(start_dim=1)
+    latent_dist = torch.cdist(flat_z, flat_z)
+    seq_dist = (target[:, None, :] != target[None, :, :]).float().mean(dim=-1)
+    mask = ~torch.eye(z.shape[0], dtype=torch.bool, device=z.device)
+    latent_values = latent_dist[mask].detach().cpu()
+    seq_values = seq_dist[mask].detach().cpu()
+    nearest = latent_dist.masked_fill(~mask, float("inf")).argmin(dim=1)
+    nearest_seq_dist = (target != target[nearest]).float().mean(dim=1)
+
+    print("\nLatent neighbor geometry:")
+    print(f"latent_seq_dist_corr {tensor_correlation(latent_values, seq_values):.3f}")
+    print(
+        f"nearest_seq_dist {nearest_seq_dist.mean().item():.3f}/"
+        f"{nearest_seq_dist.std(unbiased=False).item():.3f} "
+        f"range {nearest_seq_dist.min().item():.3f}-{nearest_seq_dist.max().item():.3f}"
+    )
+
+
+def run_manifold_diagnostics(
+    *,
+    model: SegmentalSoftpackAutoencoder,
+    rng: random.Random,
+    device: torch.device,
+    seq_len: int,
+    batch_size: int,
+    noise_scales: list[float],
+    interpolation_steps: int,
+) -> None:
+    model.eval()
+    with torch.no_grad():
+        batch = make_batch(batch_size, seq_len, rng, device)
+        z = model.encode(batch)
+        rendered = model.render_from_latents(z, seq_len)
+        metrics = reconstruction_metrics(rendered["soft_dna"], batch)
+
+        print("\nManifold diagnostics:")
+        print(f"batch_recon acc {metrics['accuracy']:.3f} exact {metrics['exact']:.3f}")
+        print(summarise_lengths(rendered["lengths"], rendered["total_len"]))
+        print(summarise_segment_usage(rendered["segment_usage"]))
+        manifold_noise_diagnostics(model=model, z=z, target=batch, noise_scales=noise_scales)
+        manifold_interpolation_diagnostics(model=model, z=z, target=batch, steps=interpolation_steps)
+        manifold_segment_swap_diagnostics(model=model, z=z, target=batch)
+        manifold_neighbor_diagnostics(z, batch)
+    model.train()
+
+
+def build_model_from_args(args: argparse.Namespace) -> SegmentalSoftpackAutoencoder:
+    return SegmentalSoftpackAutoencoder(
         seq_len=args.seq_len,
         num_segments=args.num_segments,
         latent_dim=args.latent_dim,
@@ -721,7 +854,82 @@ def train(args: argparse.Namespace) -> None:
         initial_active_fraction=args.initial_active_fraction,
         initial_length_jitter=args.initial_length_jitter,
         initial_usage_jitter=args.initial_usage_jitter,
-    ).to(device)
+    )
+
+
+def apply_checkpoint_args(args: argparse.Namespace, checkpoint_args: dict) -> argparse.Namespace:
+    preserved = {
+        "load_checkpoint": args.load_checkpoint,
+        "diagnostics_only": args.diagnostics_only,
+        "manifold_examples": args.manifold_examples,
+        "manifold_noise_scales": args.manifold_noise_scales,
+        "manifold_interp_steps": args.manifold_interp_steps,
+        "run_manifold_diagnostics": args.run_manifold_diagnostics,
+        "mps": args.mps,
+        "seed": args.seed,
+    }
+    for key, value in checkpoint_args.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    for key, value in preserved.items():
+        setattr(args, key, value)
+    return args
+
+
+def train(args: argparse.Namespace) -> None:
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    device = pick_device(args)
+
+    checkpoint = None
+    if args.load_checkpoint:
+        checkpoint = torch.load(args.load_checkpoint, map_location=device)
+        checkpoint_args = checkpoint.get("args", {})
+        if checkpoint_args:
+            args = apply_checkpoint_args(args, checkpoint_args)
+
+    if args.num_segments * args.max_slots_per_segment < args.seq_len:
+        raise ValueError("--num-segments * --max-slots-per-segment must be at least --seq-len.")
+    if args.gate_temperature <= 0 or args.pack_temperature <= 0:
+        raise ValueError("--gate-temperature and --pack-temperature must be positive.")
+    if args.batch_size <= 0 or args.val_batches <= 0:
+        raise ValueError("--batch-size and --val-batches must be positive.")
+    if args.active_segment_temperature <= 0:
+        raise ValueError("--active-segment-temperature must be positive.")
+    if args.active_budget < 0 or args.active_budget_weight < 0:
+        raise ValueError("--active-budget and --active-budget-weight must be non-negative.")
+    if args.block_length_weight < 0:
+        raise ValueError("--block-length-weight must be non-negative.")
+    if args.initial_length_jitter < 0 or args.initial_usage_jitter < 0:
+        raise ValueError("--initial-length-jitter and --initial-usage-jitter must be non-negative.")
+    if args.diagnostics_only and checkpoint is None:
+        raise ValueError("--diagnostics-only requires --load-checkpoint.")
+
+    checkpoint_dir = Path(args.checkpoint_dir)
+    if not args.diagnostics_only:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    train_rng = random.Random(args.seed)
+    val_rng = random.Random(args.seed + 1_000_000)
+    diagnostic_rng = random.Random(args.seed + 2_000_000)
+
+    model = build_model_from_args(args).to(device)
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        print(f"loaded checkpoint: {args.load_checkpoint}")
+
+    if args.diagnostics_only:
+        run_manifold_diagnostics(
+            model=model,
+            rng=diagnostic_rng,
+            device=device,
+            seq_len=args.seq_len,
+            batch_size=args.manifold_examples,
+            noise_scales=parse_float_list(args.manifold_noise_scales),
+            interpolation_steps=args.manifold_interp_steps,
+        )
+        return
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_val_loss = float("inf")
 
@@ -845,6 +1053,16 @@ def train(args: argparse.Namespace) -> None:
         checkpoint_dir / "latest.pt",
     )
     run_diagnostics(model=model, rng=diagnostic_rng, device=device, seq_len=args.seq_len)
+    if args.run_manifold_diagnostics:
+        run_manifold_diagnostics(
+            model=model,
+            rng=diagnostic_rng,
+            device=device,
+            seq_len=args.seq_len,
+            batch_size=args.manifold_examples,
+            noise_scales=parse_float_list(args.manifold_noise_scales),
+            interpolation_steps=args.manifold_interp_steps,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -884,6 +1102,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-batches", type=int, default=4)
     parser.add_argument("--print-every", type=int, default=500)
     parser.add_argument("--checkpoint-dir", default="checkpoints/dna_segmental_softpack_autoencoder")
+    parser.add_argument("--load-checkpoint", default="")
+    parser.add_argument("--diagnostics-only", action="store_true")
+    parser.add_argument("--run-manifold-diagnostics", action="store_true")
+    parser.add_argument("--manifold-examples", type=int, default=16)
+    parser.add_argument("--manifold-noise-scales", default="0.01,0.03,0.1,0.3")
+    parser.add_argument("--manifold-interp-steps", type=int, default=7)
     parser.add_argument("--mps", action="store_true")
     parser.add_argument("--seed", type=int, default=1)
     return parser.parse_args()
