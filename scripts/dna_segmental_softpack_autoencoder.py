@@ -50,28 +50,68 @@ def motif_repeat_block(rng: random.Random, length: int) -> str:
     return (motif * ((length + motif_length - 1) // motif_length))[:length]
 
 
-def generate_segmental_sequence(seq_len: int, rng: random.Random) -> str:
+def generate_segmental_sequence_with_blocks(seq_len: int, rng: random.Random) -> tuple[str, list[int], list[str]]:
     builders = [
-        random_dna_block,
-        homopolymer_block,
-        dinucleotide_repeat_block,
-        pyrimidine_rich_block,
-        motif_repeat_block,
+        ("random", random_dna_block),
+        ("homopolymer", homopolymer_block),
+        ("dinucleotide", dinucleotide_repeat_block),
+        ("pyrimidine", pyrimidine_rich_block),
+        ("motif", motif_repeat_block),
     ]
     parts = []
+    block_lengths = []
+    block_types = []
     total_length = 0
     while total_length < seq_len:
         remaining = seq_len - total_length
         length = min(remaining, rng.randint(5, 32))
-        part = rng.choice(builders)(rng, length)
+        block_type, builder = rng.choice(builders)
+        part = builder(rng, length)
         parts.append(part)
+        block_lengths.append(len(part))
+        block_types.append(block_type)
         total_length += len(part)
-    return "".join(parts)[:seq_len]
+    return "".join(parts)[:seq_len], block_lengths, block_types
+
+
+def generate_segmental_sequence(seq_len: int, rng: random.Random) -> str:
+    sequence, _, _ = generate_segmental_sequence_with_blocks(seq_len, rng)
+    return sequence
 
 
 def make_batch(batch_size: int, seq_len: int, rng: random.Random, device: torch.device) -> torch.Tensor:
     batch = torch.stack([sequence_to_tensor(generate_segmental_sequence(seq_len, rng)) for _ in range(batch_size)])
     return batch.to(device)
+
+
+def make_batch_with_blocks(
+    batch_size: int,
+    seq_len: int,
+    num_segments: int,
+    rng: random.Random,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]], list[list[str]]]:
+    sequences = []
+    all_block_lengths = []
+    all_block_types = []
+    block_length_targets = torch.zeros(batch_size, num_segments, dtype=torch.float32)
+    block_length_mask = torch.zeros(batch_size, num_segments, dtype=torch.float32)
+    for batch_index in range(batch_size):
+        sequence, block_lengths, block_types = generate_segmental_sequence_with_blocks(seq_len, rng)
+        sequences.append(sequence_to_tensor(sequence))
+        all_block_lengths.append(block_lengths)
+        all_block_types.append(block_types)
+        usable_blocks = min(num_segments, len(block_lengths))
+        if usable_blocks > 0:
+            block_length_targets[batch_index, :usable_blocks] = torch.tensor(block_lengths[:usable_blocks], dtype=torch.float32)
+            block_length_mask[batch_index, :usable_blocks] = 1.0
+    return (
+        torch.stack(sequences).to(device),
+        block_length_targets.to(device),
+        block_length_mask.to(device),
+        all_block_lengths,
+        all_block_types,
+    )
 
 
 class QuerySegmentEncoder(nn.Module):
@@ -294,7 +334,10 @@ def loss_for_batch(
     model: SegmentalSoftpackAutoencoder,
     target: torch.Tensor,
     seq_len: int,
+    block_lengths: torch.Tensor | None,
+    block_length_mask: torch.Tensor | None,
     length_weight: float,
+    block_length_weight: float,
     latent_l2_weight: float,
     sharp_weight: float,
     active_segment_weight: float,
@@ -306,6 +349,13 @@ def loss_for_batch(
     soft_dna = rendered["soft_dna"].clamp_min(1e-8)
     recon_loss = -soft_dna.gather(-1, target[..., None]).squeeze(-1).log().mean()
     length_loss = F.smooth_l1_loss(rendered["total_len"], torch.full_like(rendered["total_len"], float(seq_len)))
+    if block_length_weight > 0 and block_lengths is not None and block_length_mask is not None:
+        block_lengths = block_lengths.to(dtype=rendered["lengths"].dtype)
+        block_length_mask = block_length_mask.to(dtype=rendered["lengths"].dtype)
+        block_length_error = F.smooth_l1_loss(rendered["lengths"], block_lengths, reduction="none")
+        block_length_loss = (block_length_error * block_length_mask).sum() / block_length_mask.sum().clamp_min(1.0)
+    else:
+        block_length_loss = rendered["lengths"].new_zeros(())
     latent_l2 = z.pow(2).mean()
     sharp_loss = (rendered["keep"] * (1.0 - rendered["keep"])).mean()
     length_active = torch.sigmoid((rendered["lengths"] - active_segment_threshold) / active_segment_temperature)
@@ -315,6 +365,7 @@ def loss_for_batch(
     loss = (
         recon_loss
         + length_weight * length_loss
+        + block_length_weight * block_length_loss
         + latent_l2_weight * latent_l2
         + sharp_weight * sharp_loss
         + active_segment_weight * active_segment_loss
@@ -325,6 +376,7 @@ def loss_for_batch(
         "z": z.detach(),
         "recon_loss": recon_loss.detach(),
         "length_loss": length_loss.detach(),
+        "block_length_loss": block_length_loss.detach(),
         "latent_l2": latent_l2.detach(),
         "sharp_loss": sharp_loss.detach(),
         "active_segment_loss": active_segment_loss.detach(),
@@ -415,12 +467,48 @@ def summarise_segment_usage(segment_usage: torch.Tensor) -> str:
     )
 
 
+def summarise_true_blocks(block_lengths: list[list[int]]) -> str:
+    counts = torch.tensor([len(lengths) for lengths in block_lengths], dtype=torch.float32)
+    flat = torch.tensor([length for lengths in block_lengths for length in lengths], dtype=torch.float32)
+    return (
+        f"true_blocks {counts.mean().item():.1f}/{counts.std(unbiased=False).item():.1f} "
+        f"count_range {counts.min().item():.0f}-{counts.max().item():.0f} | "
+        f"true_block_len {flat.mean().item():.1f}/{flat.std(unbiased=False).item():.1f} "
+        f"range {flat.min().item():.0f}-{flat.max().item():.0f}"
+    )
+
+
+def block_length_correlation(
+    predicted_lengths: torch.Tensor,
+    block_lengths: list[list[int]],
+) -> float:
+    predicted_values = []
+    target_values = []
+    for batch_index, lengths in enumerate(block_lengths):
+        usable_blocks = min(predicted_lengths.shape[1], len(lengths))
+        if usable_blocks == 0:
+            continue
+        predicted_values.append(predicted_lengths[batch_index, :usable_blocks].detach().cpu())
+        target_values.append(torch.tensor(lengths[:usable_blocks], dtype=torch.float32))
+    if not predicted_values:
+        return 0.0
+    predicted = torch.cat(predicted_values)
+    target = torch.cat(target_values)
+    predicted = predicted - predicted.mean()
+    target = target - target.mean()
+    denom = predicted.norm() * target.norm()
+    if denom.item() == 0.0:
+        return 0.0
+    return float((predicted * target).sum().div(denom).item())
+
+
 def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Tensor], target: torch.Tensor) -> str:
     metrics = reconstruction_metrics(rendered["soft_dna"], target)
     return (
         f"{prefix:<5} loss {loss.item():.4f} ce {rendered['recon_loss'].item():.4f} "
         f"acc {metrics['accuracy']:.3f} exact {metrics['exact']:.3f} "
         f"len {rendered['length_loss'].item():.3f} "
+        f"block_len {rendered['block_length_loss'].item():.3f} "
         f"active_loss {rendered['active_segment_loss'].item():.3f} "
         f"usage_sharp {rendered['usage_sharp_loss'].item():.3f} "
         f"base_ent {rendered['base_entropy'].item():.3f} "
@@ -437,26 +525,38 @@ def evaluate_fresh_batches(
     seq_len: int,
     batch_size: int,
     batches: int,
+    num_segments: int,
     length_weight: float,
+    block_length_weight: float,
     latent_l2_weight: float,
     sharp_weight: float,
     active_segment_weight: float,
     active_segment_threshold: float,
     active_segment_temperature: float,
     usage_sharp_weight: float,
-) -> tuple[float, dict[str, float], dict[str, torch.Tensor], torch.Tensor]:
+) -> tuple[float, dict[str, float], dict[str, torch.Tensor], torch.Tensor, list[list[int]]]:
     total_loss = 0.0
     total_accuracy = 0.0
     total_exact = 0.0
     last_rendered: dict[str, torch.Tensor] | None = None
     last_batch: torch.Tensor | None = None
+    last_block_lengths_list: list[list[int]] | None = None
     for _ in range(batches):
-        batch = make_batch(batch_size, seq_len, rng, device)
+        batch, block_lengths, block_mask, block_lengths_list, _ = make_batch_with_blocks(
+            batch_size,
+            seq_len,
+            num_segments,
+            rng,
+            device,
+        )
         loss, rendered = loss_for_batch(
             model=model,
             target=batch,
             seq_len=seq_len,
+            block_lengths=block_lengths,
+            block_length_mask=block_mask,
             length_weight=length_weight,
+            block_length_weight=block_length_weight,
             latent_l2_weight=latent_l2_weight,
             sharp_weight=sharp_weight,
             active_segment_weight=active_segment_weight,
@@ -470,7 +570,8 @@ def evaluate_fresh_batches(
         total_exact += metrics["exact"]
         last_rendered = rendered
         last_batch = batch
-    assert last_rendered is not None and last_batch is not None
+        last_block_lengths_list = block_lengths_list
+    assert last_rendered is not None and last_batch is not None and last_block_lengths_list is not None
     return (
         total_loss / float(batches),
         {
@@ -479,6 +580,7 @@ def evaluate_fresh_batches(
         },
         last_rendered,
         last_batch,
+        last_block_lengths_list,
     )
 
 
@@ -530,6 +632,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size and --val-batches must be positive.")
     if args.active_segment_temperature <= 0:
         raise ValueError("--active-segment-temperature must be positive.")
+    if args.block_length_weight < 0:
+        raise ValueError("--block-length-weight must be non-negative.")
     if args.initial_length_jitter < 0 or args.initial_usage_jitter < 0:
         raise ValueError("--initial-length-jitter and --initial-usage-jitter must be non-negative.")
 
@@ -572,11 +676,18 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"query_position_bias={args.query_position_bias}; "
         f"initial_active_fraction={args.initial_active_fraction}; "
-        f"active_segment_weight={args.active_segment_weight}"
+        f"active_segment_weight={args.active_segment_weight}; "
+        f"block_length_weight={args.block_length_weight}"
     )
 
     for step in range(args.steps):
-        batch = make_batch(args.batch_size, args.seq_len, train_rng, device)
+        batch, block_lengths, block_mask, _, _ = make_batch_with_blocks(
+            args.batch_size,
+            args.seq_len,
+            args.num_segments,
+            train_rng,
+            device,
+        )
         sharp_weight = current_sharp_weight(step, args.steps, args.sharp_weight, args.sharp_warmup_frac)
         usage_sharp_weight = current_sharp_weight(
             step,
@@ -588,7 +699,10 @@ def train(args: argparse.Namespace) -> None:
             model=model,
             target=batch,
             seq_len=args.seq_len,
+            block_lengths=block_lengths,
+            block_length_mask=block_mask,
             length_weight=args.length_weight,
+            block_length_weight=args.block_length_weight,
             latent_l2_weight=args.latent_l2_weight,
             sharp_weight=sharp_weight,
             active_segment_weight=args.active_segment_weight,
@@ -605,14 +719,16 @@ def train(args: argparse.Namespace) -> None:
         if step % args.print_every == 0 or step == args.steps - 1:
             model.eval()
             with torch.no_grad():
-                val_loss, val_metrics, val_rendered, val_batch = evaluate_fresh_batches(
+                val_loss, val_metrics, val_rendered, val_batch, val_block_lengths = evaluate_fresh_batches(
                     model=model,
                     rng=val_rng,
                     device=device,
                     seq_len=args.seq_len,
                     batch_size=args.batch_size,
                     batches=args.val_batches,
+                    num_segments=args.num_segments,
                     length_weight=args.length_weight,
+                    block_length_weight=args.block_length_weight,
                     latent_l2_weight=args.latent_l2_weight,
                     sharp_weight=sharp_weight,
                     active_segment_weight=args.active_segment_weight,
@@ -643,6 +759,8 @@ def train(args: argparse.Namespace) -> None:
             print(summarise_lengths(val_rendered["lengths"], val_rendered["total_len"]))
             print(summarise_active_segments(val_rendered["active_segments"]))
             print(summarise_segment_usage(val_rendered["segment_usage"]))
+            print(summarise_true_blocks(val_block_lengths))
+            print(f"block_len_corr {block_length_correlation(val_rendered['lengths'], val_block_lengths):.3f}")
 
     torch.save(
         {
@@ -667,6 +785,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--length-weight", type=float, default=0.05)
+    parser.add_argument("--block-length-weight", type=float, default=0.0)
     parser.add_argument("--latent-l2-weight", type=float, default=1e-4)
     parser.add_argument("--gate-temperature", type=float, default=0.2)
     parser.add_argument("--pack-temperature", type=float, default=0.1)
