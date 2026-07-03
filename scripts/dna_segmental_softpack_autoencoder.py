@@ -384,7 +384,7 @@ def loss_for_batch(
     active_count = active_segments.sum(dim=1)
     active_segment_loss = active_count.mean()
     if active_budget > 0 and active_budget_weight > 0:
-        active_budget_loss = (active_count - active_budget).pow(2).mean()
+        active_budget_loss = (active_count.mean() - active_budget).pow(2)
     else:
         active_budget_loss = rendered["lengths"].new_zeros(())
     usage_sharp_loss = (rendered["segment_usage"] * (1.0 - rendered["segment_usage"])).sum(dim=1).mean()
@@ -617,7 +617,7 @@ def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Te
         f"sorted_block {rendered['sorted_block_length_loss'].item():.3f} "
         f"len_std {rendered['length_std_loss'].item():.3f} "
         f"active_loss {rendered['active_segment_loss'].item():.3f} "
-        f"budget {rendered['active_budget_loss'].item():.3f} "
+        f"batch_budget {rendered['active_budget_loss'].item():.3f} "
         f"usage_sharp {rendered['usage_sharp_loss'].item():.3f} "
         f"base_ent {rendered['base_entropy'].item():.3f} "
         f"pack_ent {rendered['pack_entropy'].item():.3f} "
