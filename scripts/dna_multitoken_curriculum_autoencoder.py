@@ -62,7 +62,9 @@ def single_generation_kwargs(args: argparse.Namespace) -> dict:
 def make_multitoken_batch(
     *,
     batch_size: int,
-    component_count: int,
+    max_components: int,
+    min_components: int,
+    two_component_prob: float,
     seq_len: int,
     typical_component_min_len: int,
     typical_component_max_len: int,
@@ -79,20 +81,30 @@ def make_multitoken_batch(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
     list[str],
     list[list[str]],
 ]:
     target = torch.zeros(batch_size, seq_len, dtype=torch.long)
     mask = torch.zeros(batch_size, seq_len, dtype=torch.float32)
     lengths = torch.zeros(batch_size, dtype=torch.float32)
-    component_target = torch.zeros(batch_size, component_count, component_max_len, dtype=torch.long)
-    component_mask = torch.zeros(batch_size, component_count, component_max_len, dtype=torch.float32)
-    component_lengths = torch.zeros(batch_size, component_count, dtype=torch.float32)
-    component_bits = torch.zeros(batch_size, component_count, dtype=torch.float32)
+    component_counts = torch.zeros(batch_size, dtype=torch.float32)
+    component_target = torch.zeros(batch_size, max_components, component_max_len, dtype=torch.long)
+    component_mask = torch.zeros(batch_size, max_components, component_max_len, dtype=torch.float32)
+    component_lengths = torch.zeros(batch_size, max_components, dtype=torch.float32)
+    component_bits = torch.zeros(batch_size, max_components, dtype=torch.float32)
     sequences: list[str] = []
     components: list[list[str]] = []
 
     for batch_index in range(batch_size):
+        if max_components <= min_components:
+            sampled_component_count = min_components
+        elif max_components == 2 and min_components == 1:
+            sampled_component_count = 2 if rng.random() < two_component_prob else 1
+        else:
+            sampled_component_count = rng.randint(min_components, max_components)
+        component_counts[batch_index] = float(sampled_component_count)
+
         example_kwargs = dict(generation_kwargs)
         if rng.random() < long_example_prob:
             example_kwargs["min_seq_len"] = generation_kwargs["min_seq_len"]
@@ -104,7 +116,7 @@ def make_multitoken_batch(
         for attempt in range(200):
             parts: list[str] = []
             bits: list[float] = []
-            for _ in range(component_count):
+            for _ in range(sampled_component_count):
                 sequence, _kind, sequence_bits, _entropy = base.generate_single_token_curriculum_sequence(
                     rng=rng,
                     **example_kwargs,
@@ -140,6 +152,7 @@ def make_multitoken_batch(
         target.to(device),
         mask.to(device),
         lengths.to(device),
+        component_counts.to(device),
         component_target.to(device),
         component_mask.to(device),
         component_lengths.to(device),
@@ -168,7 +181,8 @@ def primitive_supervision_loss(
     rendered: dict[str, torch.Tensor],
     teacher: dict[str, torch.Tensor],
     component_lengths: torch.Tensor,
-    component_count: int,
+    component_counts: torch.Tensor,
+    max_components: int,
     *,
     latent_weight: float,
     latent_mse_weight: float,
@@ -178,39 +192,55 @@ def primitive_supervision_loss(
     token_count_weight: float,
     boundary_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    model_latents = rendered["latents"][:, :component_count, :]
-    teacher_latents = teacher["latents"][:, :component_count, :]
-    latent_cosine = F.cosine_similarity(model_latents, teacher_latents, dim=-1)
-    latent_loss = (1.0 - latent_cosine).mean()
-    latent_mse_loss = F.mse_loss(model_latents, teacher_latents)
-    latent_norm_loss = F.smooth_l1_loss(model_latents.norm(dim=-1), teacher_latents.norm(dim=-1))
+    component_ids = torch.arange(max_components, device=component_lengths.device, dtype=component_lengths.dtype)
+    component_active = (component_ids[None, :] < component_counts[:, None]).to(dtype=component_lengths.dtype)
+    active_denom = component_active.sum().clamp_min(1.0)
 
-    model_lengths = rendered["lengths"][:, :component_count]
-    primitive_length_loss = F.smooth_l1_loss(model_lengths, component_lengths[:, :component_count])
+    model_latents = rendered["latents"][:, :max_components, :]
+    teacher_latents = teacher["latents"][:, :max_components, :]
+    latent_cosine = F.cosine_similarity(model_latents, teacher_latents, dim=-1)
+    latent_loss = ((1.0 - latent_cosine) * component_active).sum() / active_denom
+    latent_mse_per = (model_latents - teacher_latents).pow(2).mean(dim=-1)
+    latent_mse_loss = (latent_mse_per * component_active).sum() / active_denom
+    latent_norm_per = F.smooth_l1_loss(
+        model_latents.norm(dim=-1),
+        teacher_latents.norm(dim=-1),
+        reduction="none",
+    )
+    latent_norm_loss = (latent_norm_per * component_active).sum() / active_denom
+
+    model_lengths = rendered["lengths"][:, :max_components]
+    primitive_length_per = F.smooth_l1_loss(
+        model_lengths,
+        component_lengths[:, :max_components],
+        reduction="none",
+    )
+    primitive_length_loss = (primitive_length_per * component_active).sum() / active_denom
 
     target_usage = torch.zeros_like(rendered["token_usage"])
-    target_usage[:, :component_count] = 1.0
+    token_ids = torch.arange(rendered["token_usage"].shape[1], device=component_counts.device, dtype=component_counts.dtype)
+    target_usage = (token_ids[None, :] < component_counts[:, None]).to(dtype=rendered["token_usage"].dtype)
     usage_loss = F.mse_loss(rendered["token_usage"], target_usage)
-    token_count_target = torch.full_like(rendered["token_count"], float(component_count))
+    token_count_target = component_counts.to(dtype=rendered["token_count"].dtype)
     token_count_loss = F.smooth_l1_loss(rendered["token_count"], token_count_target)
     token_mass_loss = F.smooth_l1_loss(
         rendered["token_prob"].sum(dim=1),
-        torch.full_like(rendered["token_count"], float(component_count)),
+        token_count_target,
     )
 
     token_cumulative = rendered["token_prob"].cumsum(dim=1)
     boundary_loss = token_cumulative.sum() * 0.0
-    if component_count > 1:
-        boundary_positions = component_lengths[:, : component_count - 1].cumsum(dim=1).round().long() - 1
+    if max_components > 1:
+        boundary_positions = component_lengths[:, : max_components - 1].cumsum(dim=1).round().long() - 1
         boundary_positions = boundary_positions.clamp(0, token_cumulative.shape[1] - 1)
         observed = token_cumulative.gather(1, boundary_positions)
-        expected = torch.arange(
-            1,
-            component_count,
-            device=component_lengths.device,
-            dtype=component_lengths.dtype,
-        )[None, :].expand_as(observed)
-        boundary_loss = F.smooth_l1_loss(observed, expected)
+        expected = torch.arange(1, max_components, device=component_lengths.device, dtype=component_lengths.dtype)[
+            None, :
+        ].expand_as(observed)
+        boundary_active = (expected < component_counts[:, None]).to(dtype=observed.dtype)
+        if boundary_active.sum() > 0:
+            boundary_per = F.smooth_l1_loss(observed, expected, reduction="none")
+            boundary_loss = (boundary_per * boundary_active).sum() / boundary_active.sum().clamp_min(1.0)
 
     loss = (
         latent_weight * latent_loss
@@ -233,8 +263,12 @@ def primitive_supervision_loss(
         "primitive_token_mass_loss": token_mass_loss.detach(),
         "primitive_boundary_loss": boundary_loss.detach(),
         "teacher_latent_cosine": latent_cosine.mean().detach(),
+        "teacher_active_latent_cosine": (latent_cosine * component_active).sum().detach() / active_denom.detach(),
         "teacher_latent_mse": latent_mse_loss.detach(),
-        "teacher_len_error": (model_lengths - component_lengths[:, :component_count]).abs().mean().detach(),
+        "teacher_len_error": (
+            (model_lengths - component_lengths[:, :max_components]).abs() * component_active
+        ).sum().detach()
+        / active_denom.detach(),
     }
 
 
@@ -248,7 +282,8 @@ def loss_for_multitoken_batch(
     component_target: torch.Tensor,
     component_mask: torch.Tensor,
     component_lengths: torch.Tensor,
-    component_count: int,
+    component_counts: torch.Tensor,
+    max_components: int,
     args: argparse.Namespace,
     token_cost_weight: float,
     token_sharp_weight: float,
@@ -276,11 +311,12 @@ def loss_for_multitoken_batch(
     teacher_rendered = teacher_primitives(teacher, component_target, component_mask)
     with torch.no_grad():
         teacher_latents = teacher_rendered["latents"]
-        teacher_usage = torch.ones(
-            teacher_latents.shape[:2],
-            dtype=teacher_latents.dtype,
-            device=teacher_latents.device,
+        component_ids = torch.arange(
+            teacher_latents.shape[1],
+            device=component_counts.device,
+            dtype=component_counts.dtype,
         )
+        teacher_usage = (component_ids[None, :] < component_counts[:, None]).to(dtype=teacher_latents.dtype)
         if teacher_latents.shape[1] < model.max_tokens:
             pad_count = model.max_tokens - teacher_latents.shape[1]
             teacher_latents = torch.cat(
@@ -317,7 +353,8 @@ def loss_for_multitoken_batch(
         rendered,
         teacher_rendered,
         component_lengths,
-        component_count,
+        component_counts,
+        max_components,
         latent_weight=args.primitive_latent_weight,
         latent_mse_weight=args.primitive_latent_mse_weight,
         latent_norm_weight=args.primitive_latent_norm_weight,
@@ -411,7 +448,8 @@ def short_status(
     val_target: torch.Tensor,
     val_mask: torch.Tensor,
     val_lengths: torch.Tensor,
-    component_count: int,
+    component_counts: torch.Tensor,
+    val_component_counts: torch.Tensor,
 ) -> list[str]:
     train_metrics = base.reconstruction_metrics(rendered["soft_dna"], target, mask)
     val_metrics = base.reconstruction_metrics(val_rendered["soft_dna"], val_target, val_mask)
@@ -419,7 +457,7 @@ def short_status(
         (
             f"\nstep {step:06d} | val loss {val_loss:.4f} acc {val_metrics['accuracy']:.3f} "
             f"exact {val_metrics['exact']:.3f} | teacher_cos {val_rendered['teacher_latent_cosine'].item():.3f} "
-            f"token_count {val_rendered['token_count'].mean().item():.2f}/{component_count} "
+            f"token_count {val_rendered['token_count'].mean().item():.2f}/{val_component_counts.mean().item():.2f} "
             f"oracle {val_rendered['teacher_oracle_accuracy'].item():.3f}/{val_rendered['teacher_oracle_exact'].item():.3f}"
         ),
         (
@@ -429,7 +467,8 @@ def short_status(
             f"prim {rendered['primitive_loss'].item():.4f} z {rendered['primitive_latent_loss'].item():.4f} "
             f"zmse {rendered['primitive_latent_mse_loss'].item():.4f} "
             f"bound {rendered['primitive_boundary_loss'].item():.3f} "
-            f"tok {rendered['token_count'].mean().item():.2f} out {rendered['total_len'].mean().item():.1f} "
+            f"tok {rendered['token_count'].mean().item():.2f}/{component_counts.mean().item():.2f} "
+            f"out {rendered['total_len'].mean().item():.1f} "
             f"target {lengths.mean().item():.1f}"
         ),
         (
@@ -456,16 +495,19 @@ def evaluate(
     token_cost_weight: float,
     token_sharp_weight: float,
     decoder_sharp_weight: float,
-) -> tuple[float, dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[float, dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_loss = 0.0
     last_rendered = None
     last_target = None
     last_mask = None
     last_lengths = None
+    last_component_counts = None
     for _ in range(args.val_batches):
         batch = make_multitoken_batch(
             batch_size=args.batch_size,
-            component_count=args.component_count,
+            max_components=args.component_count,
+            min_components=args.min_components,
+            two_component_prob=args.two_component_prob,
             seq_len=args.seq_len,
             typical_component_min_len=args.typical_component_min_len,
             typical_component_max_len=args.typical_component_max_len,
@@ -475,7 +517,7 @@ def evaluate(
             device=device,
             generation_kwargs=generation_kwargs,
         )
-        target, mask, lengths, component_target, component_mask, component_lengths, _bits, _seqs, _parts = batch
+        target, mask, lengths, component_counts, component_target, component_mask, component_lengths, _bits, _seqs, _parts = batch
         loss, rendered = loss_for_multitoken_batch(
             model=model,
             teacher=teacher,
@@ -485,7 +527,8 @@ def evaluate(
             component_target=component_target,
             component_mask=component_mask,
             component_lengths=component_lengths,
-            component_count=args.component_count,
+            component_counts=component_counts,
+            max_components=args.component_count,
             args=args,
             token_cost_weight=token_cost_weight,
             token_sharp_weight=token_sharp_weight,
@@ -496,8 +539,15 @@ def evaluate(
         last_target = target
         last_mask = mask
         last_lengths = lengths
-    assert last_rendered is not None and last_target is not None and last_mask is not None and last_lengths is not None
-    return total_loss / float(args.val_batches), last_rendered, last_target, last_mask, last_lengths
+        last_component_counts = component_counts
+    assert (
+        last_rendered is not None
+        and last_target is not None
+        and last_mask is not None
+        and last_lengths is not None
+        and last_component_counts is not None
+    )
+    return total_loss / float(args.val_batches), last_rendered, last_target, last_mask, last_lengths, last_component_counts
 
 
 def run_diagnostics(
@@ -512,7 +562,9 @@ def run_diagnostics(
     with torch.no_grad():
         batch = make_multitoken_batch(
             batch_size=1,
-            component_count=args.component_count,
+            max_components=args.component_count,
+            min_components=args.min_components,
+            two_component_prob=args.two_component_prob,
             seq_len=args.seq_len,
             typical_component_min_len=args.typical_component_min_len,
             typical_component_max_len=args.typical_component_max_len,
@@ -522,7 +574,7 @@ def run_diagnostics(
             device=device,
             generation_kwargs=generation_kwargs,
         )
-        target, mask, lengths, component_target, component_mask, component_lengths, _bits, _seqs, parts = batch
+        target, mask, lengths, component_counts, component_target, component_mask, component_lengths, _bits, _seqs, parts = batch
         loss, rendered = loss_for_multitoken_batch(
             model=model,
             teacher=teacher,
@@ -532,7 +584,8 @@ def run_diagnostics(
             component_target=component_target,
             component_mask=component_mask,
             component_lengths=component_lengths,
-            component_count=args.component_count,
+            component_counts=component_counts,
+            max_components=args.component_count,
             args=args,
             token_cost_weight=args.token_cost_weight,
             token_sharp_weight=args.token_sharp_weight,
@@ -542,6 +595,7 @@ def run_diagnostics(
         decoded = rendered["soft_dna"].argmax(dim=-1)[0, :seq_len]
         print("\nDiagnostics:")
         print("components:", " + ".join(parts[0]))
+        print("target tokens:", f"{component_counts[0].item():.0f}")
         print("target:    ", base.tensor_to_sequence(target[0, :seq_len]))
         print("decoded:   ", base.tensor_to_sequence(decoded))
         print(
@@ -560,6 +614,8 @@ def run_diagnostics(
 def train(args: argparse.Namespace) -> None:
     if args.max_tokens < args.component_count:
         raise ValueError("--max-tokens must be >= --component-count")
+    if args.min_components <= 0 or args.min_components > args.component_count:
+        raise ValueError("--min-components must be in [1, component-count]")
     if args.max_tokens * args.max_slots_per_token < args.seq_len:
         raise ValueError("--max-tokens * --max-slots-per-token must be >= --seq-len")
     if args.component_max_len > args.max_slots_per_token:
@@ -571,7 +627,9 @@ def train(args: argparse.Namespace) -> None:
     if not 0.0 <= args.long_example_prob <= 1.0:
         raise ValueError("--long-example-prob must be in [0, 1]")
     if args.component_count <= 1:
-        raise ValueError("This stage is for multi-token training; set --component-count >= 2")
+        raise ValueError("This stage is for adaptive token training; set --component-count >= 2")
+    if not 0.0 <= args.two_component_prob <= 1.0:
+        raise ValueError("--two-component-prob must be in [0, 1]")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -599,7 +657,8 @@ def train(args: argparse.Namespace) -> None:
     total = sum(parameter.numel() for parameter in model.parameters())
     print(f"device: {device}")
     print(
-        f"multi-token curriculum; components={args.component_count}; seq_len={args.seq_len}; "
+        f"multi-token curriculum; components={args.min_components}-{args.component_count}; "
+        f"two_component_prob={args.two_component_prob}; seq_len={args.seq_len}; "
         f"max_tokens={args.max_tokens}; slots/token={args.max_slots_per_token}; params={total}; trainable={trainable}"
     )
     print(
@@ -620,7 +679,9 @@ def train(args: argparse.Namespace) -> None:
         decoder_sharp_weight = base.current_weight(step, args.steps, args.decoder_sharp_weight, args.decoder_sharp_warmup_frac)
         batch = make_multitoken_batch(
             batch_size=args.batch_size,
-            component_count=args.component_count,
+            max_components=args.component_count,
+            min_components=args.min_components,
+            two_component_prob=args.two_component_prob,
             seq_len=args.seq_len,
             typical_component_min_len=args.typical_component_min_len,
             typical_component_max_len=args.typical_component_max_len,
@@ -630,7 +691,7 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             generation_kwargs=generation_kwargs,
         )
-        target, mask, lengths, component_target, component_mask, component_lengths, _bits, _seqs, _parts = batch
+        target, mask, lengths, component_counts, component_target, component_mask, component_lengths, _bits, _seqs, _parts = batch
         loss, rendered = loss_for_multitoken_batch(
             model=model,
             teacher=teacher,
@@ -640,7 +701,8 @@ def train(args: argparse.Namespace) -> None:
             component_target=component_target,
             component_mask=component_mask,
             component_lengths=component_lengths,
-            component_count=args.component_count,
+            component_counts=component_counts,
+            max_components=args.component_count,
             args=args,
             token_cost_weight=token_cost_weight,
             token_sharp_weight=token_sharp_weight,
@@ -655,7 +717,7 @@ def train(args: argparse.Namespace) -> None:
         if step % args.print_every == 0 or step == args.steps - 1:
             model.eval()
             with torch.no_grad():
-                val_loss, val_rendered, val_target, val_mask, val_lengths = evaluate(
+                val_loss, val_rendered, val_target, val_mask, val_lengths, val_component_counts = evaluate(
                     model=model,
                     teacher=teacher,
                     rng=val_rng,
@@ -691,7 +753,8 @@ def train(args: argparse.Namespace) -> None:
                 val_target=val_target,
                 val_mask=val_mask,
                 val_lengths=val_lengths,
-                component_count=args.component_count,
+                component_counts=component_counts,
+                val_component_counts=val_component_counts,
             ):
                 print(line)
 
@@ -714,6 +777,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", default="checkpoints/dna_multitoken_from_single_motif4_two_tokens")
     parser.add_argument("--seq-len", type=int, default=96)
     parser.add_argument("--component-count", type=int, default=2)
+    parser.add_argument("--min-components", type=int, default=1)
+    parser.add_argument("--two-component-prob", type=float, default=0.6)
     parser.add_argument("--component-min-len", type=int, default=3)
     parser.add_argument("--component-max-len", type=int, default=48)
     parser.add_argument("--typical-component-min-len", type=int, default=6)
