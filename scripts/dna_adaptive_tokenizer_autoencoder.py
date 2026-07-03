@@ -26,6 +26,22 @@ def random_dna_block(rng: random.Random, length: int) -> str:
     return "".join(rng.choice(DNA_BASES) for _ in range(length))
 
 
+def gc_rich_block(rng: random.Random, length: int) -> str:
+    return "".join(rng.choice("GGGCCAT") for _ in range(length))
+
+
+def at_rich_block(rng: random.Random, length: int) -> str:
+    return "".join(rng.choice("AAATTGC") for _ in range(length))
+
+
+def pyrimidine_rich_block(rng: random.Random, length: int) -> str:
+    return "".join(rng.choice("CTTCC") for _ in range(length))
+
+
+def purine_rich_block(rng: random.Random, length: int) -> str:
+    return "".join(rng.choice("AAGGA") for _ in range(length))
+
+
 def homopolymer_block(rng: random.Random, length: int) -> str:
     return rng.choice(DNA_BASES) * length
 
@@ -43,10 +59,43 @@ def motif_repeat_block(rng: random.Random, length: int) -> str:
 
 BLOCK_BUILDERS = {
     "random": random_dna_block,
+    "gc": gc_rich_block,
+    "at": at_rich_block,
+    "pyrimidine": pyrimidine_rich_block,
+    "purine": purine_rich_block,
     "homopolymer": homopolymer_block,
     "dinucleotide": dinucleotide_repeat_block,
     "motif": motif_repeat_block,
 }
+
+
+TRAIN_FAMILIES = (
+    "random",
+    "gc",
+    "at",
+    "pyrimidine",
+    "purine",
+    "homopolymer",
+    "dinucleotide",
+    "motif",
+    "hybrid",
+)
+
+
+def block_length_for_family(family: str, rng: random.Random, remaining: int) -> int:
+    if family == "random":
+        length = rng.randint(3, 12)
+    elif family in {"gc", "at", "pyrimidine", "purine"}:
+        length = rng.randint(6, 28)
+    elif family == "homopolymer":
+        length = rng.randint(8, 72)
+    elif family == "dinucleotide":
+        length = rng.randint(6, 72)
+    elif family == "motif":
+        length = rng.randint(8, 72)
+    else:
+        length = rng.randint(3, 72)
+    return min(remaining, length)
 
 
 def generate_controlled_sequence(
@@ -66,28 +115,16 @@ def generate_controlled_sequence(
     return "".join(parts)
 
 
-def generate_low_entropy_sequence(seq_len: int, rng: random.Random) -> tuple[str, str]:
-    block_type = rng.choice(["homopolymer", "dinucleotide", "motif"])
-    builder = BLOCK_BUILDERS[block_type]
+def generate_family_sequence(seq_len: int, family: str, rng: random.Random) -> tuple[str, str]:
     parts = []
     total = 0
     while total < seq_len:
         remaining = seq_len - total
-        length = min(remaining, rng.randint(18, 72))
-        parts.append(builder(rng, length))
+        block_type = rng.choice(tuple(BLOCK_BUILDERS)) if family == "hybrid" else family
+        length = block_length_for_family(block_type, rng, remaining)
+        parts.append(BLOCK_BUILDERS[block_type](rng, length))
         total += length
-    return "".join(parts), block_type
-
-
-def generate_high_entropy_sequence(seq_len: int, rng: random.Random) -> tuple[str, str]:
-    parts = []
-    total = 0
-    while total < seq_len:
-        remaining = seq_len - total
-        length = min(remaining, rng.randint(3, 8))
-        parts.append(random_dna_block(rng, length))
-        total += length
-    return "".join(parts), "random"
+    return "".join(parts), family
 
 
 def generate_variable_sequence(
@@ -100,9 +137,14 @@ def generate_variable_sequence(
 ) -> tuple[str, str]:
     short_max_len = max(min_seq_len, int(round(max_seq_len * short_max_len_frac)))
     long_min_len = min(max_seq_len, max(min_seq_len, int(round(max_seq_len * long_min_len_frac))))
-    if rng.random() < 0.5:
-        return generate_high_entropy_sequence(rng.randint(min_seq_len, short_max_len), rng)
-    return generate_low_entropy_sequence(rng.randint(long_min_len, max_seq_len), rng)
+    length_mode = rng.random()
+    if length_mode < 0.4:
+        seq_len = rng.randint(min_seq_len, short_max_len)
+    elif length_mode < 0.8:
+        seq_len = rng.randint(long_min_len, max_seq_len)
+    else:
+        seq_len = rng.randint(min_seq_len, max_seq_len)
+    return generate_family_sequence(seq_len, rng.choice(TRAIN_FAMILIES), rng)
 
 
 def make_batch(
@@ -614,6 +656,10 @@ def controlled_probe(
                 ]
                 short_name = {
                     "random": "rand",
+                    "gc": "gc",
+                    "at": "at",
+                    "pyrimidine": "pyr",
+                    "purine": "pur",
                     "homopolymer": "hpoly",
                     "dinucleotide": "di",
                     "motif": "motif",
@@ -859,7 +905,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-examples", type=int, default=4)
     parser.add_argument("--probe-seq-lengths", default="20,40,75,100")
     parser.add_argument("--probe-block-lengths", default="4,16,48")
-    parser.add_argument("--probe-block-types", default="random,homopolymer,dinucleotide,motif")
+    parser.add_argument("--probe-block-types", default="random,gc,at,homopolymer,dinucleotide,motif")
     parser.add_argument("--verbose-probe", action="store_true")
     parser.add_argument("--verbose-metrics", action="store_true")
     parser.add_argument("--checkpoint-dir", default="checkpoints/dna_adaptive_tokenizer_autoencoder")
