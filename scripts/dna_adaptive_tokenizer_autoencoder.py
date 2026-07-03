@@ -501,6 +501,12 @@ def mean_for_indices(values: torch.Tensor, indices: list[int], device: torch.dev
     return float(values[index_tensor].mean().item())
 
 
+def fmt_mean(values: torch.Tensor, indices: list[int], device: torch.device, precision: int = 2) -> str:
+    if not indices:
+        return "na"
+    return f"{mean_for_indices(values, indices, device):.{precision}f}"
+
+
 def evaluate(
     *,
     model: AdaptiveTokenizerAutoencoder,
@@ -593,33 +599,32 @@ def controlled_probe(
         label_to_indices.setdefault(label, []).append(index)
 
     if not args.verbose_probe:
-        lines = ["probe summary: len | random tok/acc/ex/out | compress tok/acc/ex/out"]
-        compressible_types = [block_type for block_type in block_types if block_type != "random"]
+        lines = [
+            "probe summary (L=target length; tok=latent tokens; base=base accuracy; exact=whole-seq exact; out=rendered length):"
+        ]
         for seq_len in seq_lengths:
             clipped_seq_len = min(args.seq_len, seq_len)
-            random_indices = [
-                index
-                for key, indices in label_to_indices.items()
-                if key[0] == "random" and key[1] == clipped_seq_len
-                for index in indices
-            ]
-            compress_indices = [
-                index
-                for key, indices in label_to_indices.items()
-                if key[0] in compressible_types and key[1] == clipped_seq_len
-                for index in indices
-            ]
-            lines.append(
-                f"probe L{clipped_seq_len:03d} | "
-                f"random tok {mean_for_indices(token_count, random_indices, device):.2f} "
-                f"acc {mean_for_indices(per_acc, random_indices, device):.3f} "
-                f"ex {mean_for_indices(per_exact, random_indices, device):.3f} "
-                f"out {mean_for_indices(rendered['total_len'], random_indices, device):.1f} | "
-                f"compress tok {mean_for_indices(token_count, compress_indices, device):.2f} "
-                f"acc {mean_for_indices(per_acc, compress_indices, device):.3f} "
-                f"ex {mean_for_indices(per_exact, compress_indices, device):.3f} "
-                f"out {mean_for_indices(rendered['total_len'], compress_indices, device):.1f}"
-            )
+            parts = []
+            for block_type in block_types:
+                indices = [
+                    index
+                    for key, key_indices in label_to_indices.items()
+                    if key[0] == block_type and key[1] == clipped_seq_len
+                    for index in key_indices
+                ]
+                short_name = {
+                    "random": "rand",
+                    "homopolymer": "hpoly",
+                    "dinucleotide": "di",
+                    "motif": "motif",
+                }.get(block_type, block_type)
+                parts.append(
+                    f"{short_name} tok {fmt_mean(token_count, indices, device)} "
+                    f"base {fmt_mean(per_acc, indices, device, 3)} "
+                    f"exact {fmt_mean(per_exact, indices, device, 3)} "
+                    f"out {fmt_mean(rendered['total_len'], indices, device, 1)}"
+                )
+            lines.append(f"probe L{clipped_seq_len:03d} | " + " | ".join(parts))
         return lines
 
     lines = ["probe detail:"]
@@ -853,7 +858,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-every", type=int, default=500)
     parser.add_argument("--probe-examples", type=int, default=4)
     parser.add_argument("--probe-seq-lengths", default="20,40,75,100")
-    parser.add_argument("--probe-block-lengths", default="4,8,16,32,48")
+    parser.add_argument("--probe-block-lengths", default="4,16,48")
     parser.add_argument("--probe-block-types", default="random,homopolymer,dinucleotide,motif")
     parser.add_argument("--verbose-probe", action="store_true")
     parser.add_argument("--verbose-metrics", action="store_true")
