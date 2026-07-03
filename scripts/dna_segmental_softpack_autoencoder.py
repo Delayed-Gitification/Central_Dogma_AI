@@ -329,6 +329,19 @@ def reconstruction_metrics(soft_dna: torch.Tensor, target: torch.Tensor) -> dict
     }
 
 
+def sorted_block_length_loss_fn(
+    predicted_lengths: torch.Tensor,
+    block_lengths: torch.Tensor,
+    block_length_mask: torch.Tensor,
+) -> torch.Tensor:
+    block_lengths = block_lengths.to(dtype=predicted_lengths.dtype)
+    block_length_mask = block_length_mask.to(dtype=predicted_lengths.dtype)
+    target_lengths = torch.where(block_length_mask > 0, block_lengths, torch.zeros_like(block_lengths))
+    predicted_sorted = torch.sort(predicted_lengths, dim=1, descending=True).values
+    target_sorted = torch.sort(target_lengths, dim=1, descending=True).values
+    return F.smooth_l1_loss(predicted_sorted, target_sorted)
+
+
 def loss_for_batch(
     *,
     model: SegmentalSoftpackAutoencoder,
@@ -338,6 +351,9 @@ def loss_for_batch(
     block_length_mask: torch.Tensor | None,
     length_weight: float,
     block_length_weight: float,
+    sorted_block_length_weight: float,
+    length_std_target: float,
+    length_std_weight: float,
     latent_l2_weight: float,
     sharp_weight: float,
     active_segment_weight: float,
@@ -358,6 +374,20 @@ def loss_for_batch(
         block_length_loss = (block_length_error * block_length_mask).sum() / block_length_mask.sum().clamp_min(1.0)
     else:
         block_length_loss = rendered["lengths"].new_zeros(())
+    if sorted_block_length_weight > 0 and block_lengths is not None and block_length_mask is not None:
+        sorted_block_length_loss = sorted_block_length_loss_fn(
+            rendered["lengths"],
+            block_lengths,
+            block_length_mask,
+        )
+    else:
+        sorted_block_length_loss = rendered["lengths"].new_zeros(())
+    if length_std_weight > 0 and length_std_target > 0:
+        length_std = rendered["lengths"].std(dim=1, unbiased=False)
+        length_std_target_tensor = rendered["lengths"].new_full(length_std.shape, length_std_target)
+        length_std_loss = (length_std_target_tensor - length_std).clamp_min(0.0).pow(2).mean()
+    else:
+        length_std_loss = rendered["lengths"].new_zeros(())
     latent_l2 = z.pow(2).mean()
     sharp_loss = (rendered["keep"] * (1.0 - rendered["keep"])).mean()
     length_active = torch.sigmoid((rendered["lengths"] - active_segment_threshold) / active_segment_temperature)
@@ -365,7 +395,7 @@ def loss_for_batch(
     active_count = active_segments.sum(dim=1)
     active_segment_loss = active_count.mean()
     if active_budget > 0 and active_budget_weight > 0:
-        active_budget_loss = (active_count - active_budget).clamp_min(0.0).pow(2).mean()
+        active_budget_loss = (active_count - active_budget).pow(2).mean()
     else:
         active_budget_loss = rendered["lengths"].new_zeros(())
     usage_sharp_loss = (rendered["segment_usage"] * (1.0 - rendered["segment_usage"])).sum(dim=1).mean()
@@ -373,6 +403,8 @@ def loss_for_batch(
         recon_loss
         + length_weight * length_loss
         + block_length_weight * block_length_loss
+        + sorted_block_length_weight * sorted_block_length_loss
+        + length_std_weight * length_std_loss
         + latent_l2_weight * latent_l2
         + sharp_weight * sharp_loss
         + active_segment_weight * active_segment_loss
@@ -385,6 +417,8 @@ def loss_for_batch(
         "recon_loss": recon_loss.detach(),
         "length_loss": length_loss.detach(),
         "block_length_loss": block_length_loss.detach(),
+        "sorted_block_length_loss": sorted_block_length_loss.detach(),
+        "length_std_loss": length_std_loss.detach(),
         "latent_l2": latent_l2.detach(),
         "sharp_loss": sharp_loss.detach(),
         "active_segment_loss": active_segment_loss.detach(),
@@ -449,6 +483,8 @@ def pick_device(args: argparse.Namespace) -> torch.device:
 def current_sharp_weight(step: int, steps: int, sharp_weight: float, warmup_frac: float) -> float:
     if sharp_weight <= 0:
         return 0.0
+    if warmup_frac <= 0:
+        return sharp_weight
     warmup_steps = int(steps * warmup_frac)
     if step < warmup_steps:
         return 0.0
@@ -569,6 +605,8 @@ def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Te
         f"acc {metrics['accuracy']:.3f} exact {metrics['exact']:.3f} "
         f"len {rendered['length_loss'].item():.3f} "
         f"block_len {rendered['block_length_loss'].item():.3f} "
+        f"sorted_block {rendered['sorted_block_length_loss'].item():.3f} "
+        f"len_std {rendered['length_std_loss'].item():.3f} "
         f"active_loss {rendered['active_segment_loss'].item():.3f} "
         f"budget {rendered['active_budget_loss'].item():.3f} "
         f"usage_sharp {rendered['usage_sharp_loss'].item():.3f} "
@@ -589,6 +627,9 @@ def evaluate_fresh_batches(
     num_segments: int,
     length_weight: float,
     block_length_weight: float,
+    sorted_block_length_weight: float,
+    length_std_target: float,
+    length_std_weight: float,
     latent_l2_weight: float,
     sharp_weight: float,
     active_segment_weight: float,
@@ -620,6 +661,9 @@ def evaluate_fresh_batches(
             block_length_mask=block_mask,
             length_weight=length_weight,
             block_length_weight=block_length_weight,
+            sorted_block_length_weight=sorted_block_length_weight,
+            length_std_target=length_std_target,
+            length_std_weight=length_std_weight,
             latent_l2_weight=latent_l2_weight,
             sharp_weight=sharp_weight,
             active_segment_weight=active_segment_weight,
@@ -900,6 +944,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--active-budget and --active-budget-weight must be non-negative.")
     if args.block_length_weight < 0:
         raise ValueError("--block-length-weight must be non-negative.")
+    if args.sorted_block_length_weight < 0:
+        raise ValueError("--sorted-block-length-weight must be non-negative.")
+    if args.length_std_target < 0 or args.length_std_weight < 0:
+        raise ValueError("--length-std-target and --length-std-weight must be non-negative.")
     if args.initial_length_jitter < 0 or args.initial_usage_jitter < 0:
         raise ValueError("--initial-length-jitter and --initial-usage-jitter must be non-negative.")
     if args.diagnostics_only and checkpoint is None:
@@ -946,7 +994,10 @@ def train(args: argparse.Namespace) -> None:
         f"active_segment_weight={args.active_segment_weight}; "
         f"active_budget={args.active_budget}; "
         f"active_budget_weight={args.active_budget_weight}; "
-        f"block_length_weight={args.block_length_weight}"
+        f"block_length_weight={args.block_length_weight}; "
+        f"sorted_block_length_weight={args.sorted_block_length_weight}; "
+        f"length_std_target={args.length_std_target}; "
+        f"length_std_weight={args.length_std_weight}"
     )
 
     for step in range(args.steps):
@@ -978,6 +1029,9 @@ def train(args: argparse.Namespace) -> None:
             block_length_mask=block_mask,
             length_weight=args.length_weight,
             block_length_weight=args.block_length_weight,
+            sorted_block_length_weight=args.sorted_block_length_weight,
+            length_std_target=args.length_std_target,
+            length_std_weight=args.length_std_weight,
             latent_l2_weight=args.latent_l2_weight,
             sharp_weight=sharp_weight,
             active_segment_weight=args.active_segment_weight,
@@ -1006,6 +1060,9 @@ def train(args: argparse.Namespace) -> None:
                     num_segments=args.num_segments,
                     length_weight=args.length_weight,
                     block_length_weight=args.block_length_weight,
+                    sorted_block_length_weight=args.sorted_block_length_weight,
+                    length_std_target=args.length_std_target,
+                    length_std_weight=args.length_std_weight,
                     latent_l2_weight=args.latent_l2_weight,
                     sharp_weight=sharp_weight,
                     active_segment_weight=args.active_segment_weight,
@@ -1077,6 +1134,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--length-weight", type=float, default=0.05)
     parser.add_argument("--block-length-weight", type=float, default=0.0)
+    parser.add_argument("--sorted-block-length-weight", type=float, default=0.0)
+    parser.add_argument("--length-std-target", type=float, default=0.0)
+    parser.add_argument("--length-std-weight", type=float, default=0.0)
     parser.add_argument("--latent-l2-weight", type=float, default=1e-4)
     parser.add_argument("--gate-temperature", type=float, default=0.2)
     parser.add_argument("--pack-temperature", type=float, default=0.1)
