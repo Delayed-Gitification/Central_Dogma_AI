@@ -74,7 +74,7 @@ def make_batch(batch_size: int, seq_len: int, rng: random.Random, device: torch.
     return batch.to(device)
 
 
-class ConvSegmentEncoder(nn.Module):
+class QuerySegmentEncoder(nn.Module):
     def __init__(
         self,
         *,
@@ -82,10 +82,16 @@ class ConvSegmentEncoder(nn.Module):
         latent_dim: int,
         hidden_dim: int,
         layers: int,
+        query_position_bias: float,
+        query_position_width: float,
     ):
         super().__init__()
         if layers < 1:
             raise ValueError("--encoder-layers must be at least 1.")
+        if query_position_width <= 0:
+            raise ValueError("--query-position-width must be positive.")
+        self.query_position_bias = query_position_bias
+        self.query_position_width = query_position_width
         blocks = []
         in_channels = 5
         for _ in range(layers):
@@ -99,9 +105,11 @@ class ConvSegmentEncoder(nn.Module):
             )
             in_channels = hidden_dim
         self.net = nn.Sequential(*blocks)
-        self.pool = nn.AdaptiveAvgPool1d(num_segments)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.segment_queries = nn.Parameter(torch.empty(num_segments, hidden_dim))
         self.to_latent = nn.Linear(hidden_dim, latent_dim)
         self.segment_embedding = nn.Parameter(torch.zeros(num_segments, latent_dim))
+        nn.init.normal_(self.segment_queries, mean=0.0, std=hidden_dim**-0.5)
         nn.init.normal_(self.segment_embedding, mean=0.0, std=0.02)
 
     def forward(self, target: torch.Tensor) -> torch.Tensor:
@@ -109,9 +117,19 @@ class ConvSegmentEncoder(nn.Module):
         positions = torch.linspace(-1.0, 1.0, target.shape[1], device=target.device, dtype=one_hot.dtype)
         positions = positions[None, :, None].expand(target.shape[0], -1, -1)
         encoder_input = torch.cat([one_hot, positions], dim=-1)
-        hidden = self.net(encoder_input.transpose(1, 2))
-        pooled = self.pool(hidden).transpose(1, 2)
-        return self.to_latent(pooled) + self.segment_embedding[None, :, :]
+        features = self.net(encoder_input.transpose(1, 2)).transpose(1, 2)
+        features = self.norm(features)
+
+        logits = torch.einsum("bld,md->bml", features, self.segment_queries) / math.sqrt(float(features.shape[-1]))
+        if self.query_position_bias > 0:
+            centres = torch.linspace(-1.0, 1.0, self.segment_queries.shape[0], device=target.device, dtype=features.dtype)
+            position_values = positions[:, :, 0]
+            distance = position_values[:, None, :] - centres[None, :, None]
+            logits = logits - self.query_position_bias * distance.pow(2) / (2.0 * self.query_position_width**2)
+
+        attention = logits.softmax(dim=-1)
+        context = torch.einsum("bml,bld->bmd", attention, features)
+        return self.to_latent(context) + self.segment_embedding[None, :, :]
 
 
 class SegmentalSoftpackAutoencoder(nn.Module):
@@ -126,21 +144,30 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         pack_temperature: float,
         encoder_hidden_dim: int = 96,
         encoder_layers: int = 2,
+        query_position_bias: float = 1.5,
+        query_position_width: float = 0.35,
         decoder_hidden_dim: int = 64,
         slot_dim: int = 16,
+        initial_active_fraction: float = 1.0,
+        initial_length_jitter: float = 0.05,
+        initial_usage_jitter: float = 0.25,
     ):
         super().__init__()
+        if not 0.0 < initial_active_fraction <= 1.0:
+            raise ValueError("--initial-active-fraction must be in (0, 1].")
         self.num_segments = num_segments
         self.latent_dim = latent_dim
         self.max_slots_per_segment = max_slots_per_segment
         self.gate_temperature = gate_temperature
         self.pack_temperature = pack_temperature
 
-        self.encoder = ConvSegmentEncoder(
+        self.encoder = QuerySegmentEncoder(
             num_segments=num_segments,
             latent_dim=latent_dim,
             hidden_dim=encoder_hidden_dim,
             layers=encoder_layers,
+            query_position_bias=query_position_bias,
+            query_position_width=query_position_width,
         )
         self.slot_embedding = nn.Embedding(max_slots_per_segment, slot_dim)
         self.decoder = nn.Sequential(
@@ -151,9 +178,25 @@ class SegmentalSoftpackAutoencoder(nn.Module):
             nn.Linear(decoder_hidden_dim, 4),
         )
         self.length_head = nn.Linear(latent_dim, 1)
-        initial_length = seq_len / float(num_segments)
+        self.usage_head = nn.Linear(latent_dim, 1)
+        initial_raw_length = seq_len / float(num_segments * initial_active_fraction)
+        initial_raw_length = min(max(initial_raw_length, 1e-3), max_slots_per_segment - 1e-3)
+        self.segment_length_logit_bias = nn.Parameter(torch.empty(num_segments))
+        self.segment_usage_logit_bias = nn.Parameter(torch.empty(num_segments))
         nn.init.zeros_(self.length_head.weight)
-        nn.init.constant_(self.length_head.bias, logit(initial_length / float(max_slots_per_segment)))
+        nn.init.zeros_(self.length_head.bias)
+        nn.init.normal_(self.usage_head.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.usage_head.bias)
+        nn.init.normal_(
+            self.segment_length_logit_bias,
+            mean=logit(initial_raw_length / float(max_slots_per_segment)),
+            std=initial_length_jitter,
+        )
+        nn.init.normal_(
+            self.segment_usage_logit_bias,
+            mean=logit(initial_active_fraction),
+            std=initial_usage_jitter,
+        )
 
     def encode(self, target: torch.Tensor) -> torch.Tensor:
         return self.encoder(target)
@@ -162,7 +205,7 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         self,
         z: torch.Tensor,
         length_delta: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_segments, _ = z.shape
         slots = torch.arange(self.max_slots_per_segment, device=z.device)
         slot_embed = self.slot_embedding(slots)
@@ -175,12 +218,16 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         base_logits = self.decoder(decoder_input)
         base_probs = base_logits.softmax(dim=-1)
 
-        lengths = self.max_slots_per_segment * torch.sigmoid(self.length_head(z).squeeze(-1))
+        raw_length_logits = self.length_head(z).squeeze(-1) + self.segment_length_logit_bias[None, :]
+        usage_logits = self.usage_head(z).squeeze(-1) + self.segment_usage_logit_bias[None, :]
+        raw_lengths = self.max_slots_per_segment * torch.sigmoid(raw_length_logits)
+        segment_usage = torch.sigmoid(usage_logits)
+        lengths = raw_lengths * segment_usage
         if length_delta is not None:
             lengths = (lengths + length_delta).clamp(0.0, float(self.max_slots_per_segment))
         slot_centres = slots.to(dtype=z.dtype) + 0.5
         keep = torch.sigmoid((lengths[..., None] - slot_centres[None, None, :]) / self.gate_temperature)
-        return base_logits, base_probs, lengths, keep
+        return base_logits, base_probs, lengths, keep, segment_usage
 
     def render_from_latents(
         self,
@@ -188,7 +235,10 @@ class SegmentalSoftpackAutoencoder(nn.Module):
         out_len: int,
         length_delta: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        base_logits, base_probs_segmented, lengths, keep_segmented = self.segment_outputs(z, length_delta=length_delta)
+        base_logits, base_probs_segmented, lengths, keep_segmented, segment_usage = self.segment_outputs(
+            z,
+            length_delta=length_delta,
+        )
         batch_size = z.shape[0]
         num_slots = self.num_segments * self.max_slots_per_segment
         base_probs = base_probs_segmented.reshape(batch_size, num_slots, 4)
@@ -213,6 +263,7 @@ class SegmentalSoftpackAutoencoder(nn.Module):
             "base_probs_segmented": base_probs_segmented,
             "base_probs": base_probs,
             "lengths": lengths,
+            "segment_usage": segment_usage,
             "keep_segmented": keep_segmented,
             "keep": keep,
             "total_len": keep.sum(dim=1),
@@ -249,6 +300,7 @@ def loss_for_batch(
     active_segment_weight: float,
     active_segment_threshold: float,
     active_segment_temperature: float,
+    usage_sharp_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     z, rendered = model(target, seq_len)
     soft_dna = rendered["soft_dna"].clamp_min(1e-8)
@@ -256,14 +308,17 @@ def loss_for_batch(
     length_loss = F.smooth_l1_loss(rendered["total_len"], torch.full_like(rendered["total_len"], float(seq_len)))
     latent_l2 = z.pow(2).mean()
     sharp_loss = (rendered["keep"] * (1.0 - rendered["keep"])).mean()
-    active_segments = torch.sigmoid((rendered["lengths"] - active_segment_threshold) / active_segment_temperature)
+    length_active = torch.sigmoid((rendered["lengths"] - active_segment_threshold) / active_segment_temperature)
+    active_segments = rendered["segment_usage"] * length_active
     active_segment_loss = active_segments.sum(dim=1).mean()
+    usage_sharp_loss = (rendered["segment_usage"] * (1.0 - rendered["segment_usage"])).sum(dim=1).mean()
     loss = (
         recon_loss
         + length_weight * length_loss
         + latent_l2_weight * latent_l2
         + sharp_weight * sharp_loss
         + active_segment_weight * active_segment_loss
+        + usage_sharp_weight * usage_sharp_loss
     )
     return loss, {
         **rendered,
@@ -274,6 +329,8 @@ def loss_for_batch(
         "sharp_loss": sharp_loss.detach(),
         "active_segment_loss": active_segment_loss.detach(),
         "active_segments": active_segments.detach(),
+        "length_active": length_active.detach(),
+        "usage_sharp_loss": usage_sharp_loss.detach(),
     }
 
 
@@ -350,6 +407,14 @@ def summarise_active_segments(active_segments: torch.Tensor) -> str:
     )
 
 
+def summarise_segment_usage(segment_usage: torch.Tensor) -> str:
+    usage = segment_usage.detach()
+    return (
+        f"usage {usage.mean().item():.2f}/{usage.std(unbiased=False).item():.2f} "
+        f"range {usage.min().item():.2f}-{usage.max().item():.2f}"
+    )
+
+
 def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Tensor], target: torch.Tensor) -> str:
     metrics = reconstruction_metrics(rendered["soft_dna"], target)
     return (
@@ -357,6 +422,7 @@ def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Te
         f"acc {metrics['accuracy']:.3f} exact {metrics['exact']:.3f} "
         f"len {rendered['length_loss'].item():.3f} "
         f"active_loss {rendered['active_segment_loss'].item():.3f} "
+        f"usage_sharp {rendered['usage_sharp_loss'].item():.3f} "
         f"base_ent {rendered['base_entropy'].item():.3f} "
         f"pack_ent {rendered['pack_entropy'].item():.3f} "
         f"pack_conf {rendered['pack_confidence'].item():.3f}"
@@ -377,6 +443,7 @@ def evaluate_fresh_batches(
     active_segment_weight: float,
     active_segment_threshold: float,
     active_segment_temperature: float,
+    usage_sharp_weight: float,
 ) -> tuple[float, dict[str, float], dict[str, torch.Tensor], torch.Tensor]:
     total_loss = 0.0
     total_accuracy = 0.0
@@ -395,6 +462,7 @@ def evaluate_fresh_batches(
             active_segment_weight=active_segment_weight,
             active_segment_threshold=active_segment_threshold,
             active_segment_temperature=active_segment_temperature,
+            usage_sharp_weight=usage_sharp_weight,
         )
         metrics = reconstruction_metrics(rendered["soft_dna"], batch)
         total_loss += loss.item()
@@ -439,6 +507,7 @@ def run_diagnostics(
         length_modified = hard_decode(model, z, out_len=seq_len + 10, length_delta=length_delta)
         rendered = model.render_from_latents(z, seq_len)
         lengths = rendered["lengths"][0].detach().cpu()
+        segment_usage = rendered["segment_usage"][0].detach().cpu()
 
     print("\nDiagnostics:")
     print("target:       ", target)
@@ -446,6 +515,7 @@ def run_diagnostics(
     print("perturbed:    ", perturbed)
     print("length +10:   ", length_modified)
     print("segment lengths:", ", ".join(f"{value:.1f}" for value in lengths.tolist()))
+    print("segment usage:  ", ", ".join(f"{value:.2f}" for value in segment_usage.tolist()))
     print("perturb edit distance:", edit_distance(original, perturbed))
     print("perturb changed positions:", changed[:30], "..." if len(changed) > 30 else "")
     model.train()
@@ -460,6 +530,8 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("--batch-size and --val-batches must be positive.")
     if args.active_segment_temperature <= 0:
         raise ValueError("--active-segment-temperature must be positive.")
+    if args.initial_length_jitter < 0 or args.initial_usage_jitter < 0:
+        raise ValueError("--initial-length-jitter and --initial-usage-jitter must be non-negative.")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -480,7 +552,12 @@ def train(args: argparse.Namespace) -> None:
         pack_temperature=args.pack_temperature,
         encoder_hidden_dim=args.encoder_hidden_dim,
         encoder_layers=args.encoder_layers,
+        query_position_bias=args.query_position_bias,
+        query_position_width=args.query_position_width,
         decoder_hidden_dim=args.decoder_hidden_dim,
+        initial_active_fraction=args.initial_active_fraction,
+        initial_length_jitter=args.initial_length_jitter,
+        initial_usage_jitter=args.initial_usage_jitter,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     best_val_loss = float("inf")
@@ -492,10 +569,21 @@ def train(args: argparse.Namespace) -> None:
         f"segments={args.num_segments}; latent_dim={args.latent_dim}; "
         f"max_slots_per_segment={args.max_slots_per_segment}; params={param_count}"
     )
+    print(
+        f"query_position_bias={args.query_position_bias}; "
+        f"initial_active_fraction={args.initial_active_fraction}; "
+        f"active_segment_weight={args.active_segment_weight}"
+    )
 
     for step in range(args.steps):
         batch = make_batch(args.batch_size, args.seq_len, train_rng, device)
         sharp_weight = current_sharp_weight(step, args.steps, args.sharp_weight, args.sharp_warmup_frac)
+        usage_sharp_weight = current_sharp_weight(
+            step,
+            args.steps,
+            args.usage_sharp_weight,
+            args.usage_sharp_warmup_frac,
+        )
         loss, rendered = loss_for_batch(
             model=model,
             target=batch,
@@ -506,6 +594,7 @@ def train(args: argparse.Namespace) -> None:
             active_segment_weight=args.active_segment_weight,
             active_segment_threshold=args.active_segment_threshold,
             active_segment_temperature=args.active_segment_temperature,
+            usage_sharp_weight=usage_sharp_weight,
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -529,6 +618,7 @@ def train(args: argparse.Namespace) -> None:
                     active_segment_weight=args.active_segment_weight,
                     active_segment_threshold=args.active_segment_threshold,
                     active_segment_temperature=args.active_segment_temperature,
+                    usage_sharp_weight=usage_sharp_weight,
                 )
             model.train()
 
@@ -545,13 +635,14 @@ def train(args: argparse.Namespace) -> None:
                 )
 
             print(
-                f"\nstep {step:06d} sharp_w {sharp_weight:.2e} "
+                f"\nstep {step:06d} sharp_w {sharp_weight:.2e} usage_sharp_w {usage_sharp_weight:.2e} "
                 f"val_loss {val_loss:.4f} val_acc {val_metrics['accuracy']:.3f} val_exact {val_metrics['exact']:.3f}"
             )
             print(format_metrics("train", loss, rendered, batch))
             print(format_metrics("val", torch.tensor(val_loss), val_rendered, val_batch))
             print(summarise_lengths(val_rendered["lengths"], val_rendered["total_len"]))
             print(summarise_active_segments(val_rendered["active_segments"]))
+            print(summarise_segment_usage(val_rendered["segment_usage"]))
 
     torch.save(
         {
@@ -584,8 +675,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--active-segment-weight", type=float, default=0.0)
     parser.add_argument("--active-segment-threshold", type=float, default=1.0)
     parser.add_argument("--active-segment-temperature", type=float, default=0.5)
+    parser.add_argument("--usage-sharp-weight", type=float, default=0.0)
+    parser.add_argument("--usage-sharp-warmup-frac", type=float, default=0.2)
     parser.add_argument("--encoder-hidden-dim", type=int, default=96)
     parser.add_argument("--encoder-layers", type=int, default=2)
+    parser.add_argument("--query-position-bias", type=float, default=1.5)
+    parser.add_argument("--query-position-width", type=float, default=0.35)
+    parser.add_argument("--initial-active-fraction", type=float, default=1.0)
+    parser.add_argument("--initial-length-jitter", type=float, default=0.05)
+    parser.add_argument("--initial-usage-jitter", type=float, default=0.25)
     parser.add_argument("--decoder-hidden-dim", type=int, default=64)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--val-batches", type=int, default=4)
