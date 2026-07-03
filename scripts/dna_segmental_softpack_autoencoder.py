@@ -87,7 +87,7 @@ class ConvSegmentEncoder(nn.Module):
         if layers < 1:
             raise ValueError("--encoder-layers must be at least 1.")
         blocks = []
-        in_channels = 4
+        in_channels = 5
         for _ in range(layers):
             blocks.extend(
                 [
@@ -106,7 +106,10 @@ class ConvSegmentEncoder(nn.Module):
 
     def forward(self, target: torch.Tensor) -> torch.Tensor:
         one_hot = F.one_hot(target, num_classes=4).to(dtype=torch.float32)
-        hidden = self.net(one_hot.transpose(1, 2))
+        positions = torch.linspace(-1.0, 1.0, target.shape[1], device=target.device, dtype=one_hot.dtype)
+        positions = positions[None, :, None].expand(target.shape[0], -1, -1)
+        encoder_input = torch.cat([one_hot, positions], dim=-1)
+        hidden = self.net(encoder_input.transpose(1, 2))
         pooled = self.pool(hidden).transpose(1, 2)
         return self.to_latent(pooled) + self.segment_embedding[None, :, :]
 
