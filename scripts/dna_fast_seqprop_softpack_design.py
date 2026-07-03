@@ -62,6 +62,29 @@ def straight_through_bernoulli(probs: torch.Tensor, *, threshold: float) -> torc
     return hard + probs - probs.detach()
 
 
+def hard_concrete_gate(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    gamma: float,
+    zeta: float,
+    sample: bool,
+    hard: bool,
+    threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if sample:
+        uniform = torch.rand_like(logits).clamp(1e-6, 1.0 - 1e-6)
+        logistic_noise = uniform.log() - (1.0 - uniform).log()
+        stretched = torch.sigmoid((logits + logistic_noise) / max(temperature, 1e-6))
+    else:
+        stretched = torch.sigmoid(logits / max(temperature, 1e-6))
+    relaxed = (stretched * (zeta - gamma) + gamma).clamp(0.0, 1.0)
+    if hard:
+        relaxed = straight_through_bernoulli(relaxed, threshold=threshold)
+    l0_prob = torch.sigmoid(logits - temperature * math.log(-gamma / zeta))
+    return relaxed, l0_prob
+
+
 class FastSeqPropSoftPackDesigner(nn.Module):
     def __init__(
         self,
@@ -73,26 +96,39 @@ class FastSeqPropSoftPackDesigner(nn.Module):
         presence_init_mode: str,
         presence_present_init: float,
         presence_absent_init: float,
+        initial_base_logits: torch.Tensor | None = None,
+        initial_presence_logits: torch.Tensor | None = None,
         device: torch.device,
     ):
         super().__init__()
         self.batch_size = batch_size
         self.max_slots = max_slots
-        self.raw_base_logits = nn.Parameter(torch.randn(batch_size, max_slots, 4, device=device) * base_init_std)
-        if presence_init_mode == "uniform":
-            expected_fraction = min(0.98, max(0.02, expected_length / float(max_slots)))
-            presence_bias = math.log(expected_fraction / (1.0 - expected_fraction))
-            presence_logits = torch.full((batch_size, max_slots), presence_bias, device=device)
-        elif presence_init_mode == "even":
-            present_count = min(max_slots, max(1, int(round(expected_length))))
-            presence_logits = torch.full((batch_size, max_slots), presence_absent_init, device=device)
-            if present_count == 1:
-                selected = torch.tensor([0], device=device)
-            else:
-                selected = torch.linspace(0, max_slots - 1, present_count, device=device).round().long().unique()
-            presence_logits[:, selected] = presence_present_init
+        if initial_base_logits is None:
+            base_logits = torch.randn(batch_size, max_slots, 4, device=device) * base_init_std
         else:
-            raise ValueError(f"Unknown presence_init_mode: {presence_init_mode}")
+            base_logits = initial_base_logits.to(device=device, dtype=torch.float32)
+            if base_logits.shape != (batch_size, max_slots, 4):
+                raise ValueError(f"initial_base_logits has shape {tuple(base_logits.shape)}, expected {(batch_size, max_slots, 4)}")
+        self.raw_base_logits = nn.Parameter(base_logits)
+        if initial_presence_logits is None:
+            if presence_init_mode == "uniform":
+                expected_fraction = min(0.98, max(0.02, expected_length / float(max_slots)))
+                presence_bias = math.log(expected_fraction / (1.0 - expected_fraction))
+                presence_logits = torch.full((batch_size, max_slots), presence_bias, device=device)
+            elif presence_init_mode == "even":
+                present_count = min(max_slots, max(1, int(round(expected_length))))
+                presence_logits = torch.full((batch_size, max_slots), presence_absent_init, device=device)
+                if present_count == 1:
+                    selected = torch.tensor([0], device=device)
+                else:
+                    selected = torch.linspace(0, max_slots - 1, present_count, device=device).round().long().unique()
+                presence_logits[:, selected] = presence_present_init
+            else:
+                raise ValueError(f"Unknown presence_init_mode: {presence_init_mode}")
+        else:
+            presence_logits = initial_presence_logits.to(device=device, dtype=torch.float32)
+            if presence_logits.shape != (batch_size, max_slots):
+                raise ValueError(f"initial_presence_logits has shape {tuple(presence_logits.shape)}, expected {(batch_size, max_slots)}")
         self.raw_presence_logits = nn.Parameter(presence_logits + torch.randn(batch_size, max_slots, device=device) * 0.01)
         self.gamma = nn.Parameter(torch.ones(4, device=device))
         self.beta = nn.Parameter(torch.zeros(4, device=device))
@@ -114,7 +150,11 @@ class FastSeqPropSoftPackDesigner(nn.Module):
         hard_bases: bool,
         sample_bases: bool,
         hard_presence: bool,
+        presence_gate: str,
+        sample_presence: bool,
         presence_threshold: float,
+        hard_concrete_gamma: float,
+        hard_concrete_zeta: float,
         max_pack_sharpness: float,
     ) -> dict[str, torch.Tensor]:
         base_logits = self.normalised_base_logits() / max(base_temperature, 1e-6)
@@ -124,11 +164,25 @@ class FastSeqPropSoftPackDesigner(nn.Module):
         else:
             bases_for_pack = base_probs
 
-        presence_prob = torch.sigmoid(self.raw_presence_logits / max(presence_temperature, 1e-6))
-        if hard_presence:
-            presence_for_pack = straight_through_bernoulli(presence_prob, threshold=presence_threshold)
-        else:
+        if presence_gate == "sigmoid":
+            presence_prob = torch.sigmoid(self.raw_presence_logits / max(presence_temperature, 1e-6))
             presence_for_pack = presence_prob
+            l0_prob = presence_prob
+            if hard_presence:
+                presence_for_pack = straight_through_bernoulli(presence_prob, threshold=presence_threshold)
+        elif presence_gate == "hard_concrete":
+            presence_for_pack, l0_prob = hard_concrete_gate(
+                self.raw_presence_logits,
+                temperature=presence_temperature,
+                gamma=hard_concrete_gamma,
+                zeta=hard_concrete_zeta,
+                sample=sample_presence and self.training,
+                hard=hard_presence,
+                threshold=presence_threshold,
+            )
+            presence_prob = l0_prob
+        else:
+            raise ValueError(f"Unknown presence_gate: {presence_gate}")
 
         soft_rank = torch.cumsum(presence_for_pack, dim=1)
         target_coordinate = torch.arange(output_length, device=base_probs.device, dtype=base_probs.dtype) + 1.0
@@ -138,16 +192,25 @@ class FastSeqPropSoftPackDesigner(nn.Module):
         pack = pack_logits.softmax(dim=-1)
         soft_dna = torch.einsum("bol,blc->boc", pack, bases_for_pack)
 
-        relaxed_rank = torch.cumsum(presence_prob, dim=1)
+        relaxed_presence = presence_prob if presence_gate == "sigmoid" else hard_concrete_gate(
+            self.raw_presence_logits,
+            temperature=presence_temperature,
+            gamma=hard_concrete_gamma,
+            zeta=hard_concrete_zeta,
+            sample=False,
+            hard=False,
+            threshold=presence_threshold,
+        )[0]
+        relaxed_rank = torch.cumsum(relaxed_presence, dim=1)
         relaxed_pack_logits = -pack_sharpness * (relaxed_rank[:, None, :] - target_coordinate[None, :, None]).pow(2)
-        relaxed_pack_logits = relaxed_pack_logits + torch.log(presence_prob.clamp_min(1e-6))[:, None, :]
+        relaxed_pack_logits = relaxed_pack_logits + torch.log(relaxed_presence.clamp_min(1e-6))[:, None, :]
         relaxed_pack = relaxed_pack_logits.softmax(dim=-1)
         soft_dna_relaxed = torch.einsum("bol,blc->boc", relaxed_pack, base_probs)
 
         base_entropy = -(base_probs.clamp_min(1e-8) * base_probs.clamp_min(1e-8).log()).sum(dim=-1).mean()
         presence_entropy = -(
-            presence_prob.clamp_min(1e-8) * presence_prob.clamp_min(1e-8).log()
-            + (1.0 - presence_prob).clamp_min(1e-8) * (1.0 - presence_prob).clamp_min(1e-8).log()
+            l0_prob.clamp_min(1e-8) * l0_prob.clamp_min(1e-8).log()
+            + (1.0 - l0_prob).clamp_min(1e-8) * (1.0 - l0_prob).clamp_min(1e-8).log()
         ).mean()
         pack_entropy = -(pack.clamp_min(1e-8) * pack.clamp_min(1e-8).log()).sum(dim=-1).mean()
         return {
@@ -155,6 +218,7 @@ class FastSeqPropSoftPackDesigner(nn.Module):
             "base_probs": base_probs,
             "bases_for_pack": bases_for_pack,
             "presence_prob": presence_prob,
+            "presence_l0_prob": l0_prob,
             "presence_for_pack": presence_for_pack,
             "soft_rank": soft_rank,
             "pack_logits": pack_logits,
@@ -168,7 +232,7 @@ class FastSeqPropSoftPackDesigner(nn.Module):
             "pack_entropy": pack_entropy,
             "pack_confidence": pack.max(dim=-1).values.mean().detach(),
             "presence_sum": presence_for_pack.sum(dim=1).detach(),
-            "presence_prob_sum": presence_prob.sum(dim=1).detach(),
+            "presence_prob_sum": l0_prob.sum(dim=1).detach(),
             "presence_min": presence_prob.min().detach(),
             "presence_max": presence_prob.max().detach(),
         }
@@ -189,7 +253,7 @@ def reconstruction_loss(
     token_nll = -soft_dna.gather(-1, target[..., None]).squeeze(-1).log()
     nt_loss = token_nll.mean()
     length_loss = F.smooth_l1_loss(rendered["presence_for_pack"].sum(dim=1), target_lengths)
-    presence_cost = rendered["presence_prob"].mean()
+    presence_cost = rendered["presence_l0_prob"].mean()
     loss = (
         nt_loss
         + length_weight * length_loss
@@ -231,7 +295,7 @@ def motif_loss(
     motif_score = motif_temperature * torch.logsumexp(score_matrix / max(motif_temperature, 1e-6), dim=1)
     length_target = torch.full_like(rendered["presence_for_pack"].sum(dim=1), float(target_length))
     length_loss = F.smooth_l1_loss(rendered["presence_for_pack"].sum(dim=1), length_target)
-    presence_cost = rendered["presence_prob"].mean()
+    presence_cost = rendered["presence_l0_prob"].mean()
     loss = (
         -motif_score.mean()
         + length_weight * length_loss
@@ -270,6 +334,68 @@ def make_reconstruction_targets(args: argparse.Namespace, rng: random.Random, de
     return target_tensor, sequences
 
 
+def make_indel_pair(args: argparse.Namespace, rng: random.Random) -> tuple[str, str]:
+    source = clean_dna(args.source_dna) if args.source_dna else random_dna(args.source_len, rng)
+    delete_start = max(0, min(args.indel_delete_start, len(source)))
+    delete_end = max(delete_start, min(delete_start + args.indel_delete_len, len(source)))
+    target = source[:delete_start] + source[delete_end:]
+    insert_sequence = clean_dna(args.indel_insert)
+    insert_at = max(0, min(args.indel_insert_at, len(target)))
+    target = target[:insert_at] + insert_sequence + target[insert_at:]
+    return source, target
+
+
+def make_source_canvas_initialisation(
+    *,
+    source: str,
+    batch_size: int,
+    max_slots: int,
+    optional_slots_per_base: int,
+    base_logit_init_strength: float,
+    presence_present_init: float,
+    presence_absent_init: float,
+    base_init_std: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows_base = []
+    rows_presence = []
+    real_slot_mask = []
+    real_slot_base = []
+    for _ in range(batch_size):
+        base_logits = []
+        presence_logits = []
+        slot_mask = []
+        slot_base = []
+        for base in source:
+            real_logits = torch.randn(4, device=device) * base_init_std
+            real_logits[DNA_TO_INDEX[base]] += base_logit_init_strength
+            base_logits.append(real_logits)
+            presence_logits.append(torch.tensor(presence_present_init, device=device))
+            slot_mask.append(torch.tensor(True, device=device))
+            slot_base.append(torch.tensor(DNA_TO_INDEX[base], device=device))
+            for _slot in range(optional_slots_per_base):
+                base_logits.append(torch.randn(4, device=device) * base_init_std)
+                presence_logits.append(torch.tensor(presence_absent_init, device=device))
+                slot_mask.append(torch.tensor(False, device=device))
+                slot_base.append(torch.tensor(0, device=device))
+        padding = max_slots - len(base_logits)
+        if padding < 0:
+            raise ValueError(
+                f"Source canvas needs {len(base_logits)} slots, but --max-slots={max_slots}. "
+                "Increase --max-slots or reduce --optional-slots-per-base."
+            )
+        for _pad in range(padding):
+            base_logits.append(torch.randn(4, device=device) * base_init_std)
+            presence_logits.append(torch.tensor(presence_absent_init, device=device))
+            slot_mask.append(torch.tensor(False, device=device))
+            slot_base.append(torch.tensor(0, device=device))
+        rows_base.append(torch.stack(base_logits))
+        rows_presence.append(torch.stack(presence_logits))
+        real_slot_mask.append(torch.stack(slot_mask))
+        real_slot_base.append(torch.stack(slot_base))
+    return torch.stack(rows_base), torch.stack(rows_presence), torch.stack(real_slot_mask), torch.stack(real_slot_base)
+
+
 def decode_batch(rendered: dict[str, torch.Tensor], output_length: int) -> list[str]:
     predicted = rendered["soft_dna"].argmax(dim=-1)
     return [tensor_to_dna(predicted[row, :output_length]) for row in range(predicted.shape[0])]
@@ -287,16 +413,78 @@ def selected_slot_summary(presence: torch.Tensor, *, threshold: float = 0.5, lim
     return f"{len(selected)} active; slots {shown}{suffix}"
 
 
+def source_slot_labels(source: str, optional_slots_per_base: int, max_slots: int) -> list[str]:
+    labels = []
+    for index, base in enumerate(source):
+        labels.append(f"src{index}:{base}")
+        for optional_index in range(optional_slots_per_base):
+            labels.append(f"opt{index}.{optional_index}")
+    while len(labels) < max_slots:
+        labels.append(f"pad{len(labels)}")
+    return labels[:max_slots]
+
+
+def active_slot_trace(
+    *,
+    presence: torch.Tensor,
+    base_probs: torch.Tensor,
+    labels: list[str],
+    threshold: float = 0.5,
+    limit: int = 120,
+) -> str:
+    selected = torch.nonzero(presence.detach().cpu() >= threshold, as_tuple=False).flatten().tolist()
+    parts = []
+    base_indices = base_probs.detach().cpu().argmax(dim=-1)
+    for slot in selected[:limit]:
+        label = labels[slot] if slot < len(labels) else f"slot{slot}"
+        parts.append(f"{slot}:{label}->{DNA_BASES[int(base_indices[slot])]}")
+    suffix = " ..." if len(selected) > limit else ""
+    return " | ".join(parts) + suffix
+
+
 def train(args: argparse.Namespace) -> None:
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
     device = pick_device(args.device)
+    source_sequence = ""
+    initial_base_logits = None
+    initial_presence_logits = None
+    source_real_slot_mask = None
+    source_real_slot_base = None
+    slot_labels = [f"slot{index}" for index in range(args.max_slots)]
 
     if args.mode == "reconstruct":
         target, sequences = make_reconstruction_targets(args, rng, device)
         output_length = target.shape[1]
         target_lengths = torch.full((args.batch_size,), float(output_length), device=device)
         expected_length = float(output_length)
+    elif args.mode == "indel":
+        source_sequence, target_sequence = make_indel_pair(args, rng)
+        sequences = [target_sequence for _ in range(args.batch_size)]
+        target = torch.stack([dna_to_tensor(target_sequence, device) for _ in range(args.batch_size)], dim=0)
+        output_length = target.shape[1]
+        target_lengths = torch.full((args.batch_size,), float(output_length), device=device)
+        expected_length = float(len(source_sequence))
+        source_canvas_slots = len(source_sequence) * (args.optional_slots_per_base + 1)
+        if args.max_slots < source_canvas_slots:
+            args.max_slots = source_canvas_slots
+        slot_labels = source_slot_labels(source_sequence, args.optional_slots_per_base, args.max_slots)
+        (
+            initial_base_logits,
+            initial_presence_logits,
+            source_real_slot_mask,
+            source_real_slot_base,
+        ) = make_source_canvas_initialisation(
+            source=source_sequence,
+            batch_size=args.batch_size,
+            max_slots=args.max_slots,
+            optional_slots_per_base=args.optional_slots_per_base,
+            base_logit_init_strength=args.base_logit_init_strength,
+            presence_present_init=args.presence_present_init,
+            presence_absent_init=args.presence_absent_init,
+            base_init_std=args.base_init_std,
+            device=device,
+        )
     else:
         motif = dna_to_tensor(args.motif, device)
         output_length = args.output_len
@@ -316,6 +504,8 @@ def train(args: argparse.Namespace) -> None:
         presence_init_mode=args.presence_init_mode,
         presence_present_init=args.presence_present_init,
         presence_absent_init=args.presence_absent_init,
+        initial_base_logits=initial_base_logits,
+        initial_presence_logits=initial_presence_logits,
         device=device,
     )
     optimizer = torch.optim.AdamW(designer.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -333,10 +523,14 @@ def train(args: argparse.Namespace) -> None:
     )
     print(
         f"hard_bases={args.hard_bases}; sample_bases={args.sample_bases}; "
-        f"hard_presence={args.hard_presence}; lr={args.lr}"
+        f"presence_gate={args.presence_gate}; hard_presence={args.hard_presence}; "
+        f"sample_presence={args.sample_presence}; lr={args.lr}"
     )
     if args.mode == "reconstruct":
         print("target[0]:", sequences[0])
+    elif args.mode == "indel":
+        print("source:", source_sequence)
+        print("target:", sequences[0])
     else:
         print("motif:", clean_dna(args.motif))
 
@@ -349,10 +543,14 @@ def train(args: argparse.Namespace) -> None:
             hard_bases=args.hard_bases,
             sample_bases=args.sample_bases,
             hard_presence=args.hard_presence,
+            presence_gate=args.presence_gate,
+            sample_presence=args.sample_presence,
             presence_threshold=args.presence_threshold,
+            hard_concrete_gamma=args.hard_concrete_gamma,
+            hard_concrete_zeta=args.hard_concrete_zeta,
             max_pack_sharpness=args.max_pack_sharpness,
         )
-        if args.mode == "reconstruct":
+        if args.mode in {"reconstruct", "indel"}:
             assert target is not None
             loss, loss_metrics = reconstruction_loss(
                 rendered,
@@ -366,6 +564,16 @@ def train(args: argparse.Namespace) -> None:
             )
             recon = reconstruction_metrics(rendered["soft_dna"], target)
             final_metrics = {**{key: float(value.item()) for key, value in loss_metrics.items()}, **recon}
+            if args.mode == "indel" and args.source_base_anchor_weight > 0:
+                assert source_real_slot_mask is not None and source_real_slot_base is not None
+                anchor_log_probs = rendered["base_probs"].clamp_min(1e-8).log()
+                source_base_nll = -anchor_log_probs.gather(-1, source_real_slot_base[..., None]).squeeze(-1)
+                source_mask = source_real_slot_mask.to(dtype=source_base_nll.dtype)
+                source_anchor_loss = (
+                    source_base_nll * source_mask
+                ).sum() / source_mask.sum().clamp_min(1.0)
+                loss = loss + args.source_base_anchor_weight * source_anchor_loss
+                final_metrics["source_anchor_loss"] = float(source_anchor_loss.detach().item())
         else:
             loss, loss_metrics = motif_loss(
                 rendered,
@@ -416,8 +624,10 @@ def train(args: argparse.Namespace) -> None:
                 f"pack_conf {rendered['pack_confidence'].item():.3f} "
                 f"sharp {rendered['pack_sharpness'].item():.3f}"
             )
-            if args.mode == "reconstruct":
+            if args.mode in {"reconstruct", "indel"}:
                 print("target: ", sequences[0])
+                if args.mode == "indel":
+                    print("source: ", source_sequence)
                 print(
                     f"example0 acc {final_metrics.get('example0_acc', 0.0):.3f} "
                     f"exact {final_metrics.get('example0_exact', 0.0):.0f}; "
@@ -429,11 +639,49 @@ def train(args: argparse.Namespace) -> None:
     decoded = decode_batch(final_rendered, output_length)
     print("\nFinal:")
     print("decoded[0]:", decoded[0])
-    if args.mode == "reconstruct":
+    if args.mode in {"reconstruct", "indel"}:
         print("target[0]: ", sequences[0])
+    if args.mode == "indel":
+        print("source:    ", source_sequence)
     print("presence probs[0]:", format_presence(final_rendered["presence_prob"][0]))
     print("selected slots[0]:", selected_slot_summary(final_rendered["presence_prob"][0]))
     print("base argmax[0]:", tensor_to_dna(final_rendered["base_probs"][0].argmax(dim=-1)))
+    with torch.no_grad():
+        designer.eval()
+        hard_rendered = designer(
+            output_length=output_length,
+            base_temperature=args.base_temperature,
+            presence_temperature=args.presence_temperature,
+            hard_bases=True,
+            sample_bases=False,
+            hard_presence=True,
+            presence_gate=args.presence_gate,
+            sample_presence=False,
+            presence_threshold=args.presence_threshold,
+            hard_concrete_gamma=args.hard_concrete_gamma,
+            hard_concrete_zeta=args.hard_concrete_zeta,
+            max_pack_sharpness=args.max_pack_sharpness,
+        )
+        hard_decoded = decode_batch(hard_rendered, output_length)
+        print("hard decoded[0]:", hard_decoded[0])
+        print("hard active slots[0]:", selected_slot_summary(hard_rendered["presence_for_pack"][0]))
+        if args.mode == "indel":
+            print(
+                "hard active trace[0]:",
+                active_slot_trace(
+                    presence=hard_rendered["presence_for_pack"][0],
+                    base_probs=hard_rendered["base_probs"][0],
+                    labels=slot_labels,
+                ),
+            )
+        if args.mode in {"reconstruct", "indel"}:
+            assert target is not None
+            hard_metrics = reconstruction_metrics(hard_rendered["soft_dna"], target)
+            print(
+                f"hard example0 acc {hard_metrics['example0_acc']:.3f} "
+                f"exact {hard_metrics['example0_exact']:.0f}; "
+                f"batch exact {hard_metrics['exact_count']:.0f}/{args.batch_size}"
+            )
     torch.save(
         {
             "model_state_dict": designer.state_dict(),
@@ -448,7 +696,7 @@ def train(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fast SeqProp base logits plus existence gates and SoftPack.")
-    parser.add_argument("--mode", choices=("reconstruct", "motif"), default="reconstruct")
+    parser.add_argument("--mode", choices=("reconstruct", "indel", "motif"), default="reconstruct")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -456,17 +704,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-len", type=int, default=100)
     parser.add_argument("--output-len", type=int, default=100)
     parser.add_argument("--target-dna", default="")
+    parser.add_argument("--source-dna", default="")
+    parser.add_argument("--source-len", type=int, default=100)
+    parser.add_argument("--optional-slots-per-base", type=int, default=1)
+    parser.add_argument("--indel-insert", default="GATTACA")
+    parser.add_argument("--indel-insert-at", type=int, default=50)
+    parser.add_argument("--indel-delete-start", type=int, default=25)
+    parser.add_argument("--indel-delete-len", type=int, default=5)
+    parser.add_argument("--source-base-anchor-weight", type=float, default=1.0)
     parser.add_argument("--motif", default="TATAAA")
     parser.add_argument("--steps", type=int, default=2_000)
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--base-init-std", type=float, default=0.01)
     parser.add_argument("--presence-init-mode", choices=("even", "uniform"), default="even")
+    parser.add_argument("--base-logit-init-strength", type=float, default=5.0)
     parser.add_argument("--presence-present-init", type=float, default=4.0)
     parser.add_argument("--presence-absent-init", type=float, default=-4.0)
     parser.add_argument("--base-temperature", type=float, default=1.0)
     parser.add_argument("--presence-temperature", type=float, default=1.0)
+    parser.add_argument("--presence-gate", choices=("sigmoid", "hard_concrete"), default="sigmoid")
+    parser.add_argument("--sample-presence", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--presence-threshold", type=float, default=0.5)
+    parser.add_argument("--hard-concrete-gamma", type=float, default=-0.1)
+    parser.add_argument("--hard-concrete-zeta", type=float, default=1.1)
     parser.add_argument("--hard-bases", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--sample-bases", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--hard-presence", action=argparse.BooleanOptionalAction, default=False)
