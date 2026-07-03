@@ -432,6 +432,53 @@ def summarise_batch(rendered: dict[str, torch.Tensor], target_lengths: torch.Ten
     )
 
 
+def compact_status(
+    *,
+    step: int,
+    token_cost_weight: float,
+    token_sharp_weight: float,
+    decoder_sharp_weight: float,
+    train_loss: torch.Tensor,
+    train_rendered: dict[str, torch.Tensor],
+    train_target: torch.Tensor,
+    train_mask: torch.Tensor,
+    train_lengths: torch.Tensor,
+    val_loss: float,
+    val_rendered: dict[str, torch.Tensor],
+    val_target: torch.Tensor,
+    val_mask: torch.Tensor,
+    val_lengths: torch.Tensor,
+) -> list[str]:
+    train_metrics = reconstruction_metrics(train_rendered["soft_dna"], train_target, train_mask)
+    val_metrics = reconstruction_metrics(val_rendered["soft_dna"], val_target, val_mask)
+    train_tokens = train_rendered["token_count"]
+    val_tokens = val_rendered["token_count"]
+    return [
+        (
+            f"\nstep {step:06d} | "
+            f"val loss {val_loss:.4f} acc {val_metrics['accuracy']:.3f} exact {val_metrics['exact']:.3f} | "
+            f"token_w {token_cost_weight:.2e} sharp_w {token_sharp_weight:.2e}/{decoder_sharp_weight:.2e}"
+        ),
+        (
+            f"train loss {train_loss.item():.4f} ce {train_rendered['recon_loss'].item():.4f} "
+            f"acc {train_metrics['accuracy']:.3f} exact {train_metrics['exact']:.3f} "
+            f"len_loss {train_rendered['length_loss'].item():.3f} "
+            f"tokens {train_tokens.mean().item():.2f}/{train_tokens.std(unbiased=False).item():.2f} "
+            f"target_len {train_lengths.mean().item():.1f}/{train_lengths.std(unbiased=False).item():.1f} "
+            f"out {train_rendered['total_len'].mean().item():.1f}/{train_rendered['total_len'].std(unbiased=False).item():.1f}"
+        ),
+        (
+            f"val   ce {val_rendered['recon_loss'].item():.4f} "
+            f"len_loss {val_rendered['length_loss'].item():.3f} "
+            f"tokens {val_tokens.mean().item():.2f}/{val_tokens.std(unbiased=False).item():.2f} "
+            f"range {val_tokens.min().item():.1f}-{val_tokens.max().item():.1f} "
+            f"tok/base {(val_tokens / val_lengths.clamp_min(1.0)).mean().item():.3f} "
+            f"target_len {val_lengths.mean().item():.1f}/{val_lengths.std(unbiased=False).item():.1f} "
+            f"out {val_rendered['total_len'].mean().item():.1f}/{val_rendered['total_len'].std(unbiased=False).item():.1f}"
+        ),
+    ]
+
+
 def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Tensor], target: torch.Tensor, mask: torch.Tensor) -> str:
     metrics = reconstruction_metrics(rendered["soft_dna"], target, mask)
     return (
@@ -445,6 +492,13 @@ def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Te
         f"pack_ent {rendered['pack_entropy'].item():.3f} "
         f"pack_conf {rendered['pack_confidence'].item():.3f}"
     )
+
+
+def mean_for_indices(values: torch.Tensor, indices: list[int], device: torch.device) -> float:
+    if not indices:
+        return float("nan")
+    index_tensor = torch.tensor(indices, device=device)
+    return float(values[index_tensor].mean().item())
 
 
 def evaluate(
@@ -538,7 +592,37 @@ def controlled_probe(
     for index, label in enumerate(labels):
         label_to_indices.setdefault(label, []).append(index)
 
-    lines = ["probe adaptive tokenizer:"]
+    if not args.verbose_probe:
+        lines = ["probe summary: len | random tok/acc/ex/out | compress tok/acc/ex/out"]
+        compressible_types = [block_type for block_type in block_types if block_type != "random"]
+        for seq_len in seq_lengths:
+            clipped_seq_len = min(args.seq_len, seq_len)
+            random_indices = [
+                index
+                for key, indices in label_to_indices.items()
+                if key[0] == "random" and key[1] == clipped_seq_len
+                for index in indices
+            ]
+            compress_indices = [
+                index
+                for key, indices in label_to_indices.items()
+                if key[0] in compressible_types and key[1] == clipped_seq_len
+                for index in indices
+            ]
+            lines.append(
+                f"probe L{clipped_seq_len:03d} | "
+                f"random tok {mean_for_indices(token_count, random_indices, device):.2f} "
+                f"acc {mean_for_indices(per_acc, random_indices, device):.3f} "
+                f"ex {mean_for_indices(per_exact, random_indices, device):.3f} "
+                f"out {mean_for_indices(rendered['total_len'], random_indices, device):.1f} | "
+                f"compress tok {mean_for_indices(token_count, compress_indices, device):.2f} "
+                f"acc {mean_for_indices(per_acc, compress_indices, device):.3f} "
+                f"ex {mean_for_indices(per_exact, compress_indices, device):.3f} "
+                f"out {mean_for_indices(rendered['total_len'], compress_indices, device):.1f}"
+            )
+        return lines
+
+    lines = ["probe detail:"]
     for block_type in block_types:
         for seq_len in seq_lengths:
             parts = []
@@ -698,14 +782,27 @@ def train(args: argparse.Namespace) -> None:
                     checkpoint_dir / "best.pt",
                 )
 
-            print(
-                f"\nstep {step:06d} token_w {token_cost_weight:.2e} "
-                f"tok_sharp_w {token_sharp_weight:.2e} dec_sharp_w {decoder_sharp_weight:.2e} "
-                f"val_loss {val_loss:.4f} val_acc {val_metrics['accuracy']:.3f} val_exact {val_metrics['exact']:.3f}"
-            )
-            print(format_metrics("train", loss, rendered, target, mask))
-            print(format_metrics("val", torch.tensor(val_loss), val_rendered, val_target, val_mask))
-            print(summarise_batch(val_rendered, val_lengths))
+            for line in compact_status(
+                step=step,
+                token_cost_weight=token_cost_weight,
+                token_sharp_weight=token_sharp_weight,
+                decoder_sharp_weight=decoder_sharp_weight,
+                train_loss=loss,
+                train_rendered=rendered,
+                train_target=target,
+                train_mask=mask,
+                train_lengths=lengths,
+                val_loss=val_loss,
+                val_rendered=val_rendered,
+                val_target=val_target,
+                val_mask=val_mask,
+                val_lengths=val_lengths,
+            ):
+                print(line)
+            if args.verbose_metrics:
+                print(format_metrics("train", loss, rendered, target, mask))
+                print(format_metrics("val", torch.tensor(val_loss), val_rendered, val_target, val_mask))
+                print(summarise_batch(val_rendered, val_lengths))
             for line in probe_lines:
                 print(line)
 
@@ -758,6 +855,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-seq-lengths", default="20,40,75,100")
     parser.add_argument("--probe-block-lengths", default="4,8,16,32,48")
     parser.add_argument("--probe-block-types", default="random,homopolymer,dinucleotide,motif")
+    parser.add_argument("--verbose-probe", action="store_true")
+    parser.add_argument("--verbose-metrics", action="store_true")
     parser.add_argument("--checkpoint-dir", default="checkpoints/dna_adaptive_tokenizer_autoencoder")
     parser.add_argument("--mps", action="store_true")
     parser.add_argument("--seed", type=int, default=1)
