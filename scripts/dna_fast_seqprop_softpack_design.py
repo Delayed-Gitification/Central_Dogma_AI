@@ -254,6 +254,9 @@ def reconstruction_metrics(soft_dna: torch.Tensor, target: torch.Tensor) -> dict
     return {
         "nt_acc": float(correct.float().mean().item()),
         "exact": float(correct.all(dim=1).float().mean().item()),
+        "example0_acc": float(correct[0].float().mean().item()),
+        "example0_exact": float(correct[0].all().float().item()),
+        "exact_count": float(correct.all(dim=1).float().sum().item()),
     }
 
 
@@ -275,6 +278,13 @@ def decode_batch(rendered: dict[str, torch.Tensor], output_length: int) -> list[
 def format_presence(values: torch.Tensor, limit: int = 80) -> str:
     shown = values.detach().cpu().tolist()[:limit]
     return ", ".join(f"{value:.2f}" for value in shown)
+
+
+def selected_slot_summary(presence: torch.Tensor, *, threshold: float = 0.5, limit: int = 120) -> str:
+    selected = torch.nonzero(presence.detach().cpu() >= threshold, as_tuple=False).flatten().tolist()
+    shown = selected[:limit]
+    suffix = " ..." if len(selected) > limit else ""
+    return f"{len(selected)} active; slots {shown}{suffix}"
 
 
 def train(args: argparse.Namespace) -> None:
@@ -408,6 +418,11 @@ def train(args: argparse.Namespace) -> None:
             )
             if args.mode == "reconstruct":
                 print("target: ", sequences[0])
+                print(
+                    f"example0 acc {final_metrics.get('example0_acc', 0.0):.3f} "
+                    f"exact {final_metrics.get('example0_exact', 0.0):.0f}; "
+                    f"batch exact {final_metrics.get('exact_count', 0.0):.0f}/{args.batch_size}"
+                )
             print("decoded:", decoded[0])
 
     assert final_rendered is not None
@@ -417,6 +432,7 @@ def train(args: argparse.Namespace) -> None:
     if args.mode == "reconstruct":
         print("target[0]: ", sequences[0])
     print("presence probs[0]:", format_presence(final_rendered["presence_prob"][0]))
+    print("selected slots[0]:", selected_slot_summary(final_rendered["presence_prob"][0]))
     print("base argmax[0]:", tensor_to_dna(final_rendered["base_probs"][0].argmax(dim=-1)))
     torch.save(
         {
