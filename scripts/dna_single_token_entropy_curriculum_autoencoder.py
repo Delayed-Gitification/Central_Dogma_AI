@@ -313,6 +313,99 @@ def make_single_token_entropy_batch(
     )
 
 
+def make_single_token_entropy_family_batch(
+    *,
+    seed_count: int,
+    family_size: int,
+    max_seq_len: int,
+    min_seq_len: int,
+    bit_budget: float,
+    kmer_sizes: list[int],
+    entropy_percentile: float,
+    families: list[str],
+    rng: random.Random,
+    device: torch.device,
+    max_tries: int,
+    substitution_rate: float,
+    indel_rate: float,
+    repeat_rate: float,
+    max_edits: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[str],
+    list[str],
+    torch.Tensor,
+]:
+    if seed_count <= 0 or family_size <= 0:
+        raise ValueError("seed_count and family_size must be positive.")
+    total = seed_count * family_size
+    target = torch.zeros(total, max_seq_len, dtype=torch.long)
+    mask = torch.zeros(total, max_seq_len, dtype=torch.float32)
+    lengths = torch.zeros(total, dtype=torch.float32)
+    bits = torch.zeros(total, dtype=torch.float32)
+    entropies = torch.zeros(total, dtype=torch.float32)
+    sequences: list[str] = []
+    kinds: list[str] = []
+    family_ids = torch.zeros(total, dtype=torch.long)
+    row = 0
+    for family_index in range(seed_count):
+        seed_sequence, kind, _seed_bits, _seed_entropy = generate_entropy_budget_sequence(
+            max_seq_len=max_seq_len,
+            min_seq_len=min_seq_len,
+            bit_budget=bit_budget,
+            kmer_sizes=kmer_sizes,
+            entropy_percentile=entropy_percentile,
+            families=families,
+            rng=rng,
+            max_tries=max_tries,
+        )
+        variants = [seed_sequence]
+        for variant_index in range(1, family_size):
+            scale = 1.0 + float(variant_index - 1) / float(max(1, family_size - 1))
+            variants.append(
+                augment_sequence(
+                    seed_sequence,
+                    max_seq_len=max_seq_len,
+                    rng=rng,
+                    substitution_rate=substitution_rate * scale,
+                    indel_rate=indel_rate * scale,
+                    repeat_rate=min(1.0, repeat_rate * scale),
+                    max_edits=max_edits,
+                )
+            )
+        for sequence in variants:
+            sequence_tensor = sequence_to_tensor(sequence)
+            seq_len = len(sequence)
+            entropy = multiscale_kmer_complexity_per_base(
+                sequence,
+                k_values=kmer_sizes,
+                percentile=entropy_percentile,
+            )
+            target[row, :seq_len] = sequence_tensor
+            mask[row, :seq_len] = 1.0
+            lengths[row] = seq_len
+            bits[row] = seq_len * entropy
+            entropies[row] = entropy
+            sequences.append(sequence)
+            kinds.append(kind)
+            family_ids[row] = family_index
+            row += 1
+    return (
+        target.to(device),
+        mask.to(device),
+        lengths.to(device),
+        bits.to(device),
+        entropies.to(device),
+        sequences,
+        kinds,
+        family_ids.to(device),
+    )
+
+
 def augment_sequence(
     sequence: str,
     *,
@@ -1198,30 +1291,68 @@ def evaluate(
     last_mask: torch.Tensor | None = None
     last_lengths: torch.Tensor | None = None
     families = single_token_families(args)
+    kmer_sizes = single_token_kmer_sizes(args)
     for _ in range(args.val_batches):
-        target, mask, lengths, bits, entropies, _ = make_single_token_entropy_batch(
-            batch_size=args.batch_size,
-            max_seq_len=args.seq_len,
-            min_seq_len=args.single_token_min_len,
-            bit_budget=args.single_token_bit_budget,
-            kmer_sizes=single_token_kmer_sizes(args),
-            entropy_percentile=args.single_token_entropy_percentile,
-            families=families,
-            rng=rng,
-            device=device,
-            max_tries=args.single_token_max_tries,
-        )
-        loss, rendered = loss_for_batch(
-            model=model,
-            target=target,
-            mask=mask,
-            target_lengths=lengths,
-            length_weight=args.length_weight,
-            token_cost_weight=token_cost_weight,
-            token_sharp_weight=token_sharp_weight,
-            decoder_sharp_weight=decoder_sharp_weight,
-            latent_l2_weight=args.latent_l2_weight,
-        )
+        if manifold_weight > 0:
+            family_size = max(2, args.manifold_family_size)
+            seed_count = args.manifold_seed_count if args.manifold_seed_count > 0 else max(1, args.batch_size // family_size)
+            target, mask, lengths, bits, entropies, sequences, _kinds, family_ids = make_single_token_entropy_family_batch(
+                seed_count=seed_count,
+                family_size=family_size,
+                max_seq_len=args.seq_len,
+                min_seq_len=args.single_token_min_len,
+                bit_budget=args.single_token_bit_budget,
+                kmer_sizes=kmer_sizes,
+                entropy_percentile=args.single_token_entropy_percentile,
+                families=families,
+                rng=rng,
+                device=device,
+                max_tries=args.single_token_max_tries,
+                substitution_rate=args.augment_substitution_rate,
+                indel_rate=args.augment_indel_rate,
+                repeat_rate=args.augment_repeat_rate,
+                max_edits=args.augment_max_edits,
+            )
+            loss, rendered = loss_for_family_geometry_batch(
+                model=model,
+                target=target,
+                mask=mask,
+                lengths=lengths,
+                sequences=sequences,
+                family_ids=family_ids,
+                length_weight=args.length_weight,
+                token_cost_weight=token_cost_weight,
+                token_sharp_weight=token_sharp_weight,
+                decoder_sharp_weight=decoder_sharp_weight,
+                latent_l2_weight=args.latent_l2_weight,
+                manifold_weight=manifold_weight,
+                within_family_only=args.rapidfuzz_within_family_only,
+                similarity_margin=args.rapidfuzz_similarity_margin,
+            )
+        else:
+            target, mask, lengths, bits, entropies, _ = make_single_token_entropy_batch(
+                batch_size=args.batch_size,
+                max_seq_len=args.seq_len,
+                min_seq_len=args.single_token_min_len,
+                bit_budget=args.single_token_bit_budget,
+                kmer_sizes=kmer_sizes,
+                entropy_percentile=args.single_token_entropy_percentile,
+                families=families,
+                rng=rng,
+                device=device,
+                max_tries=args.single_token_max_tries,
+            )
+            loss, rendered = loss_for_batch(
+                model=model,
+                target=target,
+                mask=mask,
+                target_lengths=lengths,
+                length_weight=args.length_weight,
+                token_cost_weight=token_cost_weight,
+                token_sharp_weight=token_sharp_weight,
+                decoder_sharp_weight=decoder_sharp_weight,
+                latent_l2_weight=args.latent_l2_weight,
+            )
         rendered["info_bits"] = bits.detach()
         rendered["entropy_per_base"] = entropies.detach()
         metrics = reconstruction_metrics(rendered["soft_dna"], target, mask)
@@ -1437,37 +1568,75 @@ def train(args: argparse.Namespace) -> None:
         f"length_weight={args.length_weight}; initial_stride={args.initial_token_stride}; "
         f"bit_budget={args.single_token_bit_budget}; kmers={','.join(str(k) for k in kmer_sizes)}; "
         f"entropy_percentile={args.single_token_entropy_percentile}; "
-        f"families={','.join(families)}"
+        f"families={','.join(families)}; manifold_weight={args.manifold_weight}; "
+        f"manifold_family_size={max(2, args.manifold_family_size)}; manifold_warmup={args.manifold_warmup_frac}"
     )
 
     for step in range(args.steps):
         token_cost_weight = current_weight(step, args.steps, args.token_cost_weight, args.token_cost_warmup_frac)
         token_sharp_weight = current_weight(step, args.steps, args.token_sharp_weight, args.token_sharp_warmup_frac)
         decoder_sharp_weight = current_weight(step, args.steps, args.decoder_sharp_weight, args.decoder_sharp_warmup_frac)
-        manifold_weight = 0.0
-        target, mask, lengths, bits, entropies, _ = make_single_token_entropy_batch(
-            batch_size=args.batch_size,
-            max_seq_len=args.seq_len,
-            min_seq_len=args.single_token_min_len,
-            bit_budget=args.single_token_bit_budget,
-            kmer_sizes=kmer_sizes,
-            entropy_percentile=args.single_token_entropy_percentile,
-            families=families,
-            rng=train_rng,
-            device=device,
-            max_tries=args.single_token_max_tries,
-        )
-        loss, rendered = loss_for_batch(
-            model=model,
-            target=target,
-            mask=mask,
-            target_lengths=lengths,
-            length_weight=args.length_weight,
-            token_cost_weight=token_cost_weight,
-            token_sharp_weight=token_sharp_weight,
-            decoder_sharp_weight=decoder_sharp_weight,
-            latent_l2_weight=args.latent_l2_weight,
-        )
+        manifold_weight = current_weight(step, args.steps, args.manifold_weight, args.manifold_warmup_frac)
+        if manifold_weight > 0:
+            family_size = max(2, args.manifold_family_size)
+            seed_count = args.manifold_seed_count if args.manifold_seed_count > 0 else max(1, args.batch_size // family_size)
+            target, mask, lengths, bits, entropies, sequences, _kinds, family_ids = make_single_token_entropy_family_batch(
+                seed_count=seed_count,
+                family_size=family_size,
+                max_seq_len=args.seq_len,
+                min_seq_len=args.single_token_min_len,
+                bit_budget=args.single_token_bit_budget,
+                kmer_sizes=kmer_sizes,
+                entropy_percentile=args.single_token_entropy_percentile,
+                families=families,
+                rng=train_rng,
+                device=device,
+                max_tries=args.single_token_max_tries,
+                substitution_rate=args.augment_substitution_rate,
+                indel_rate=args.augment_indel_rate,
+                repeat_rate=args.augment_repeat_rate,
+                max_edits=args.augment_max_edits,
+            )
+            loss, rendered = loss_for_family_geometry_batch(
+                model=model,
+                target=target,
+                mask=mask,
+                lengths=lengths,
+                sequences=sequences,
+                family_ids=family_ids,
+                length_weight=args.length_weight,
+                token_cost_weight=token_cost_weight,
+                token_sharp_weight=token_sharp_weight,
+                decoder_sharp_weight=decoder_sharp_weight,
+                latent_l2_weight=args.latent_l2_weight,
+                manifold_weight=manifold_weight,
+                within_family_only=args.rapidfuzz_within_family_only,
+                similarity_margin=args.rapidfuzz_similarity_margin,
+            )
+        else:
+            target, mask, lengths, bits, entropies, _ = make_single_token_entropy_batch(
+                batch_size=args.batch_size,
+                max_seq_len=args.seq_len,
+                min_seq_len=args.single_token_min_len,
+                bit_budget=args.single_token_bit_budget,
+                kmer_sizes=kmer_sizes,
+                entropy_percentile=args.single_token_entropy_percentile,
+                families=families,
+                rng=train_rng,
+                device=device,
+                max_tries=args.single_token_max_tries,
+            )
+            loss, rendered = loss_for_batch(
+                model=model,
+                target=target,
+                mask=mask,
+                target_lengths=lengths,
+                length_weight=args.length_weight,
+                token_cost_weight=token_cost_weight,
+                token_sharp_weight=token_sharp_weight,
+                decoder_sharp_weight=decoder_sharp_weight,
+                latent_l2_weight=args.latent_l2_weight,
+            )
         rendered["info_bits"] = bits.detach()
         rendered["entropy_per_base"] = entropies.detach()
         optimizer.zero_grad(set_to_none=True)
@@ -1571,12 +1740,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder-sharp-weight", type=float, default=0.001)
     parser.add_argument("--decoder-sharp-warmup-frac", type=float, default=0.1)
     parser.add_argument("--latent-l2-weight", type=float, default=1e-4)
-    parser.add_argument("--manifold-weight", type=float, default=0.0)
-    parser.add_argument("--manifold-warmup-frac", type=float, default=0.1)
+    parser.add_argument("--manifold-weight", type=float, default=0.05)
+    parser.add_argument("--manifold-warmup-frac", type=float, default=0.0)
     parser.add_argument("--manifold-position-weight", type=float, default=0.05)
     parser.add_argument("--manifold-temperature", type=float, default=0.08)
     parser.add_argument("--manifold-seed-count", type=int, default=0)
-    parser.add_argument("--manifold-family-size", type=int, default=0)
+    parser.add_argument("--manifold-family-size", type=int, default=4)
     parser.add_argument("--rapidfuzz-similarity-margin", type=float, default=0.0)
     parser.add_argument("--rapidfuzz-within-family-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--augment-substitution-rate", type=float, default=0.02)
