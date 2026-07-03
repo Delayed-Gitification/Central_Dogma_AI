@@ -52,11 +52,11 @@ def motif_repeat_block(rng: random.Random, length: int) -> str:
 
 def generate_segmental_sequence_with_blocks(seq_len: int, rng: random.Random) -> tuple[str, list[int], list[str]]:
     builders = [
-        ("random", random_dna_block),
-        ("homopolymer", homopolymer_block),
-        ("dinucleotide", dinucleotide_repeat_block),
-        ("pyrimidine", pyrimidine_rich_block),
-        ("motif", motif_repeat_block),
+        ("random", random_dna_block, 3, 8),
+        ("homopolymer", homopolymer_block, 16, 48),
+        ("dinucleotide", dinucleotide_repeat_block, 14, 40),
+        ("pyrimidine", pyrimidine_rich_block, 8, 28),
+        ("motif", motif_repeat_block, 10, 36),
     ]
     parts = []
     block_lengths = []
@@ -64,8 +64,8 @@ def generate_segmental_sequence_with_blocks(seq_len: int, rng: random.Random) ->
     total_length = 0
     while total_length < seq_len:
         remaining = seq_len - total_length
-        length = min(remaining, rng.randint(5, 32))
-        block_type, builder = rng.choice(builders)
+        block_type, builder, min_len, max_len = rng.choice(builders)
+        length = min(remaining, rng.randint(min_len, max_len))
         part = builder(rng, length)
         parts.append(part)
         block_lengths.append(len(part))
@@ -502,6 +502,49 @@ def block_length_correlation(
     return float((predicted * target).sum().div(denom).item())
 
 
+def tensor_correlation(first: torch.Tensor, second: torch.Tensor) -> float:
+    if first.numel() < 2 or second.numel() < 2:
+        return 0.0
+    first = first.detach().float().cpu().flatten()
+    second = second.detach().float().cpu().flatten()
+    first = first - first.mean()
+    second = second - second.mean()
+    denom = first.norm() * second.norm()
+    if denom.item() == 0.0:
+        return 0.0
+    return float((first * second).sum().div(denom).item())
+
+
+def summarise_segment_entropy(rendered: dict[str, torch.Tensor], target: torch.Tensor) -> str:
+    lengths = rendered["lengths"].detach()
+    weights = rendered["weights"].detach()
+    batch_size, num_segments = lengths.shape
+    max_slots_per_segment = weights.shape[1] // num_segments
+    segment_weights = weights.reshape(batch_size, num_segments, max_slots_per_segment, target.shape[1]).sum(dim=2)
+    segment_mass = segment_weights.sum(dim=-1)
+
+    one_hot = F.one_hot(target, num_classes=4).to(dtype=segment_weights.dtype)
+    base_mass = torch.einsum("bml,blc->bmc", segment_weights, one_hot)
+    base_probs = base_mass / (base_mass.sum(dim=-1, keepdim=True) + 1e-8)
+    entropy = -(base_probs.clamp_min(1e-8) * base_probs.clamp_min(1e-8).log()).sum(dim=-1) / math.log(4.0)
+
+    mask = segment_mass > 0.25
+    if not mask.any():
+        return "seg_entropy n/a"
+
+    length_values = lengths[mask].detach().float().cpu()
+    entropy_values = entropy[mask].detach().float().cpu()
+    order = torch.argsort(length_values)
+    group_size = max(1, int(math.ceil(float(order.numel()) * 0.25)))
+    short_entropy = entropy_values[order[:group_size]].mean()
+    long_entropy = entropy_values[order[-group_size:]].mean()
+    return (
+        f"seg_entropy {entropy_values.mean().item():.3f} "
+        f"len_entropy_corr {tensor_correlation(length_values, entropy_values):.3f} "
+        f"short_entropy {short_entropy.item():.3f} long_entropy {long_entropy.item():.3f}"
+    )
+
+
 def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Tensor], target: torch.Tensor) -> str:
     metrics = reconstruction_metrics(rendered["soft_dna"], target)
     return (
@@ -761,6 +804,7 @@ def train(args: argparse.Namespace) -> None:
             print(summarise_segment_usage(val_rendered["segment_usage"]))
             print(summarise_true_blocks(val_block_lengths))
             print(f"block_len_corr {block_length_correlation(val_rendered['lengths'], val_block_lengths):.3f}")
+            print(summarise_segment_entropy(val_rendered, val_batch))
 
     torch.save(
         {
