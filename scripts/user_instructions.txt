@@ -1,0 +1,7 @@
+in 'scripts/', write me an MPS-compatible script that creates a DNA sequence autoencoder. 
+
+I'm thinking that the DNA gets encoded into a 64-dim latent space (configurable of course), with an average of one column of autoencoder per 20 bases. But crucially, this is not fixed. An single column in the autoencoder could emit ZERO bases. Or, it could emit 200. Of course, long emmissions will typically be low entropy sequences. High entropy sequences will need more columns per base (though still many bases total per single column typically). The aim here is to create a manifold whereby the latent space can be tweaked slightly to, for example, add indels, or increase the length of a polypyrimidine tract. Get it?
+
+Think carefully about the best PYTORCH architecture.
+
+Before you implement, explain your plan, so I can double check with other AIs

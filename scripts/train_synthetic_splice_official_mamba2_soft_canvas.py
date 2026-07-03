@@ -630,6 +630,19 @@ def train(args: argparse.Namespace) -> None:
                     f"nt_exact {final_metrics['downstream_nt_exact_match']:.3f}"
                 )
 
+        if (
+            renderer_enabled
+            and args.stop_when_renderer_exact
+            and final_metrics["construct_exact_match"] >= args.exact_stop_threshold
+            and final_metrics["downstream_exact_match"] >= args.exact_stop_threshold
+            and final_metrics["downstream_nt_exact_match"] >= args.exact_stop_threshold
+        ):
+            print(
+                "stopping early: construct, downstream protein, and downstream CDS are exact",
+                flush=True,
+            )
+            break
+
     print("\nFinal metrics:")
     for key, value in final_metrics.items():
         print(f"{key}: {value}")
@@ -731,6 +744,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--track-loss-weight", type=float, default=1.0)
     parser.add_argument("--downstream-aa-loss-weight", type=float, default=1.0)
     parser.add_argument("--downstream-nt-loss-weight", type=float, default=0.5)
+    parser.add_argument("--stop-when-renderer-exact", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--exact-stop-threshold", type=float, default=1.0)
     parser.add_argument("--construct-sharpness-init", type=float, default=4.0)
     parser.add_argument("--max-construct-sharpness", type=float, default=50.0)
     parser.add_argument("--base-logit-init-strength", type=float, default=5.0)
