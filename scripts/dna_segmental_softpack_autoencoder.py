@@ -343,6 +343,8 @@ def loss_for_batch(
     active_segment_weight: float,
     active_segment_threshold: float,
     active_segment_temperature: float,
+    active_budget: float,
+    active_budget_weight: float,
     usage_sharp_weight: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     z, rendered = model(target, seq_len)
@@ -360,7 +362,12 @@ def loss_for_batch(
     sharp_loss = (rendered["keep"] * (1.0 - rendered["keep"])).mean()
     length_active = torch.sigmoid((rendered["lengths"] - active_segment_threshold) / active_segment_temperature)
     active_segments = rendered["segment_usage"] * length_active
-    active_segment_loss = active_segments.sum(dim=1).mean()
+    active_count = active_segments.sum(dim=1)
+    active_segment_loss = active_count.mean()
+    if active_budget > 0 and active_budget_weight > 0:
+        active_budget_loss = (active_count - active_budget).clamp_min(0.0).pow(2).mean()
+    else:
+        active_budget_loss = rendered["lengths"].new_zeros(())
     usage_sharp_loss = (rendered["segment_usage"] * (1.0 - rendered["segment_usage"])).sum(dim=1).mean()
     loss = (
         recon_loss
@@ -369,6 +376,7 @@ def loss_for_batch(
         + latent_l2_weight * latent_l2
         + sharp_weight * sharp_loss
         + active_segment_weight * active_segment_loss
+        + active_budget_weight * active_budget_loss
         + usage_sharp_weight * usage_sharp_loss
     )
     return loss, {
@@ -380,6 +388,7 @@ def loss_for_batch(
         "latent_l2": latent_l2.detach(),
         "sharp_loss": sharp_loss.detach(),
         "active_segment_loss": active_segment_loss.detach(),
+        "active_budget_loss": active_budget_loss.detach(),
         "active_segments": active_segments.detach(),
         "length_active": length_active.detach(),
         "usage_sharp_loss": usage_sharp_loss.detach(),
@@ -553,6 +562,7 @@ def format_metrics(prefix: str, loss: torch.Tensor, rendered: dict[str, torch.Te
         f"len {rendered['length_loss'].item():.3f} "
         f"block_len {rendered['block_length_loss'].item():.3f} "
         f"active_loss {rendered['active_segment_loss'].item():.3f} "
+        f"budget {rendered['active_budget_loss'].item():.3f} "
         f"usage_sharp {rendered['usage_sharp_loss'].item():.3f} "
         f"base_ent {rendered['base_entropy'].item():.3f} "
         f"pack_ent {rendered['pack_entropy'].item():.3f} "
@@ -576,6 +586,8 @@ def evaluate_fresh_batches(
     active_segment_weight: float,
     active_segment_threshold: float,
     active_segment_temperature: float,
+    active_budget: float,
+    active_budget_weight: float,
     usage_sharp_weight: float,
 ) -> tuple[float, dict[str, float], dict[str, torch.Tensor], torch.Tensor, list[list[int]]]:
     total_loss = 0.0
@@ -605,6 +617,8 @@ def evaluate_fresh_batches(
             active_segment_weight=active_segment_weight,
             active_segment_threshold=active_segment_threshold,
             active_segment_temperature=active_segment_temperature,
+            active_budget=active_budget,
+            active_budget_weight=active_budget_weight,
             usage_sharp_weight=usage_sharp_weight,
         )
         metrics = reconstruction_metrics(rendered["soft_dna"], batch)
