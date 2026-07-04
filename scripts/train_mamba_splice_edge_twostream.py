@@ -283,6 +283,13 @@ class OfficialMamba2Block(nn.Module):
         d_inner = 2 * hidden_dim
         if d_inner % headdim != 0:
             raise ValueError("2 * hidden_dim must be divisible by headdim")
+        nheads = d_inner // headdim
+        if nheads % 8 != 0:
+            raise ValueError(
+                "Mamba2 Triton kernels are happiest when nheads=(2 * hidden_dim / headdim) "
+                f"is a multiple of 8. Got hidden_dim={hidden_dim}, headdim={headdim}, "
+                f"nheads={nheads}. Try --hidden-dim 192 --headdim 16 or --hidden-dim 160 --headdim 8."
+            )
         self.mamba = Mamba2(
             d_model=hidden_dim,
             d_state=32,
