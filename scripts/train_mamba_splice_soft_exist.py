@@ -377,6 +377,28 @@ def metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> d
     f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-8)
     peak_true = labels.amax(dim=(1, 2)).mean()
     peak_pred = probs.amax(dim=(1, 2)).mean()
+    topk_values = {}
+    for channel, prefix in ((DONOR, "don"), (ACCEPTOR, "acc")):
+        valid = mask.reshape(-1) > 0
+        channel_probs = probs[..., channel].reshape(-1)
+        channel_true = (labels[..., channel].reshape(-1) >= 0.5) & valid
+        valid_count = int(valid.sum().item())
+        true_count = int(channel_true.sum().item())
+        if true_count > 0 and valid_count > 0:
+            masked_probs = channel_probs.masked_fill(~valid, -1.0)
+            k = min(true_count, valid_count)
+            top_index = masked_probs.topk(k=k, largest=True).indices
+            top_hits = channel_true[top_index].float().sum()
+            k2 = min(2 * true_count, valid_count)
+            top2_index = masked_probs.topk(k=k2, largest=True).indices
+            top2_hits = channel_true[top2_index].float().sum()
+            topk_values[f"{prefix}_topk"] = float((top_hits / float(k)).item())
+            topk_values[f"{prefix}_top2k_rec"] = float((top2_hits / float(true_count)).item())
+            topk_values[f"{prefix}_true_n"] = float(true_count)
+        else:
+            topk_values[f"{prefix}_topk"] = 0.0
+            topk_values[f"{prefix}_top2k_rec"] = 0.0
+            topk_values[f"{prefix}_true_n"] = float(true_count)
     return {
         "don_f1": float(f1[DONOR].item()),
         "acc_f1": float(f1[ACCEPTOR].item()),
@@ -385,6 +407,7 @@ def metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> d
         "peak_true": float(peak_true.item()),
         "peak_pred": float(peak_pred.item()),
         "mean_prob": float((probs * mask[..., None]).sum().item() / (mask.sum().item() * labels.shape[-1])),
+        **topk_values,
     }
 
 
@@ -464,8 +487,13 @@ def train(args: argparse.Namespace) -> None:
                 save_checkpoint(checkpoint_dir / "best.pt", model, args, step, best_loss, val_metrics)
             print(
                 f"\nstep {step:06d} loss {loss.item():.4f} val {val_loss.item():.4f} best {best_loss:.4f} "
-                f"f1 donor/acceptor {val_metrics['don_f1']:.3f}/{val_metrics['acc_f1']:.3f} "
-                f"recall {val_metrics['don_rec']:.3f}/{val_metrics['acc_rec']:.3f}"
+                f"topK donor/acceptor {val_metrics['don_topk']:.3f}/{val_metrics['acc_topk']:.3f} "
+                f"top2Krec {val_metrics['don_top2k_rec']:.3f}/{val_metrics['acc_top2k_rec']:.3f}"
+            )
+            print(
+                f"threshold f1 donor/acceptor {val_metrics['don_f1']:.3f}/{val_metrics['acc_f1']:.3f} "
+                f"recall {val_metrics['don_rec']:.3f}/{val_metrics['acc_rec']:.3f} "
+                f"true sites donor/acceptor {val_metrics['don_true_n']:.0f}/{val_metrics['acc_true_n']:.0f}"
             )
             print(
                 f"peaks pred/true {val_metrics['peak_pred']:.3f}/{val_metrics['peak_true']:.3f} "
