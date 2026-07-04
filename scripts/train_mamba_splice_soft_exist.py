@@ -338,12 +338,15 @@ def make_batch(args: argparse.Namespace, sampler: GtfSpliceWindowSampler, device
     return torch.stack(dna_rows), torch.stack(label_rows)
 
 
-def prepare_input(args: argparse.Namespace, dna: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if random.random() < args.soft_augment_prob:
+def prepare_input(args: argparse.Namespace, dna: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, bool]]:
+    soft_augmented = random.random() < args.soft_augment_prob
+    exist_augmented = False
+    if soft_augmented:
         dna = soften_one_hot(dna, args.soft_eps_min, args.soft_eps_max, args.soft_logit_noise_std, args.soft_temperature)
     existence = torch.ones(dna.shape[:2], dtype=dna.dtype, device=dna.device)
     mask = torch.ones_like(existence)
     if args.junk_slots_per_base > 0 and random.random() < args.exist_augment_prob:
+        exist_augmented = True
         max_length = dna.shape[1] * (1 + args.junk_slots_per_base)
         dna, labels, existence, mask = add_existence_junk(
             dna,
@@ -352,7 +355,7 @@ def prepare_input(args: argparse.Namespace, dna: torch.Tensor, labels: torch.Ten
             junk_exist_max=args.junk_exist_max,
             max_length=max_length,
         )
-    return dna, labels, existence, mask
+    return dna, labels, existence, mask, {"soft": soft_augmented, "exist": exist_augmented}
 
 
 def splice_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, positive_weight: float) -> torch.Tensor:
@@ -440,7 +443,7 @@ def train(args: argparse.Namespace) -> None:
     for step in range(args.steps):
         model.train()
         dna, labels = make_batch(args, sampler, device, step)
-        dna_in, labels_in, existence, mask = prepare_input(args, dna, labels)
+        dna_in, labels_in, existence, mask, train_aug = prepare_input(args, dna, labels)
         logits = model(dna_in, existence, mask)
         loss = splice_loss(logits, labels_in, mask, args.positive_weight)
         optimizer.zero_grad(set_to_none=True)
@@ -452,7 +455,7 @@ def train(args: argparse.Namespace) -> None:
             model.eval()
             with torch.no_grad():
                 val_dna, val_labels = make_batch(args, sampler, device, 100_000 + step)
-                val_dna_in, val_labels_in, val_exist, val_mask = prepare_input(args, val_dna, val_labels)
+                val_dna_in, val_labels_in, val_exist, val_mask, val_aug = prepare_input(args, val_dna, val_labels)
                 val_logits = model(val_dna_in, val_exist, val_mask)
                 val_loss = splice_loss(val_logits, val_labels_in, val_mask, args.positive_weight)
                 val_metrics = metrics(val_logits, val_labels_in, val_mask)
@@ -467,7 +470,9 @@ def train(args: argparse.Namespace) -> None:
             print(
                 f"peaks pred/true {val_metrics['peak_pred']:.3f}/{val_metrics['peak_true']:.3f} "
                 f"mean_prob {val_metrics['mean_prob']:.5f} input_len {val_dna_in.shape[1]} "
-                f"exist_sum {val_exist.sum(dim=1).mean().item():.1f}"
+                f"exist_sum {val_exist.sum(dim=1).mean().item():.1f} "
+                f"aug train soft/exist {int(train_aug['soft'])}/{int(train_aug['exist'])} "
+                f"val {int(val_aug['soft'])}/{int(val_aug['exist'])}"
             )
 
     save_checkpoint(checkpoint_dir / "latest.pt", model, args, args.steps - 1, best_loss, {})
@@ -497,12 +502,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--positive-weight", type=float, default=300.0)
 
-    parser.add_argument("--soft-augment-prob", type=float, default=0.5)
+    parser.add_argument("--soft-augment-prob", type=float, default=0.0)
     parser.add_argument("--soft-eps-min", type=float, default=0.01)
     parser.add_argument("--soft-eps-max", type=float, default=0.25)
     parser.add_argument("--soft-logit-noise-std", type=float, default=0.25)
     parser.add_argument("--soft-temperature", type=float, default=1.0)
-    parser.add_argument("--exist-augment-prob", type=float, default=0.25)
+    parser.add_argument("--exist-augment-prob", type=float, default=0.0)
     parser.add_argument("--junk-slots-per-base", type=int, default=1)
     parser.add_argument("--junk-exist-max", type=float, default=0.05)
 
