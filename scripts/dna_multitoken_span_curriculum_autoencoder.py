@@ -260,6 +260,89 @@ def learned_span_assignment_loss(
     return (per_token * active).sum() / active.sum().clamp_min(1.0)
 
 
+def token_open_targets(
+    *,
+    component_lengths: torch.Tensor,
+    component_counts: torch.Tensor,
+    seq_len: int,
+    mask: torch.Tensor,
+    max_components: int,
+) -> torch.Tensor:
+    active = component_active_mask(component_counts, max_components)
+    starts = component_lengths[:, :max_components].cumsum(dim=1) - component_lengths[:, :max_components]
+    start_positions = starts.round().long().clamp(0, seq_len - 1)
+    targets = torch.zeros_like(mask)
+    targets.scatter_add_(1, start_positions, active.to(dtype=targets.dtype))
+    return targets.clamp_max(1.0) * mask
+
+
+def token_opening_loss(
+    rendered: dict[str, torch.Tensor],
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    positive_weight: float,
+) -> torch.Tensor:
+    weights = mask * (1.0 + positive_weight * targets)
+    per_position = (rendered["token_prob"] - targets).pow(2)
+    return (per_position * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def latent_interpolation_regularization(
+    *,
+    model: base.AdaptiveTokenizerAutoencoder,
+    latents: torch.Tensor,
+    token_usage: torch.Tensor,
+    lengths: torch.Tensor,
+    component_counts: torch.Tensor,
+    out_len: int,
+    max_pairs: int,
+    alpha: float,
+    entropy_weight: float,
+    length_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    batch_size = latents.shape[0]
+    if batch_size < 2 or max_pairs <= 0:
+        zero = latents.sum() * 0.0
+        return zero, {
+            "interpolation_loss": zero.detach(),
+            "interpolation_base_entropy": zero.detach(),
+            "interpolation_length_loss": zero.detach(),
+            "interpolation_pairs": zero.detach(),
+        }
+
+    left = torch.arange(batch_size - 1, device=latents.device)
+    right = left + 1
+    same_count = component_counts[left].round() == component_counts[right].round()
+    pair_indices = same_count.nonzero(as_tuple=False).flatten()[:max_pairs]
+    if pair_indices.numel() == 0:
+        zero = latents.sum() * 0.0
+        return zero, {
+            "interpolation_loss": zero.detach(),
+            "interpolation_base_entropy": zero.detach(),
+            "interpolation_length_loss": zero.detach(),
+            "interpolation_pairs": zero.detach(),
+        }
+
+    left = left[pair_indices]
+    right = right[pair_indices]
+    alpha_tensor = torch.tensor(float(alpha), device=latents.device, dtype=latents.dtype)
+    mid_latents = (1.0 - alpha_tensor) * latents[left] + alpha_tensor * latents[right]
+    mid_usage = (1.0 - alpha_tensor) * token_usage[left] + alpha_tensor * token_usage[right]
+    decoded = model.decode(mid_latents, mid_usage, out_len)
+    probs = decoded["soft_dna"].clamp_min(1e-8)
+    base_entropy = -(probs * probs.log()).sum(dim=-1).mean()
+    expected_length = (1.0 - alpha_tensor) * lengths[left] + alpha_tensor * lengths[right]
+    length_loss = F.smooth_l1_loss(decoded["total_len"], expected_length)
+    loss = entropy_weight * base_entropy + length_weight * length_loss
+    return loss, {
+        "interpolation_loss": loss.detach(),
+        "interpolation_base_entropy": base_entropy.detach(),
+        "interpolation_length_loss": length_loss.detach(),
+        "interpolation_pairs": torch.tensor(float(pair_indices.numel()), device=latents.device),
+    }
+
+
 def primitive_supervision_loss(
     rendered: dict[str, torch.Tensor],
     teacher: dict[str, torch.Tensor],
@@ -421,6 +504,47 @@ def loss_for_multitoken_batch(
         max_components=max_components,
     )
     span_assignment = learned_span_assignment_loss(learned, span_weights, component_counts, max_components)
+    open_targets = token_open_targets(
+        component_lengths=component_lengths,
+        component_counts=component_counts,
+        seq_len=target.shape[1],
+        mask=mask,
+        max_components=max_components,
+    )
+    open_loss = token_opening_loss(
+        learned,
+        open_targets,
+        mask,
+        positive_weight=args.token_open_positive_weight,
+    )
+
+    if args.interpolation_weight > 0:
+        interpolation_loss, interpolation_metrics = latent_interpolation_regularization(
+            model=model,
+            latents=mixed_latents,
+            token_usage=mixed_usage,
+            lengths=decoded["total_len"],
+            component_counts=component_counts,
+            out_len=target.shape[1],
+            max_pairs=args.interpolation_pairs,
+            alpha=args.interpolation_alpha,
+            entropy_weight=args.interpolation_entropy_weight,
+            length_weight=args.interpolation_length_weight,
+        )
+    else:
+        with torch.no_grad():
+            interpolation_loss, interpolation_metrics = latent_interpolation_regularization(
+                model=model,
+                latents=mixed_latents.detach(),
+                token_usage=mixed_usage.detach(),
+                lengths=decoded["total_len"].detach(),
+                component_counts=component_counts,
+                out_len=target.shape[1],
+                max_pairs=args.interpolation_pairs if args.report_interpolation else 0,
+                alpha=args.interpolation_alpha,
+                entropy_weight=args.interpolation_entropy_weight,
+                length_weight=args.interpolation_length_weight,
+            )
 
     base_loss = (
         recon_loss
@@ -431,6 +555,8 @@ def loss_for_multitoken_batch(
         + decoder_sharp_weight * decoder_sharp
         + args.latent_l2_weight * latent_l2
         + args.span_assignment_weight * span_assignment
+        + args.token_open_weight * open_loss
+        + args.interpolation_weight * interpolation_loss
     )
     rendered.update(
         {
@@ -443,9 +569,11 @@ def loss_for_multitoken_batch(
             "latent_l2": latent_l2.detach(),
             "token_count": token_count.detach(),
             "span_assignment_loss": span_assignment.detach(),
+            "token_opening_loss": open_loss.detach(),
             "span_mix": torch.tensor(float(span_mix), device=target.device),
             "span_latents": span["latents"].detach(),
             "mixed_latents": mixed_latents.detach(),
+            **interpolation_metrics,
         }
     )
     learned_for_supervision = {**learned, "token_count": token_count}
@@ -632,6 +760,9 @@ def short_status(
             f"zmse {rendered['primitive_latent_mse_loss'].item():.4f} "
             f"bound {rendered['primitive_boundary_loss'].item():.3f} "
             f"span_assign {rendered['span_assignment_loss'].item():.3f} "
+            f"open {rendered['token_opening_loss'].item():.3f} "
+            f"interp {rendered['interpolation_base_entropy'].item():.3f}/"
+            f"{rendered['interpolation_length_loss'].item():.3f} "
             f"tok {rendered['token_count'].mean().item():.2f}/{component_counts.mean().item():.2f} "
             f"out {rendered['total_len'].mean().item():.1f} "
             f"target {lengths.mean().item():.1f}"
@@ -642,7 +773,11 @@ def short_status(
             f"z {val_rendered['primitive_latent_loss'].item():.4f} "
             f"zmse {val_rendered['primitive_latent_mse_loss'].item():.4f} "
             f"bound {val_rendered['primitive_boundary_loss'].item():.3f} "
-            f"span_assign {val_rendered['span_assignment_loss'].item():.3f} token_use "
+            f"span_assign {val_rendered['span_assignment_loss'].item():.3f} "
+            f"open {val_rendered['token_opening_loss'].item():.3f} "
+            f"interp {val_rendered['interpolation_base_entropy'].item():.3f}/"
+            f"{val_rendered['interpolation_length_loss'].item():.3f} "
+            f"token_use "
             f"{', '.join(f'{v:.2f}' for v in val_rendered['token_usage'].mean(dim=0).detach().cpu().tolist())} "
             f"emit_len {', '.join(f'{v:.1f}' for v in val_rendered['lengths'].mean(dim=0).detach().cpu().tolist())} "
             f"out {val_rendered['total_len'].mean().item():.1f}/{val_lengths.mean().item():.1f}"
@@ -799,6 +934,14 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError("This stage is for adaptive token training; set --component-count >= 2")
     if not 0.0 <= args.two_component_prob <= 1.0:
         raise ValueError("--two-component-prob must be in [0, 1]")
+    if args.token_open_weight < 0 or args.token_open_positive_weight < 0:
+        raise ValueError("--token-open-weight and --token-open-positive-weight must be non-negative")
+    if args.interpolation_weight < 0:
+        raise ValueError("--interpolation-weight must be non-negative")
+    if not 0.0 <= args.interpolation_alpha <= 1.0:
+        raise ValueError("--interpolation-alpha must be in [0, 1]")
+    if args.interpolation_pairs < 0:
+        raise ValueError("--interpolation-pairs must be non-negative")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -837,6 +980,11 @@ def train(args: argparse.Namespace) -> None:
     print(
         f"span curriculum: span_force_steps={args.span_force_steps}; "
         f"span_assignment_weight={args.span_assignment_weight}"
+    )
+    print(
+        f"token openings: weight={args.token_open_weight}; pos_weight={args.token_open_positive_weight}; "
+        f"interpolation weight={args.interpolation_weight}; pairs={args.interpolation_pairs}; "
+        f"entropy/length={args.interpolation_entropy_weight}/{args.interpolation_length_weight}"
     )
     print(
         f"init_checkpoint={args.init_checkpoint}; freeze_decoder={args.freeze_primitive_decoder}; "
@@ -1009,6 +1157,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--primitive-boundary-weight", type=float, default=0.5)
     parser.add_argument("--span-force-steps", type=int, default=5_000)
     parser.add_argument("--span-assignment-weight", type=float, default=1.0)
+    parser.add_argument("--token-open-weight", type=float, default=1.0)
+    parser.add_argument("--token-open-positive-weight", type=float, default=8.0)
+    parser.add_argument("--interpolation-weight", type=float, default=0.0)
+    parser.add_argument("--interpolation-alpha", type=float, default=0.5)
+    parser.add_argument("--interpolation-pairs", type=int, default=32)
+    parser.add_argument("--interpolation-entropy-weight", type=float, default=1.0)
+    parser.add_argument("--interpolation-length-weight", type=float, default=0.25)
+    parser.add_argument("--report-interpolation", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--alignment-loss-weight", type=float, default=0.25)
     parser.add_argument("--alignment-mode", choices=("local_window", "dp", "none"), default="local_window")
