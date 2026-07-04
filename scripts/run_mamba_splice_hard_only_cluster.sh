@@ -22,12 +22,14 @@ python scripts/train_mamba_splice_soft_exist.py \
   --layers 6 \
   --chunk-size 64 \
   --headdim 8 \
+  --local-conv-kernel 9 \
   --lr 2e-4 \
   --weight-decay 1e-4 \
-  --positive-weight 300 \
+  --positive-weight 150 \
   --soft-augment-prob 0 \
   --exist-augment-prob 0 \
   --steps 20000 \
   --print-every 100 \
+  --val-batches 8 \
   --device cuda \
-  --checkpoint-dir checkpoints/mamba_splice_hard_only_len2048
+  --checkpoint-dir checkpoints/mamba_splice_bidir_hard_only_len2048

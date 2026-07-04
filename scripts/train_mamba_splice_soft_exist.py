@@ -294,20 +294,69 @@ class OfficialMamba2Block(nn.Module):
         return residual + y
 
 
-class MambaSpliceSoftExistPredictor(nn.Module):
-    def __init__(self, hidden_dim: int, layers: int, chunk_size: int, headdim: int, dropout: float):
+class UniMambaBlock(nn.Module):
+    def __init__(self, hidden_dim: int, chunk_size: int, headdim: int):
         super().__init__()
+        self.block = OfficialMamba2Block(hidden_dim, chunk_size=chunk_size, headdim=headdim)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return self.block(x) * mask[..., None]
+
+
+class BiMambaBlock(nn.Module):
+    def __init__(self, hidden_dim: int, chunk_size: int, headdim: int):
+        super().__init__()
+        self.fwd = OfficialMamba2Block(hidden_dim, chunk_size=chunk_size, headdim=headdim)
+        self.rev = OfficialMamba2Block(hidden_dim, chunk_size=chunk_size, headdim=headdim)
+        self.mix = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        yf = self.fwd(x)
+        yr = torch.flip(self.rev(torch.flip(x, dims=[1])), dims=[1])
+        return self.mix(torch.cat([yf, yr], dim=-1)) * mask[..., None]
+
+
+class MambaSpliceSoftExistPredictor(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        layers: int,
+        chunk_size: int,
+        headdim: int,
+        dropout: float,
+        bidirectional: bool,
+        local_conv_kernel: int,
+    ):
+        super().__init__()
+        if local_conv_kernel > 0 and local_conv_kernel % 2 == 0:
+            raise ValueError("--local-conv-kernel must be odd, or 0 to disable the local path.")
         self.input_projection = nn.Sequential(
             nn.Linear(6, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        block_cls = BiMambaBlock if bidirectional else UniMambaBlock
         self.blocks = nn.ModuleList(
-            [OfficialMamba2Block(hidden_dim, chunk_size=chunk_size, headdim=headdim) for _ in range(layers)]
+            [block_cls(hidden_dim, chunk_size=chunk_size, headdim=headdim) for _ in range(layers)]
         )
+        if local_conv_kernel > 0:
+            padding = local_conv_kernel // 2
+            self.local = nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=local_conv_kernel, padding=padding),
+                nn.GELU(),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=local_conv_kernel, padding=padding),
+                nn.GELU(),
+            )
+        else:
+            self.local = None
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden_dim, len(TRACK_NAMES))
+        self.donor_head = nn.Linear(hidden_dim, 1)
+        self.acceptor_head = nn.Linear(hidden_dim, 1)
 
     def forward(self, dna_probs: torch.Tensor, existence: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         effective_pos = torch.cumsum(existence * mask, dim=1)
@@ -323,29 +372,47 @@ class MambaSpliceSoftExistPredictor(nn.Module):
         x = self.input_projection(features)
         x = x * mask[..., None]
         for block in self.blocks:
-            x = block(x) * mask[..., None]
-        return self.head(self.dropout(self.norm(x)))
+            x = block(x, mask)
+        if self.local is not None:
+            x = x + self.local(x.transpose(1, 2)).transpose(1, 2) * mask[..., None]
+        x = self.dropout(self.norm(x))
+        donor = self.donor_head(x)
+        acceptor = self.acceptor_head(x)
+        return torch.cat([donor, acceptor], dim=-1)
 
 
-def make_batch(args: argparse.Namespace, sampler: GtfSpliceWindowSampler, device: torch.device, step: int) -> tuple[torch.Tensor, torch.Tensor]:
+def make_batch(
+    args: argparse.Namespace,
+    sampler: GtfSpliceWindowSampler,
+    device: torch.device,
+    step: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
     rng = random.Random(args.seed + step)
+    sequences = []
     dna_rows = []
     label_rows = []
     for _ in range(args.batch_size):
         sequence, labels = sampler.sample(rng)
+        sequences.append(sequence)
         dna_rows.append(one_hot_sequence(sequence, device))
         label_rows.append(labels.to(device))
-    return torch.stack(dna_rows), torch.stack(label_rows)
+    return torch.stack(dna_rows), torch.stack(label_rows), sequences
 
 
-def prepare_input(args: argparse.Namespace, dna: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, bool]]:
-    soft_augmented = random.random() < args.soft_augment_prob
+def prepare_input(
+    args: argparse.Namespace,
+    dna: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    allow_augment: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, bool]]:
+    soft_augmented = allow_augment and random.random() < args.soft_augment_prob
     exist_augmented = False
     if soft_augmented:
         dna = soften_one_hot(dna, args.soft_eps_min, args.soft_eps_max, args.soft_logit_noise_std, args.soft_temperature)
     existence = torch.ones(dna.shape[:2], dtype=dna.dtype, device=dna.device)
     mask = torch.ones_like(existence)
-    if args.junk_slots_per_base > 0 and random.random() < args.exist_augment_prob:
+    if allow_augment and args.junk_slots_per_base > 0 and random.random() < args.exist_augment_prob:
         exist_augmented = True
         max_length = dna.shape[1] * (1 + args.junk_slots_per_base)
         dna, labels, existence, mask = add_existence_junk(
@@ -411,6 +478,99 @@ def metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> d
     }
 
 
+@torch.no_grad()
+def motif_sanity(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor,
+    sequences: list[str],
+) -> dict[str, float]:
+    probs = torch.sigmoid(logits)
+    out: dict[str, float] = {}
+    for channel, prefix, motif_side, motif in (
+        (DONOR, "don", "right", "GT"),
+        (ACCEPTOR, "acc", "left", "AG"),
+    ):
+        valid = mask.reshape(-1) > 0
+        channel_probs = probs[..., channel].reshape(-1)
+        channel_true = (labels[..., channel].reshape(-1) >= 0.5) & valid
+        true_count = int(channel_true.sum().item())
+        if true_count <= 0:
+            out[f"{prefix}_top_motif"] = 0.0
+            out[f"{prefix}_true_motif"] = 0.0
+            continue
+        masked_probs = channel_probs.masked_fill(~valid, -1.0)
+        top_indices = masked_probs.topk(k=min(true_count, int(valid.sum().item())), largest=True).indices.cpu().tolist()
+        true_indices = torch.nonzero(channel_true, as_tuple=False).flatten().cpu().tolist()
+
+        def motif_fraction(flat_indices: list[int]) -> float:
+            hits = 0
+            total = 0
+            length = labels.shape[1]
+            for flat in flat_indices:
+                row = flat // length
+                pos = flat % length
+                if row >= len(sequences):
+                    continue
+                sequence = sequences[row]
+                if motif_side == "right":
+                    if pos + 2 >= len(sequence):
+                        continue
+                    context = sequence[pos + 1 : pos + 3]
+                else:
+                    if pos - 2 < 0:
+                        continue
+                    context = sequence[pos - 2 : pos]
+                total += 1
+                hits += int(context == motif)
+            return hits / max(1, total)
+
+        out[f"{prefix}_top_motif"] = motif_fraction(top_indices)
+        out[f"{prefix}_true_motif"] = motif_fraction(true_indices)
+    return out
+
+
+@torch.no_grad()
+def evaluate(
+    args: argparse.Namespace,
+    model: nn.Module,
+    sampler: GtfSpliceWindowSampler,
+    device: torch.device,
+) -> tuple[float, dict[str, float], dict[str, float], int, float, dict[str, bool]]:
+    logits_rows = []
+    label_rows = []
+    mask_rows = []
+    exist_means = []
+    sequences: list[str] = []
+    losses = []
+    val_aug = {"soft": False, "exist": False}
+    for batch_index in range(args.val_batches):
+        val_dna, val_labels, val_sequences = make_batch(args, sampler, device, 100_000 + batch_index)
+        val_dna_in, val_labels_in, val_exist, val_mask, batch_aug = prepare_input(
+            args,
+            val_dna,
+            val_labels,
+            allow_augment=args.val_augment,
+        )
+        val_logits = model(val_dna_in, val_exist, val_mask)
+        losses.append(splice_loss(val_logits, val_labels_in, val_mask, args.positive_weight))
+        logits_rows.append(val_logits)
+        label_rows.append(val_labels_in)
+        mask_rows.append(val_mask)
+        exist_means.append(val_exist.sum(dim=1).mean())
+        sequences.extend(val_sequences)
+        val_aug["soft"] = val_aug["soft"] or batch_aug["soft"]
+        val_aug["exist"] = val_aug["exist"] or batch_aug["exist"]
+    logits = torch.cat(logits_rows, dim=0)
+    labels = torch.cat(label_rows, dim=0)
+    mask = torch.cat(mask_rows, dim=0)
+    val_loss = torch.stack(losses).mean()
+    val_metrics = metrics(logits, labels, mask)
+    val_motifs = motif_sanity(logits, labels, mask, sequences)
+    exist_sum = float(torch.stack(exist_means).mean().item())
+    return float(val_loss.item()), val_metrics, val_motifs, logits.shape[1], exist_sum, val_aug
+
+
 def save_checkpoint(path: Path, model: nn.Module, args: argparse.Namespace, step: int, val_loss: float, val_metrics: dict[str, float]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -448,6 +608,8 @@ def train(args: argparse.Namespace) -> None:
         chunk_size=args.chunk_size,
         headdim=args.headdim,
         dropout=args.dropout,
+        bidirectional=not args.unidirectional,
+        local_conv_kernel=args.local_conv_kernel,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -456,7 +618,8 @@ def train(args: argparse.Namespace) -> None:
     print("Mamba splice predictor with soft DNA + existence inputs")
     print(
         f"device={device}; seq_len={args.seq_len}; batch={args.batch_size}; hidden={args.hidden_dim}; "
-        f"layers={args.layers}; params={sum(p.numel() for p in model.parameters())}"
+        f"layers={args.layers}; bidirectional={not args.unidirectional}; local_kernel={args.local_conv_kernel}; "
+        f"val_batches={args.val_batches}; params={sum(p.numel() for p in model.parameters())}"
     )
     print(
         f"soft_prob={args.soft_augment_prob}; exist_prob={args.exist_augment_prob}; "
@@ -465,8 +628,8 @@ def train(args: argparse.Namespace) -> None:
 
     for step in range(args.steps):
         model.train()
-        dna, labels = make_batch(args, sampler, device, step)
-        dna_in, labels_in, existence, mask, train_aug = prepare_input(args, dna, labels)
+        dna, labels, _train_sequences = make_batch(args, sampler, device, step)
+        dna_in, labels_in, existence, mask, train_aug = prepare_input(args, dna, labels, allow_augment=True)
         logits = model(dna_in, existence, mask)
         loss = splice_loss(logits, labels_in, mask, args.positive_weight)
         optimizer.zero_grad(set_to_none=True)
@@ -477,16 +640,17 @@ def train(args: argparse.Namespace) -> None:
         if step % args.print_every == 0 or step == args.steps - 1:
             model.eval()
             with torch.no_grad():
-                val_dna, val_labels = make_batch(args, sampler, device, 100_000 + step)
-                val_dna_in, val_labels_in, val_exist, val_mask, val_aug = prepare_input(args, val_dna, val_labels)
-                val_logits = model(val_dna_in, val_exist, val_mask)
-                val_loss = splice_loss(val_logits, val_labels_in, val_mask, args.positive_weight)
-                val_metrics = metrics(val_logits, val_labels_in, val_mask)
-            if val_loss.item() < best_loss:
-                best_loss = float(val_loss.item())
+                val_loss, val_metrics, val_motifs, val_input_len, val_exist_sum, val_aug = evaluate(
+                    args,
+                    model,
+                    sampler,
+                    device,
+                )
+            if val_loss < best_loss:
+                best_loss = val_loss
                 save_checkpoint(checkpoint_dir / "best.pt", model, args, step, best_loss, val_metrics)
             print(
-                f"\nstep {step:06d} loss {loss.item():.4f} val {val_loss.item():.4f} best {best_loss:.4f} "
+                f"\nstep {step:06d} loss {loss.item():.4f} val {val_loss:.4f} best {best_loss:.4f} "
                 f"topK donor/acceptor {val_metrics['don_topk']:.3f}/{val_metrics['acc_topk']:.3f} "
                 f"top2Krec {val_metrics['don_top2k_rec']:.3f}/{val_metrics['acc_top2k_rec']:.3f}"
             )
@@ -496,9 +660,15 @@ def train(args: argparse.Namespace) -> None:
                 f"true sites donor/acceptor {val_metrics['don_true_n']:.0f}/{val_metrics['acc_true_n']:.0f}"
             )
             print(
+                f"motif sanity topK donor_GT/acceptor_AG "
+                f"{val_motifs['don_top_motif']:.3f}/{val_motifs['acc_top_motif']:.3f} "
+                f"| true donor_GT/acceptor_AG "
+                f"{val_motifs['don_true_motif']:.3f}/{val_motifs['acc_true_motif']:.3f}"
+            )
+            print(
                 f"peaks pred/true {val_metrics['peak_pred']:.3f}/{val_metrics['peak_true']:.3f} "
-                f"mean_prob {val_metrics['mean_prob']:.5f} input_len {val_dna_in.shape[1]} "
-                f"exist_sum {val_exist.sum(dim=1).mean().item():.1f} "
+                f"mean_prob {val_metrics['mean_prob']:.5f} input_len {val_input_len} "
+                f"exist_sum {val_exist_sum:.1f} "
                 f"aug train soft/exist {int(train_aug['soft'])}/{int(train_aug['exist'])} "
                 f"val {int(val_aug['soft'])}/{int(val_aug['exist'])}"
             )
@@ -524,11 +694,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=6)
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--headdim", type=int, default=8)
+    parser.add_argument("--unidirectional", action="store_true", help="Use the old left-to-right-only Mamba stack.")
+    parser.add_argument("--local-conv-kernel", type=int, default=9, help="Odd kernel size for a centered local conv residual path. Use 0 to disable.")
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--positive-weight", type=float, default=300.0)
+    parser.add_argument("--positive-weight", type=float, default=150.0)
 
     parser.add_argument("--soft-augment-prob", type=float, default=0.0)
     parser.add_argument("--soft-eps-min", type=float, default=0.01)
@@ -541,6 +713,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--steps", type=int, default=20_000)
     parser.add_argument("--print-every", type=int, default=100)
+    parser.add_argument("--val-batches", type=int, default=8, help="Fixed validation batches to average at each report.")
+    parser.add_argument("--val-augment", action="store_true", help="Apply soft/existence augmentation during validation too.")
     parser.add_argument("--checkpoint-dir", default="checkpoints/mamba_splice_soft_exist")
     return parser.parse_args()
 
