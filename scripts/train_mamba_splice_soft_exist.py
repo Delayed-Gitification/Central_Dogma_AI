@@ -84,12 +84,16 @@ class GtfSpliceWindowSampler:
         max_sites: int,
         min_non_n_frac: float,
         seed: int,
+        offset_min_frac: float = 1.0 / 3.0,
+        offset_max_frac: float = 2.0 / 3.0,
     ):
         import pyfastx  # noqa: PLC0415
 
         self.fasta = pyfastx.Fasta(str(Path(fasta_path).expanduser()))
         self.seq_len = seq_len
         self.min_non_n_frac = min_non_n_frac
+        self.offset_min_frac = offset_min_frac
+        self.offset_max_frac = offset_max_frac
         available_chroms = set(self.fasta.keys())
         if chroms is None:
             chroms = available_chroms
@@ -176,7 +180,11 @@ class GtfSpliceWindowSampler:
         for _attempt in range(200):
             chrom, centre, _label, strand = rng.choice(self.records)
             chrom_len = len(self.fasta[chrom])
-            offset = rng.randint(self.seq_len // 3, (2 * self.seq_len) // 3)
+            offset_min = int(round(self.seq_len * self.offset_min_frac))
+            offset_max = int(round(self.seq_len * self.offset_max_frac))
+            offset_min = min(max(0, offset_min), self.seq_len)
+            offset_max = min(max(offset_min, offset_max), self.seq_len)
+            offset = rng.randint(offset_min, offset_max)
             start = min(max(0, centre - offset), max(0, chrom_len - self.seq_len))
             end = start + self.seq_len
             sequence = self.fasta[chrom][start:end].seq.upper().replace("U", "T")

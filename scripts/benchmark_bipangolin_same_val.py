@@ -62,15 +62,24 @@ def benchmark(args: argparse.Namespace) -> None:
     device = pick_device(args.device)
     chroms = parse_chroms(args.chroms)
     strands = {part.strip() for part in args.strands.split(",") if part.strip()}
+    context_len = args.context_len if args.context_len > 0 else args.seq_len + 2 * args.context_flank
+    if context_len < args.seq_len:
+        raise ValueError(f"--context-len must be >= --seq-len, got {context_len} < {args.seq_len}")
+    roi_start = (context_len - args.seq_len) // 2
+    roi_end = roi_start + args.seq_len
+    offset_min_frac = roi_start / float(context_len)
+    offset_max_frac = max(roi_start, roi_end - 1) / float(context_len)
     sampler = GtfSpliceWindowSampler(
         fasta_path=args.fasta,
         gtf_path=args.gtf,
-        seq_len=args.seq_len,
+        seq_len=context_len,
         chroms=chroms,
         strands=strands,
         max_sites=args.max_sites,
         min_non_n_frac=args.min_non_n_frac,
         seed=args.seed,
+        offset_min_frac=offset_min_frac,
+        offset_max_frac=offset_max_frac,
     )
     runner = build_runner(args, device)
 
@@ -81,7 +90,8 @@ def benchmark(args: argparse.Namespace) -> None:
 
     print("biPangolin exact-validation benchmark")
     print(
-        f"device={device}; seq_len={args.seq_len}; batch={args.batch_size}; "
+        f"device={device}; roi_len={args.seq_len}; context_len={context_len}; "
+        f"crop={roi_start}:{roi_end}; batch={args.batch_size}; "
         f"val_batches={args.val_batches}; score_source={args.score_source}"
     )
     print(
@@ -92,10 +102,13 @@ def benchmark(args: argparse.Namespace) -> None:
     for batch_index in range(args.val_batches):
         _dna, labels, sequences = make_batch(args, sampler, torch.device("cpu"), 100_000 + batch_index)
         probs = score_batch_with_bipangolin(runner, sequences, args.score_source).cpu()
+        probs = probs[:, roi_start:roi_end]
+        labels = labels[:, roi_start:roi_end]
+        roi_sequences = [sequence[roi_start:roi_end] for sequence in sequences]
         logits_rows.append(probs_to_logits(probs))
         label_rows.append(labels.cpu())
         mask_rows.append(torch.ones(labels.shape[:2], dtype=torch.float32))
-        sequences_all.extend(sequences)
+        sequences_all.extend(roi_sequences)
         print(f"scored val batch {batch_index + 1}/{args.val_batches}")
 
     logits = torch.cat(logits_rows, dim=0)
@@ -123,7 +136,7 @@ def benchmark(args: argparse.Namespace) -> None:
     )
     print(
         f"peaks pred/true {val_metrics['peak_pred']:.3f}/{val_metrics['peak_true']:.3f} "
-        f"mean_prob {val_metrics['mean_prob']:.5f} input_len {args.seq_len} "
+        f"mean_prob {val_metrics['mean_prob']:.5f} input_len {context_len} roi_len {args.seq_len} "
         f"exist_sum {float(args.seq_len):.1f} aug train soft/exist 0/0 val 0/0"
     )
 
@@ -136,7 +149,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strands", default="+,-")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--seq-len", type=int, default=2048)
+    parser.add_argument("--seq-len", type=int, default=2048, help="Central ROI length used for labels/metrics after cropping.")
+    parser.add_argument("--context-flank", type=int, default=5000, help="Real genomic flank on each side of the ROI for biPangolin scoring.")
+    parser.add_argument("--context-len", type=int, default=0, help="Override total scored sequence length. Default: seq_len + 2*context_flank.")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--val-batches", type=int, default=8)
     parser.add_argument("--max-sites", type=int, default=300_000)
