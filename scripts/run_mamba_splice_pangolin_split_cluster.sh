@@ -17,17 +17,17 @@ python scripts/train_mamba_splice_soft_exist.py \
   --val-chroms chr1,chr3,chr5,chr7,chr9 \
   --seq-len 15000 \
   --target-length 5000 \
-  --batch-size 2 \
+  --batch-size 4 \
   --hidden-dim 96 \
   --layers 6 \
   --chunk-size 64 \
   --headdim 8 \
   --local-conv-kernel 9 \
-  --optimizer adam \
-  --lr 1e-3 \
-  --weight-decay 0 \
-  --grad-clip 0 \
-  --positive-weight 150 \
+  --optimizer adamw \
+  --lr 2e-4 \
+  --weight-decay 1e-4 \
+  --grad-clip 1 \
+  --positive-weight 500 \
   --lr-milestones 6,7,8,9 \
   --lr-gamma 0.5 \
   --soft-augment-prob 0 \
@@ -38,4 +38,4 @@ python scripts/train_mamba_splice_soft_exist.py \
   --print-every 100 \
   --val-batches 8 \
   --device cuda \
-  --checkpoint-dir checkpoints/mamba_splice_pangolin_split_len15000_target5000_h96_l6_sharedhead_pos150
+  --checkpoint-dir checkpoints/mamba_splice_pangolin_split_len15000_target5000_h96_l6_sharedhead_pos500_adamw
