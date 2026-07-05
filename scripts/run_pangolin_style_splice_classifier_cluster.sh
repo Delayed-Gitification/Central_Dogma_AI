@@ -4,8 +4,8 @@ set -euo pipefail
 python scripts/train_pangolin_style_splice_classifier.py \
   --fasta /camp/home/wilkino/home/POSTDOC/software/biPangolin/data/GRCh38.primary_assembly.genome.fa \
   --gtf /camp/home/wilkino/home/POSTDOC/software/biPangolin/data/gencode.v47.basic.annotation.gtf \
-  --train-chroms chr2,chr4,chr6,chr8,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19 \
-  --val-chroms chr20,chr21,chr22 \
+  --train-chroms chr2,chr4,chr6,chr8,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22,chrX,chrY \
+  --val-chroms chr1,chr3,chr5,chr7,chr9 \
   --seq-len 15000 \
   --batch-size 8 \
   --channels 32 \
@@ -26,4 +26,4 @@ python scripts/train_pangolin_style_splice_classifier.py \
   --print-every 100 \
   --val-batches 8 \
   --device cuda \
-  --checkpoint-dir checkpoints/pangolin_style_splice_classifier_spliceai_trainstyle_len15000_ch32
+  --checkpoint-dir checkpoints/pangolin_style_splice_classifier_pangolin_split_len15000_ch32
