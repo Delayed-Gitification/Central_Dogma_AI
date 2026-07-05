@@ -4,20 +4,26 @@ set -euo pipefail
 python scripts/train_pangolin_style_splice_classifier.py \
   --fasta /camp/home/wilkino/home/POSTDOC/software/biPangolin/data/GRCh38.primary_assembly.genome.fa \
   --gtf /camp/home/wilkino/home/POSTDOC/software/biPangolin/data/gencode.v47.basic.annotation.gtf \
-  --chroms chr2,chr4,chr6,chr8,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19,chr20,chr21,chr22 \
-  --seq-len 20000 \
+  --train-chroms chr2,chr4,chr6,chr8,chr10,chr11,chr12,chr13,chr14,chr15,chr16,chr17,chr18,chr19 \
+  --val-chroms chr20,chr21,chr22 \
+  --seq-len 15000 \
   --batch-size 8 \
   --channels 64 \
-  --lr 2e-4 \
-  --weight-decay 1e-4 \
-  --positive-weight 100 \
+  --optimizer adam \
+  --lr 1e-3 \
+  --weight-decay 0 \
+  --grad-clip 0 \
+  --positive-weight 1 \
   --none-weight 1 \
-  --site-prior 0.001 \
+  --site-prior 0.3333333333333333 \
+  --lr-milestones 6,7,8,9 \
+  --lr-gamma 0.5 \
   --soft-augment-prob 0 \
   --exist-augment-prob 0 \
   --junk-slots-per-base 0 \
-  --steps 20000 \
+  --epochs 10 \
+  --steps-per-epoch 1000 \
   --print-every 100 \
   --val-batches 8 \
   --device cuda \
-  --checkpoint-dir checkpoints/pangolin_style_splice_classifier_len20000_ch64
+  --checkpoint-dir checkpoints/pangolin_style_splice_classifier_spliceai_trainstyle_len15000_ch64
