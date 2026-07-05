@@ -8,7 +8,7 @@ python scripts/train_pangolin_style_splice_classifier.py \
   --val-chroms chr20,chr21,chr22 \
   --seq-len 15000 \
   --batch-size 8 \
-  --channels 64 \
+  --channels 32 \
   --optimizer adam \
   --lr 1e-3 \
   --weight-decay 0 \
@@ -26,4 +26,4 @@ python scripts/train_pangolin_style_splice_classifier.py \
   --print-every 100 \
   --val-batches 8 \
   --device cuda \
-  --checkpoint-dir checkpoints/pangolin_style_splice_classifier_spliceai_trainstyle_len15000_ch64
+  --checkpoint-dir checkpoints/pangolin_style_splice_classifier_spliceai_trainstyle_len15000_ch32

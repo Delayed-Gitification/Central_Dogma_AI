@@ -438,7 +438,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sites", type=int, default=300_000)
     parser.add_argument("--min-non-n-frac", type=float, default=0.95)
 
-    parser.add_argument("--channels", type=int, default=64)
+    parser.add_argument("--channels", type=int, default=32)
     parser.add_argument("--kernels", default=",".join(str(value) for value in DEFAULT_W))
     parser.add_argument("--atrous-rates", default=",".join(str(value) for value in DEFAULT_AR))
     parser.add_argument("--dropout", type=float, default=0.05)
