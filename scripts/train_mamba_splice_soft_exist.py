@@ -84,6 +84,7 @@ class GtfSpliceWindowSampler:
         max_sites: int,
         min_non_n_frac: float,
         seed: int,
+        canonical_only: bool = False,
         offset_min_frac: float = 1.0 / 3.0,
         offset_max_frac: float = 2.0 / 3.0,
     ):
@@ -92,6 +93,7 @@ class GtfSpliceWindowSampler:
         self.fasta = pyfastx.Fasta(str(Path(fasta_path).expanduser()))
         self.seq_len = seq_len
         self.min_non_n_frac = min_non_n_frac
+        self.canonical_only = canonical_only
         self.offset_min_frac = offset_min_frac
         self.offset_max_frac = offset_max_frac
         available_chroms = set(self.fasta.keys())
@@ -127,6 +129,8 @@ class GtfSpliceWindowSampler:
         records: list[tuple[str, int, int, str]] = []
         skipped_tss = 0
         skipped_tts = 0
+        skipped_noncanonical = {DONOR: 0, ACCEPTOR: 0}
+        kept_canonical = {DONOR: 0, ACCEPTOR: 0}
         for (chrom, _transcript_id, strand), exons in transcript_exons.items():
             if len(exons) < 2:
                 continue
@@ -141,11 +145,19 @@ class GtfSpliceWindowSampler:
                 is_first = index == 0
                 is_last = index == len(exons_sorted) - 1
                 if not is_first:
-                    self._add_site(chrom, acceptor_pos, ACCEPTOR, records, strand)
+                    if self._keep_site(chrom, acceptor_pos, ACCEPTOR, strand):
+                        kept_canonical[ACCEPTOR] += int(self.canonical_only)
+                        self._add_site(chrom, acceptor_pos, ACCEPTOR, records, strand)
+                    else:
+                        skipped_noncanonical[ACCEPTOR] += 1
                 else:
                     skipped_tss += 1
                 if not is_last:
-                    self._add_site(chrom, donor_pos, DONOR, records, strand)
+                    if self._keep_site(chrom, donor_pos, DONOR, strand):
+                        kept_canonical[DONOR] += int(self.canonical_only)
+                        self._add_site(chrom, donor_pos, DONOR, records, strand)
+                    else:
+                        skipped_noncanonical[DONOR] += 1
                 else:
                     skipped_tts += 1
 
@@ -162,6 +174,37 @@ class GtfSpliceWindowSampler:
             f"{sum(len(v) for v in self.sites_by_chrom_strand.values()):,} unique strand-specific clean sites; "
             f"chroms={len(site_chroms)}; skipped TSS/TTS {skipped_tss:,}/{skipped_tts:,}"
         )
+        if self.canonical_only:
+            print(
+                "canonical filter: "
+                f"kept donor/acceptor {kept_canonical[DONOR]:,}/{kept_canonical[ACCEPTOR]:,}; "
+                f"skipped noncanonical donor/acceptor "
+                f"{skipped_noncanonical[DONOR]:,}/{skipped_noncanonical[ACCEPTOR]:,}"
+            )
+
+    def _genomic_slice(self, chrom: str, start: int, end: int) -> str:
+        if start < 0 or end > len(self.fasta[chrom]) or start >= end:
+            return ""
+        return self.fasta[chrom][start:end].seq.upper().replace("U", "T")
+
+    def _canonical_motif(self, chrom: str, position: int, label: int, strand: str) -> str:
+        if strand == "+":
+            if label == DONOR:
+                return self._genomic_slice(chrom, position + 1, position + 3)
+            return self._genomic_slice(chrom, position - 2, position)
+        if label == DONOR:
+            return self._genomic_slice(chrom, position - 2, position)
+        return self._genomic_slice(chrom, position + 1, position + 3)
+
+    def _keep_site(self, chrom: str, position: int, label: int, strand: str) -> bool:
+        if not self.canonical_only:
+            return True
+        motif = self._canonical_motif(chrom, position, label, strand)
+        if strand == "+":
+            expected = "GT" if label == DONOR else "AG"
+        else:
+            expected = "AC" if label == DONOR else "CT"
+        return motif == expected
 
     def _add_site(
         self,

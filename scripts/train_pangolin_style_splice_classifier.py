@@ -294,6 +294,7 @@ def train(args: argparse.Namespace) -> None:
         max_sites=args.max_sites,
         min_non_n_frac=args.min_non_n_frac,
         seed=args.seed,
+        canonical_only=not args.allow_noncanonical_sites,
     )
     val_sampler = GtfSpliceWindowSampler(
         fasta_path=args.fasta,
@@ -304,6 +305,7 @@ def train(args: argparse.Namespace) -> None:
         max_sites=args.max_sites,
         min_non_n_frac=args.min_non_n_frac,
         seed=args.seed + 10_000,
+        canonical_only=not args.allow_noncanonical_sites,
     )
     model = PangolinStyleSpliceClassifier(
         channels=args.channels,
@@ -392,7 +394,7 @@ def train(args: argparse.Namespace) -> None:
                 best_loss = val_loss
                 save_checkpoint(checkpoint_dir / "best.pt", model, args, step, best_loss, val_metrics)
             print(
-                f"\nstep {step:06d} epoch {epoch + 1:02d}.{step_in_epoch:04d} "
+                f"\nstep {step:06d} epoch {epoch + 1:02d} step {step_in_epoch:04d}/{args.steps_per_epoch} "
                 f"lr {optimizer.param_groups[0]['lr']:.2e} loss {loss.item():.4f} "
                 f"val {val_loss:.4f} best {best_loss:.4f} "
                 f"topK donor/acceptor {val_metrics['don_topk']:.3f}/{val_metrics['acc_topk']:.3f} "
@@ -437,6 +439,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-sites", type=int, default=300_000)
     parser.add_argument("--min-non-n-frac", type=float, default=0.95)
+    parser.add_argument("--allow-noncanonical-sites", action="store_true")
 
     parser.add_argument("--channels", type=int, default=32)
     parser.add_argument("--kernels", default=",".join(str(value) for value in DEFAULT_W))
