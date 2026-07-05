@@ -404,8 +404,10 @@ class MambaSpliceSoftExistPredictor(nn.Module):
         dropout: float,
         bidirectional: bool,
         local_conv_kernel: int,
+        split_output_heads: bool,
     ):
         super().__init__()
+        self.split_output_heads = split_output_heads
         if local_conv_kernel > 0 and local_conv_kernel % 2 == 0:
             raise ValueError("--local-conv-kernel must be odd, or 0 to disable the local path.")
         self.input_projection = nn.Sequential(
@@ -429,8 +431,14 @@ class MambaSpliceSoftExistPredictor(nn.Module):
             self.local = None
         self.norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
-        self.donor_head = nn.Linear(hidden_dim, 1)
-        self.acceptor_head = nn.Linear(hidden_dim, 1)
+        if split_output_heads:
+            self.donor_head = nn.Linear(hidden_dim, 1)
+            self.acceptor_head = nn.Linear(hidden_dim, 1)
+            self.output_head = None
+        else:
+            self.output_head = nn.Linear(hidden_dim, len(TRACK_NAMES))
+            self.donor_head = None
+            self.acceptor_head = None
 
     def forward(self, dna_probs: torch.Tensor, existence: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         effective_pos = torch.cumsum(existence * mask, dim=1)
@@ -450,6 +458,8 @@ class MambaSpliceSoftExistPredictor(nn.Module):
         if self.local is not None:
             x = x + self.local(x.transpose(1, 2)).transpose(1, 2) * mask[..., None]
         x = self.dropout(self.norm(x))
+        if self.output_head is not None:
+            return self.output_head(x)
         donor = self.donor_head(x)
         acceptor = self.acceptor_head(x)
         return torch.cat([donor, acceptor], dim=-1)
@@ -752,6 +762,7 @@ def train(args: argparse.Namespace) -> None:
         dropout=args.dropout,
         bidirectional=not args.unidirectional,
         local_conv_kernel=args.local_conv_kernel,
+        split_output_heads=args.split_output_heads,
     ).to(device)
     if args.optimizer == "adam":
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -783,6 +794,7 @@ def train(args: argparse.Namespace) -> None:
         f"device={device}; seq_len={args.seq_len}; target_len={args.target_length}; "
         f"batch={args.batch_size}; hidden={args.hidden_dim}; "
         f"layers={args.layers}; bidirectional={not args.unidirectional}; local_kernel={args.local_conv_kernel}; "
+        f"split_heads={args.split_output_heads}; "
         f"val_batches={args.val_batches}; params={sum(p.numel() for p in model.parameters())}"
     )
     print(
@@ -885,6 +897,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headdim", type=int, default=8)
     parser.add_argument("--unidirectional", action="store_true", help="Use the old left-to-right-only Mamba stack.")
     parser.add_argument("--local-conv-kernel", type=int, default=9, help="Odd kernel size for a centered local conv residual path. Use 0 to disable.")
+    parser.add_argument("--split-output-heads", action="store_true", help="Use separate donor/acceptor output heads instead of one shared 2-channel head.")
     parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--optimizer", choices=("adam", "adamw"), default="adam")
     parser.add_argument("--lr", type=float, default=1e-3)
