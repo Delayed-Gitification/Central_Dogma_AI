@@ -123,7 +123,7 @@ class GtfSpliceWindowSampler:
                 if line_count % 1_000_000 == 0:
                     print(f"parsed {line_count:,} GTF lines, kept {exon_count:,} exons")
 
-        self.sites_by_chrom: dict[str, dict[int, int]] = {}
+        self.sites_by_chrom_strand: dict[tuple[str, str], dict[int, int]] = {}
         records: list[tuple[str, int, int, str]] = []
         skipped_tss = 0
         skipped_tts = 0
@@ -155,11 +155,12 @@ class GtfSpliceWindowSampler:
             rng = random.Random(seed)
             records = rng.sample(records, max_sites)
         self.records = records
-        self.sorted_sites = {chrom: sorted(sites.keys()) for chrom, sites in self.sites_by_chrom.items()}
+        self.sorted_sites = {key: sorted(sites.keys()) for key, sites in self.sites_by_chrom_strand.items()}
+        site_chroms = {chrom for chrom, _strand in self.sites_by_chrom_strand}
         print(
             f"GTF windows: {len(self.records):,} site-centred records; "
-            f"{sum(len(v) for v in self.sites_by_chrom.values()):,} unique clean sites; "
-            f"chroms={len(self.sites_by_chrom)}; skipped TSS/TTS {skipped_tss:,}/{skipped_tts:,}"
+            f"{sum(len(v) for v in self.sites_by_chrom_strand.values()):,} unique strand-specific clean sites; "
+            f"chroms={len(site_chroms)}; skipped TSS/TTS {skipped_tss:,}/{skipped_tts:,}"
         )
 
     def _add_site(
@@ -170,7 +171,7 @@ class GtfSpliceWindowSampler:
         records: list[tuple[str, int, int, str]],
         strand: str,
     ) -> None:
-        sites = self.sites_by_chrom.setdefault(chrom, {})
+        sites = self.sites_by_chrom_strand.setdefault((chrom, strand), {})
         previous = sites.get(position)
         if previous is None or previous == label:
             sites[position] = label
@@ -193,8 +194,9 @@ class GtfSpliceWindowSampler:
                 continue
 
             labels = torch.zeros(self.seq_len, len(TRACK_NAMES), dtype=torch.float32)
-            site_positions = self.sorted_sites.get(chrom, [])
-            site_labels = self.sites_by_chrom.get(chrom, {})
+            site_key = (chrom, strand)
+            site_positions = self.sorted_sites.get(site_key, [])
+            site_labels = self.sites_by_chrom_strand.get(site_key, {})
             lo = bisect_left(site_positions, start)
             hi = bisect_right(site_positions, end - 1)
             for pos in site_positions[lo:hi]:
