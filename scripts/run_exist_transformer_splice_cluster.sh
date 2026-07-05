@@ -17,11 +17,11 @@ python scripts/train_exist_transformer_splice.py \
   --relative-buckets 32 \
   --relative-bucket-size 16 \
   --head-kernel 9 \
-  --optimizer adam \
-  --lr 1e-3 \
-  --weight-decay 0 \
-  --grad-clip 0 \
-  --positive-weight 1 \
+  --optimizer adamw \
+  --lr 2e-4 \
+  --weight-decay 1e-4 \
+  --grad-clip 1 \
+  --positive-weight 100 \
   --none-weight 1 \
   --lr-milestones 6,7,8,9 \
   --lr-gamma 0.5 \
@@ -33,4 +33,4 @@ python scripts/train_exist_transformer_splice.py \
   --print-every 100 \
   --val-batches 8 \
   --device cuda \
-  --checkpoint-dir checkpoints/exist_transformer_splice_pangolin_split_len2048_h128_l4_fullattn
+  --checkpoint-dir checkpoints/exist_transformer_splice_pangolin_split_len2048_h128_l4_fullattn_pos100_adamw
