@@ -27,7 +27,7 @@ python scripts/train_mamba_splice_soft_exist.py \
   --lr 1e-3 \
   --weight-decay 0 \
   --grad-clip 0 \
-  --positive-weight 1 \
+  --positive-weight 150 \
   --lr-milestones 6,7,8,9 \
   --lr-gamma 0.5 \
   --soft-augment-prob 0 \
@@ -38,4 +38,4 @@ python scripts/train_mamba_splice_soft_exist.py \
   --print-every 100 \
   --val-batches 8 \
   --device cuda \
-  --checkpoint-dir checkpoints/mamba_splice_pangolin_split_len15000_target5000_h96_l6
+  --checkpoint-dir checkpoints/mamba_splice_pangolin_split_len15000_target5000_h96_l6_pos150

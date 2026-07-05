@@ -787,7 +787,8 @@ def train(args: argparse.Namespace) -> None:
     )
     print(
         f"soft_prob={args.soft_augment_prob}; exist_prob={args.exist_augment_prob}; "
-        f"junk/base={args.junk_slots_per_base}; explicit input=[soft_base*exist, exist, effective_pos]"
+        f"junk/base={args.junk_slots_per_base}; positive_weight={args.positive_weight}; "
+        f"explicit input=[soft_base*exist, exist, effective_pos]"
     )
     print(
         f"train_chroms={','.join(train_chroms)}; val_chroms={','.join(val_chroms)}; "
@@ -889,7 +890,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=0.0)
-    parser.add_argument("--positive-weight", type=float, default=1.0)
+    parser.add_argument("--positive-weight", type=float, default=150.0)
     parser.add_argument("--lr-milestones", default="6,7,8,9")
     parser.add_argument("--lr-gamma", type=float, default=0.5)
 
