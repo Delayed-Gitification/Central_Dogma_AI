@@ -1529,11 +1529,6 @@ class MambaPhaseTrackPredictor(nn.Module):
     ):
         super().__init__()
         self.input_projection = nn.Linear(input_dim, hidden_dim)
-        self.position_projection = nn.Sequential(
-            nn.Linear(2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
         self.scan_blocks = OfficialMamba2Encoder(
             hidden_dim=hidden_dim,
             layers=layers,
@@ -1548,15 +1543,8 @@ class MambaPhaseTrackPredictor(nn.Module):
         )
 
     def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, genome_length, _ = dna_one_hot.shape
-        splice_site_signal = splice_tracks.max(dim=-1, keepdim=True).values.clamp(0, 1)
         features = torch.cat([dna_one_hot, splice_tracks], dim=-1)
-        genome_position = torch.linspace(0, 1, genome_length, device=dna_one_hot.device)
-        genome_position = genome_position[None, :, None].expand(batch_size, -1, -1)
-        encoded = (
-            self.input_projection(features)
-            + self.position_projection(torch.cat([genome_position, splice_site_signal], dim=-1))
-        )
+        encoded = self.input_projection(features)
         encoded = self.scan_blocks(encoded)
         return self.phase_head(encoded), encoded
 
