@@ -1533,8 +1533,10 @@ class MambaPhaseTrackPredictor(nn.Module):
         headdim: int = 8,
         local_conv_kernel: int = 9,
         head_conv_kernel: int = 7,
+        bidirectional: bool = False,
     ):
         super().__init__()
+        self.bidirectional = bidirectional
         self.input_projection = nn.Linear(input_dim, hidden_dim)
         self.local_norm = nn.LayerNorm(hidden_dim)
         self.local_context = nn.Sequential(
@@ -1554,6 +1556,14 @@ class MambaPhaseTrackPredictor(nn.Module):
             chunk_size=chunk_size,
             headdim=headdim,
         )
+        if self.bidirectional:
+            self.reverse_scan_blocks = OfficialMamba2Encoder(
+                hidden_dim=hidden_dim,
+                layers=layers,
+                chunk_size=chunk_size,
+                headdim=headdim,
+            )
+            self.bidirectional_fusion = nn.Linear(hidden_dim * 2, hidden_dim)
         self.phase_norm = nn.LayerNorm(hidden_dim)
         self.phase_head = nn.Sequential(
             nn.Conv1d(
@@ -1569,12 +1579,36 @@ class MambaPhaseTrackPredictor(nn.Module):
             nn.Conv1d(hidden_dim, len(PHASE_LABELS), kernel_size=1),
         )
 
+    def seed_reverse_from_forward(self) -> None:
+        if self.bidirectional:
+            self.reverse_scan_blocks.load_state_dict(self.scan_blocks.state_dict())
+
+    @staticmethod
+    def _reverse_valid_prefix(x: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        batch_size, max_length, channels = x.shape
+        positions = torch.arange(max_length, device=x.device)
+        lengths = valid_mask.long().sum(dim=1)
+        reverse_positions = lengths[:, None] - 1 - positions[None, :]
+        gather_positions = reverse_positions.clamp(min=0, max=max_length - 1)
+        gather_positions = gather_positions.unsqueeze(-1).expand(batch_size, max_length, channels)
+        reversed_x = torch.gather(x, dim=1, index=gather_positions)
+        prefix_mask = positions[None, :] < lengths[:, None]
+        return reversed_x.masked_fill(~prefix_mask.unsqueeze(-1), 0.0)
+
     def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = torch.cat([dna_one_hot, splice_tracks], dim=-1)
         encoded = self.input_projection(features)
         local_features = self.local_norm(encoded).transpose(1, 2)
         encoded = encoded + self.local_context(local_features).transpose(1, 2)
-        encoded = self.scan_blocks(encoded)
+        forward_encoded = self.scan_blocks(encoded)
+        if self.bidirectional:
+            valid_mask = dna_one_hot.sum(dim=-1) > 0
+            reverse_input = self._reverse_valid_prefix(encoded, valid_mask)
+            reverse_encoded = self.reverse_scan_blocks(reverse_input)
+            reverse_encoded = self._reverse_valid_prefix(reverse_encoded, valid_mask)
+            encoded = self.bidirectional_fusion(torch.cat([forward_encoded, reverse_encoded], dim=-1))
+        else:
+            encoded = forward_encoded
         phase_features = self.phase_norm(encoded).transpose(1, 2)
         phase_logits = self.phase_head(phase_features).transpose(1, 2)
         return phase_logits, encoded
@@ -1738,6 +1772,11 @@ def train_phase(args: argparse.Namespace) -> None:
         f"min={args.min_exon_bases} bp, median~{args.median_exon_bases} bp, "
         f"max={args.max_exon_bases} bp, rare short exon probability={args.rare_short_exon_prob:.3f}"
     )
+    print(
+        "architecture: "
+        f"{'bidirectional' if args.bidirectional else 'forward-only'} Mamba2, "
+        f"local_conv={args.local_conv_kernel}, head_conv={args.head_conv_kernel}"
+    )
 
     stage_start = time.perf_counter()
     print("building phase Mamba model...", flush=True)
@@ -1748,6 +1787,7 @@ def train_phase(args: argparse.Namespace) -> None:
         headdim=args.headdim,
         local_conv_kernel=args.local_conv_kernel,
         head_conv_kernel=args.head_conv_kernel,
+        bidirectional=args.bidirectional,
     ).to(device)
     timed("model is on device", stage_start)
     stage_start = time.perf_counter()
@@ -1764,6 +1804,9 @@ def train_phase(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"Initial checkpoint does not exist: {init_path}")
         print(f"loading compatible weights from: {init_path}", flush=True)
         load_matching_model_weights(init_path, model=model, device=device)
+        if args.bidirectional:
+            model.seed_reverse_from_forward()
+            print("seeded reverse Mamba blocks from loaded forward blocks", flush=True)
 
     checkpoint_dir = resolve_checkpoint_path(args.checkpoint_dir)
     print(f"checkpoint directory: {checkpoint_dir}")
@@ -2009,6 +2052,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--headdim", type=int, default=8)
     parser.add_argument("--local-conv-kernel", type=int, default=9)
     parser.add_argument("--head-conv-kernel", type=int, default=7)
+    parser.add_argument("--bidirectional", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use-prior-emit-mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-6)
