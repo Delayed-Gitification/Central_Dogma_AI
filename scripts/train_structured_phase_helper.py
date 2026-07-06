@@ -65,6 +65,18 @@ def parse_args() -> argparse.Namespace:
             "leave disabled for the first trainer."
         ),
     )
+    parser.add_argument(
+        "--require-split-codon",
+        choices=("none", "any", "start", "stop"),
+        default="none",
+        help="Force sampled multiexon genes to have split start and/or stop codons across exon junctions.",
+    )
+    parser.add_argument(
+        "--unsplit-codon-fraction",
+        type=float,
+        default=0.0,
+        help="When requiring split codons, keep this fraction as clean examples with neither start nor stop split.",
+    )
     parser.add_argument("--init-textbook", action="store_true", help="Initialize motif detector as ATG/stop oracle.")
     return parser.parse_args()
 
@@ -85,7 +97,51 @@ def randint(rng: random.Random, low: int, high: int) -> int:
     return rng.randint(low, high)
 
 
+def codon_is_contiguous_in_genome(gene: SyntheticPhaseGene, codon_start: int, codon: str | None = None) -> bool:
+    observed = gene.dna[codon_start : codon_start + 3]
+    if codon is not None and observed == codon:
+        return True
+    if codon is None and len(observed) == 3:
+        path_set = set(gene.paths[0].genomic_indices.tolist())
+        return all(index in path_set for index in range(codon_start, codon_start + 3))
+    return False
+
+
+def split_codon_flags(gene: SyntheticPhaseGene) -> tuple[bool, bool]:
+    start_split = not codon_is_contiguous_in_genome(gene, gene.start_codon_start, "ATG")
+    stop_split = gene.dna[gene.stop_codon_start : gene.stop_codon_start + 3] not in {"TAA", "TAG", "TGA"}
+    return start_split, stop_split
+
+
+def split_requirement_is_met(gene: SyntheticPhaseGene, requirement: str) -> bool:
+    start_split, stop_split = split_codon_flags(gene)
+    if requirement == "none":
+        return True
+    if requirement == "any":
+        return start_split or stop_split
+    if requirement == "start":
+        return start_split
+    if requirement == "stop":
+        return stop_split
+    raise ValueError(f"Unknown split requirement: {requirement}")
+
+
+def split_counts_for_gene(gene: SyntheticPhaseGene) -> dict[str, int]:
+    start_split, stop_split = split_codon_flags(gene)
+    return {
+        "split_start": int(start_split),
+        "split_stop": int(stop_split),
+        "split_any": int(start_split or stop_split),
+        "split_none": int(not start_split and not stop_split),
+    }
+
+
 def make_gene(args: argparse.Namespace, rng: random.Random) -> SyntheticPhaseGene:
+    if args.require_split_codon != "none" and not args.allow_split_start_stop:
+        raise ValueError("--require-split-codon needs --allow-split-start-stop")
+    if args.unsplit_codon_fraction < 0.0 or args.unsplit_codon_fraction > 1.0:
+        raise ValueError("--unsplit-codon-fraction must be between 0 and 1")
+
     if args.mode == "single_exon":
         utr5_length = randint(rng, args.min_utr5_length, args.max_utr5_length)
         coding_codons = randint(rng, args.min_coding_codons, args.max_coding_codons)
@@ -97,6 +153,11 @@ def make_gene(args: argparse.Namespace, rng: random.Random) -> SyntheticPhaseGen
             seed=rng.randrange(2**31),
         )
 
+    use_unsplit_anchor = (
+        args.require_split_codon != "none"
+        and args.unsplit_codon_fraction > 0.0
+        and rng.random() < args.unsplit_codon_fraction
+    )
     for _attempt in range(500):
         utr5_length = randint(rng, args.min_utr5_length, args.max_utr5_length)
         coding_codons = randint(rng, args.min_coding_codons, args.max_coding_codons)
@@ -115,9 +176,14 @@ def make_gene(args: argparse.Namespace, rng: random.Random) -> SyntheticPhaseGen
             )
         except ValueError:
             continue
-        start_is_contiguous = gene.dna[gene.start_codon_start : gene.start_codon_start + 3] == "ATG"
-        stop_is_contiguous = gene.dna[gene.stop_codon_start : gene.stop_codon_start + 3] in {"TAA", "TAG", "TGA"}
-        if args.allow_split_start_stop or (start_is_contiguous and stop_is_contiguous):
+        start_split, stop_split = split_codon_flags(gene)
+        if args.require_split_codon != "none":
+            if use_unsplit_anchor and not start_split and not stop_split:
+                return gene
+            if not use_unsplit_anchor and split_requirement_is_met(gene, args.require_split_codon):
+                return gene
+            continue
+        if args.allow_split_start_stop or (not start_split and not stop_split):
             return gene
     raise RuntimeError(
         "Could not sample a valid multiexon gene. Try lowering --min-exon-length/--max-exons "
@@ -179,6 +245,7 @@ def evaluate(
     length_sum = 0
     exon_sum = 0
     intron_sum = 0
+    split_counts = {"split_start": 0, "split_stop": 0, "split_any": 0, "split_none": 0}
 
     for _ in range(examples):
         gene = make_gene(args, rng)
@@ -206,6 +273,8 @@ def evaluate(
         length_sum += len(gene.dna)
         exon_sum += len(gene.exon_lengths)
         intron_sum += len(gene.intron_lengths)
+        for key, value in split_counts_for_gene(gene).items():
+            split_counts[key] += value
 
         for state_index in range(len(PHASE_STATES)):
             mask = target == state_index
@@ -229,6 +298,10 @@ def evaluate(
         "mean_length": length_sum / examples,
         "mean_exons": exon_sum / examples,
         "mean_introns": intron_sum / examples,
+        "split_start": split_counts["split_start"] / examples,
+        "split_stop": split_counts["split_stop"] / examples,
+        "split_any": split_counts["split_any"] / examples,
+        "split_none": split_counts["split_none"] / examples,
     }
 
 
@@ -240,6 +313,8 @@ def format_metrics(prefix: str, metrics: dict[str, object]) -> str:
         f"(phase={metrics['phase_loss']:.4f}, start={metrics['start_loss']:.4f}, stop={metrics['stop_loss']:.4f})\n"
         f"           phase base={metrics['base_accuracy']:.3f}, gene exact={metrics['gene_exact']:.3f}, "
         f"start peak={metrics['start_exact']:.3f}, stop peak={metrics['stop_exact']:.3f}\n"
+        f"           split codons any={metrics['split_any']:.3f}, none={metrics['split_none']:.3f}, "
+        f"start={metrics['split_start']:.3f}, stop={metrics['split_stop']:.3f}\n"
         f"           per-state {state_bits}"
     )
 
@@ -335,7 +410,9 @@ def main() -> None:
             "splice structure: "
             f"exons={args.min_exons}-{args.max_exons}, "
             f"introns={args.min_intron_length}-{args.max_intron_length} bp, "
-            f"split_start_stop={'allowed' if args.allow_split_start_stop else 'disabled'}"
+            f"split_start_stop={'allowed' if args.allow_split_start_stop else 'disabled'}, "
+            f"require_split={args.require_split_codon}, "
+            f"unsplit_fraction={args.unsplit_codon_fraction:.2f}"
         )
     print(f"checkpoint directory: {args.checkpoint_dir}")
     if args.init_from is not None:
@@ -355,6 +432,7 @@ def main() -> None:
         length_sum = 0
         exon_sum = 0
         intron_sum = 0
+        split_counts = {"split_start": 0, "split_stop": 0, "split_any": 0, "split_none": 0}
 
         for _example_index in range(args.examples_per_step):
             gene = make_gene(args, train_rng)
@@ -381,6 +459,8 @@ def main() -> None:
                 length_sum += len(gene.dna)
                 exon_sum += len(gene.exon_lengths)
                 intron_sum += len(gene.intron_lengths)
+                for key, value in split_counts_for_gene(gene).items():
+                    split_counts[key] += value
                 for state_index in range(len(PHASE_STATES)):
                     mask = target == state_index
                     state_total[state_index] += int(mask.sum().item())
@@ -468,6 +548,12 @@ def main() -> None:
                 f"gene exact={train_counts['exact'] / args.examples_per_step:.3f}, "
                 f"start peak={train_counts['start'] / args.examples_per_step:.3f}, "
                 f"stop peak={train_counts['stop'] / args.examples_per_step:.3f}"
+            )
+            print(
+                f"           split codons any={split_counts['split_any'] / args.examples_per_step:.3f}, "
+                f"none={split_counts['split_none'] / args.examples_per_step:.3f}, "
+                f"start={split_counts['split_start'] / args.examples_per_step:.3f}, "
+                f"stop={split_counts['split_stop'] / args.examples_per_step:.3f}"
             )
             print("           per-state " + ", ".join(f"{name}={per_state[name]:.3f}" for name in PHASE_STATES))
             if validation is not None:
