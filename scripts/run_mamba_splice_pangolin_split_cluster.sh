@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+
 # Keep Mamba/Triton JIT artifacts out of home/conda cache space on the cluster.
 CACHE_ROOT="${CACHE_ROOT:-/nemo/lab/ulej/home/users/wilkino/tmp/mamba_splice_pangolin_split_cache}"
 mkdir -p "$CACHE_ROOT"/{triton,torch,xdg,tmp}
