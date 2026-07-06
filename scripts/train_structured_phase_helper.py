@@ -86,36 +86,43 @@ def randint(rng: random.Random, low: int, high: int) -> int:
 
 
 def make_gene(args: argparse.Namespace, rng: random.Random) -> SyntheticPhaseGene:
-    utr5_length = randint(rng, args.min_utr5_length, args.max_utr5_length)
-    coding_codons = randint(rng, args.min_coding_codons, args.max_coding_codons)
-    utr3_length = randint(rng, args.min_utr3_length, args.max_utr3_length)
-    seed = rng.randrange(2**31)
-
     if args.mode == "single_exon":
+        utr5_length = randint(rng, args.min_utr5_length, args.max_utr5_length)
+        coding_codons = randint(rng, args.min_coding_codons, args.max_coding_codons)
+        utr3_length = randint(rng, args.min_utr3_length, args.max_utr3_length)
         return generate_single_exon_phase_gene(
             utr5_length=utr5_length,
             coding_codons=coding_codons,
             utr3_length=utr3_length,
-            seed=seed,
-        )
-
-    exon_count = randint(rng, args.min_exons, args.max_exons)
-    for _attempt in range(500):
-        gene = generate_multiexon_phase_gene(
-            utr5_length=utr5_length,
-            coding_codons=coding_codons,
-            utr3_length=utr3_length,
-            exon_count=exon_count,
-            min_exon_length=args.min_exon_length,
-            min_intron_length=args.min_intron_length,
-            max_intron_length=args.max_intron_length,
             seed=rng.randrange(2**31),
         )
+
+    for _attempt in range(500):
+        utr5_length = randint(rng, args.min_utr5_length, args.max_utr5_length)
+        coding_codons = randint(rng, args.min_coding_codons, args.max_coding_codons)
+        utr3_length = randint(rng, args.min_utr3_length, args.max_utr3_length)
+        exon_count = randint(rng, args.min_exons, args.max_exons)
+        try:
+            gene = generate_multiexon_phase_gene(
+                utr5_length=utr5_length,
+                coding_codons=coding_codons,
+                utr3_length=utr3_length,
+                exon_count=exon_count,
+                min_exon_length=args.min_exon_length,
+                min_intron_length=args.min_intron_length,
+                max_intron_length=args.max_intron_length,
+                seed=rng.randrange(2**31),
+            )
+        except ValueError:
+            continue
         start_is_contiguous = gene.dna[gene.start_codon_start : gene.start_codon_start + 3] == "ATG"
         stop_is_contiguous = gene.dna[gene.stop_codon_start : gene.stop_codon_start + 3] in {"TAA", "TAG", "TGA"}
         if args.allow_split_start_stop or (start_is_contiguous and stop_is_contiguous):
             return gene
-    raise RuntimeError("Could not sample a multiexon gene with unsplit start/stop codons")
+    raise RuntimeError(
+        "Could not sample a valid multiexon gene. Try lowering --min-exon-length/--max-exons "
+        "or increasing UTR/coding length ranges."
+    )
 
 
 def tensor_to_device(gene: SyntheticPhaseGene, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
