@@ -1658,12 +1658,14 @@ def train_phase(args: argparse.Namespace) -> None:
         f"max={args.max_exon_bases} bp, rare short exon probability={args.rare_short_exon_prob:.3f}"
     )
 
+    print("building phase Mamba model...", flush=True)
     model = MambaPhaseTrackPredictor(
         hidden_dim=args.hidden_dim,
         layers=args.layers,
         chunk_size=args.chunk_size,
         headdim=args.headdim,
     ).to(device)
+    print("model is on device", flush=True)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -1674,6 +1676,7 @@ def train_phase(args: argparse.Namespace) -> None:
         init_path = resolve_checkpoint_path(args.init_from)
         if not init_path.exists():
             raise FileNotFoundError(f"Initial checkpoint does not exist: {init_path}")
+        print(f"loading compatible weights from: {init_path}", flush=True)
         load_matching_model_weights(init_path, model=model, device=device)
 
     checkpoint_dir = resolve_checkpoint_path(args.checkpoint_dir)
@@ -1683,6 +1686,7 @@ def train_phase(args: argparse.Namespace) -> None:
 
     validation_batch = None
     if args.validation_batch_size > 0:
+        print(f"building fixed validation batch with {args.validation_batch_size} examples...", flush=True)
         validation_batch = make_batch(
             batch_size=args.validation_batch_size,
             device=device,
@@ -1700,6 +1704,9 @@ def train_phase(args: argparse.Namespace) -> None:
             length_bucket_size=args.length_bucket_size,
             seed=args.validation_seed,
         )
+        print("fixed validation batch ready", flush=True)
+    else:
+        print("fixed validation disabled", flush=True)
 
     class_weights = torch.tensor(
         [1.0, 1.0, 1.0, args.not_coding_weight],
@@ -1711,6 +1718,8 @@ def train_phase(args: argparse.Namespace) -> None:
     final_metrics = None
 
     for step in range(args.steps):
+        if step == 0:
+            print("starting training loop; first Mamba call may compile Triton kernels", flush=True)
         scheduled_lr = get_lr(
             step=step,
             total_steps=args.steps,
