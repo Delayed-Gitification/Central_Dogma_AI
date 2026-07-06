@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -1603,11 +1604,17 @@ def format_phase_report(label: str, metrics: dict[str, float]) -> str:
     )
 
 
+def timed(message: str, start_time: float) -> None:
+    print(f"{message} ({time.perf_counter() - start_time:.1f}s)", flush=True)
+
+
 def load_matching_model_weights(path: Path, *, model: nn.Module, device: torch.device) -> None:
+    start_time = time.perf_counter()
     try:
-        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     except TypeError:
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(path, map_location="cpu")
+    timed("checkpoint loaded on CPU", start_time)
     source_state = checkpoint["model_state_dict"]
     target_state = model.state_dict()
     matching_state = {
@@ -1615,8 +1622,10 @@ def load_matching_model_weights(path: Path, *, model: nn.Module, device: torch.d
         for key, value in source_state.items()
         if key in target_state and tuple(value.shape) == tuple(target_state[key].shape)
     }
+    copy_start = time.perf_counter()
     model.load_state_dict({**target_state, **matching_state})
-    print(f"loaded {len(matching_state)} compatible tensors from: {path}")
+    timed(f"copied {len(matching_state)} compatible tensors into phase model", copy_start)
+    print(f"loaded compatible tensors from: {path}", flush=True)
 
 
 def train_phase(args: argparse.Namespace) -> None:
@@ -1646,6 +1655,7 @@ def train_phase(args: argparse.Namespace) -> None:
         f"max={args.max_exon_bases} bp, rare short exon probability={args.rare_short_exon_prob:.3f}"
     )
 
+    stage_start = time.perf_counter()
     print("building phase Mamba model...", flush=True)
     model = MambaPhaseTrackPredictor(
         hidden_dim=args.hidden_dim,
@@ -1653,13 +1663,15 @@ def train_phase(args: argparse.Namespace) -> None:
         chunk_size=args.chunk_size,
         headdim=args.headdim,
     ).to(device)
-    print("model is on device", flush=True)
+    timed("model is on device", stage_start)
+    stage_start = time.perf_counter()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
     )
+    timed("optimizer built", stage_start)
     if args.init_from:
         init_path = resolve_checkpoint_path(args.init_from)
         if not init_path.exists():
@@ -1674,6 +1686,7 @@ def train_phase(args: argparse.Namespace) -> None:
 
     validation_batch = None
     if args.validation_batch_size > 0:
+        stage_start = time.perf_counter()
         print(f"building fixed validation batch with {args.validation_batch_size} examples...", flush=True)
         validation_batch = make_batch(
             batch_size=args.validation_batch_size,
@@ -1692,7 +1705,7 @@ def train_phase(args: argparse.Namespace) -> None:
             length_bucket_size=args.length_bucket_size,
             seed=args.validation_seed,
         )
-        print("fixed validation batch ready", flush=True)
+        timed("fixed validation batch ready", stage_start)
     else:
         print("fixed validation disabled", flush=True)
 
@@ -1761,7 +1774,10 @@ def train_phase(args: argparse.Namespace) -> None:
                 max_length=dna.shape[1],
                 device=device,
             )
+            first_forward_start = time.perf_counter() if step == 0 and micro_batch_index == 0 else None
             logits, _encoded = model(dna, splice_tracks)
+            if first_forward_start is not None:
+                timed("first Mamba forward complete", first_forward_start)
             per_base_loss = F.cross_entropy(
                 logits.reshape(-1, len(PHASE_LABELS)),
                 phase_target.reshape(-1),
