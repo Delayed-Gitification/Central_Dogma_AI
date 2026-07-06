@@ -15,7 +15,7 @@ echo "python: $(command -v python)"
 echo "CONDA_PREFIX: ${CONDA_PREFIX:-unset}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi -L || true
-python -c 'import torch; print("torch", torch.__version__, "cuda_available", torch.cuda.is_available(), "torch_cuda", torch.version.cuda, "device_count", torch.cuda.device_count())'
+python -c 'import torch; print("torch", torch.__version__, "cuda_available", torch.cuda.is_available(), "torch_cuda", torch.version.cuda, "device_count", torch.cuda.device_count()); torch.cuda.init(); print("cuda init ok", torch.cuda.get_device_name(0))'
 
 # Keep Mamba/Triton JIT artifacts out of home/conda cache space on the cluster.
 CACHE_ROOT="${CACHE_ROOT:-/nemo/lab/ulej/home/users/wilkino/tmp/mamba_splice_pangolin_split_cache}"

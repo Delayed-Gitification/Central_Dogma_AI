@@ -15,7 +15,7 @@ echo "python: $(command -v python)"
 echo "CONDA_PREFIX: ${CONDA_PREFIX:-unset}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi -L || true
-python -c 'import torch; print("torch", torch.__version__, "cuda_available", torch.cuda.is_available(), "torch_cuda", torch.version.cuda, "device_count", torch.cuda.device_count())'
+python -c 'import torch; print("torch", torch.__version__, "cuda_available", torch.cuda.is_available(), "torch_cuda", torch.version.cuda, "device_count", torch.cuda.device_count()); torch.cuda.init(); print("cuda init ok", torch.cuda.get_device_name(0))'
 
 python scripts/train_pangolin_style_splice_classifier.py \
   --fasta /camp/home/wilkino/home/POSTDOC/software/biPangolin/data/GRCh38.primary_assembly.genome.fa \
