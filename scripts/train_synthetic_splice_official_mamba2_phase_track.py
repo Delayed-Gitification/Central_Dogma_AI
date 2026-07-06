@@ -968,6 +968,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--assignment-entropy-weight must be non-negative")
     if args.not_coding_weight < 0:
         raise ValueError("--not-coding-weight must be non-negative")
+    if args.local_conv_kernel < 1 or args.local_conv_kernel % 2 == 0:
+        raise ValueError("--local-conv-kernel must be a positive odd integer")
+    if args.head_conv_kernel < 1 or args.head_conv_kernel % 2 == 0:
+        raise ValueError("--head-conv-kernel must be a positive odd integer")
     if args.max_assignment_sharpness <= 0:
         raise ValueError("--max-assignment-sharpness must be positive")
     if not 0 <= args.loss_ema_beta < 1:
@@ -1527,27 +1531,53 @@ class MambaPhaseTrackPredictor(nn.Module):
         layers: int = 3,
         chunk_size: int = 32,
         headdim: int = 8,
+        local_conv_kernel: int = 9,
+        head_conv_kernel: int = 7,
     ):
         super().__init__()
         self.input_projection = nn.Linear(input_dim, hidden_dim)
+        self.local_norm = nn.LayerNorm(hidden_dim)
+        self.local_context = nn.Sequential(
+            nn.Conv1d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=local_conv_kernel,
+                padding=local_conv_kernel // 2,
+                groups=hidden_dim,
+            ),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+        )
         self.scan_blocks = OfficialMamba2Encoder(
             hidden_dim=hidden_dim,
             layers=layers,
             chunk_size=chunk_size,
             headdim=headdim,
         )
+        self.phase_norm = nn.LayerNorm(hidden_dim)
         self.phase_head = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Conv1d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=head_conv_kernel,
+                padding=head_conv_kernel // 2,
+                groups=hidden_dim,
+            ),
             nn.GELU(),
-            nn.Linear(hidden_dim, len(PHASE_LABELS)),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, len(PHASE_LABELS), kernel_size=1),
         )
 
     def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         features = torch.cat([dna_one_hot, splice_tracks], dim=-1)
         encoded = self.input_projection(features)
+        local_features = self.local_norm(encoded).transpose(1, 2)
+        encoded = encoded + self.local_context(local_features).transpose(1, 2)
         encoded = self.scan_blocks(encoded)
-        return self.phase_head(encoded), encoded
+        phase_features = self.phase_norm(encoded).transpose(1, 2)
+        phase_logits = self.phase_head(phase_features).transpose(1, 2)
+        return phase_logits, encoded
 
 
 def phase_targets_from_examples(
@@ -1582,14 +1612,23 @@ def phase_metrics(logits: torch.Tensor, target: torch.Tensor, genome_mask: torch
     exact = ((predicted == target) | ~genome_mask).all(dim=1).float().mean()
     coding_exact = ((predicted == target) | ~coding_mask).all(dim=1).float().mean()
     confidence = logits.softmax(dim=-1).max(dim=-1).values
+    phase_metrics_by_class = {}
+    for phase_index in range(3):
+        phase_mask = coding_mask & (target == phase_index)
+        phase_correct = (predicted == target) & phase_mask
+        phase_metrics_by_class[f"exon_phase_{phase_index}_accuracy"] = (
+            float(phase_correct.sum().item()) / max(1, int(phase_mask.sum().item()))
+        )
     return {
         "accuracy": float(correct.sum().item()) / max(1, int(genome_mask.sum().item())),
         "coding_phase_accuracy": float(coding_correct.sum().item()) / max(1, int(coding_mask.sum().item())),
+        "exon_phase_accuracy": float(coding_correct.sum().item()) / max(1, int(coding_mask.sum().item())),
         "not_coding_accuracy": float(noncoding_correct.sum().item()) / max(1, int(noncoding_mask.sum().item())),
         "exact_match": float(exact.item()),
         "coding_exact_match": float(coding_exact.item()),
         "confidence": float((confidence * genome_mask.to(confidence.dtype)).sum().item())
         / max(1, int(genome_mask.sum().item())),
+        **phase_metrics_by_class,
     }
 
 
@@ -1597,8 +1636,11 @@ def format_phase_report(label: str, metrics: dict[str, float]) -> str:
     return (
         f"{label:<10} loss={metrics['loss']:.4f}\n"
         f"{'':<10} genome exact={metrics['exact_match']:.3f}, all-base accuracy={metrics['accuracy']:.3f}\n"
-        f"{'':<10} coding phase exact={metrics['coding_exact_match']:.3f}, "
-        f"coding phase base={metrics['coding_phase_accuracy']:.3f}, "
+        f"{'':<10} exon phase exact={metrics['coding_exact_match']:.3f}, "
+        f"exon phase base={metrics['exon_phase_accuracy']:.3f}, "
+        f"phase0={metrics['exon_phase_0_accuracy']:.3f}, "
+        f"phase1={metrics['exon_phase_1_accuracy']:.3f}, "
+        f"phase2={metrics['exon_phase_2_accuracy']:.3f}, "
         f"not-coding base={metrics['not_coding_accuracy']:.3f}\n"
         f"{'':<10} confidence={metrics['confidence']:.3f}"
     )
@@ -1704,6 +1746,8 @@ def train_phase(args: argparse.Namespace) -> None:
         layers=args.layers,
         chunk_size=args.chunk_size,
         headdim=args.headdim,
+        local_conv_kernel=args.local_conv_kernel,
+        head_conv_kernel=args.head_conv_kernel,
     ).to(device)
     timed("model is on device", stage_start)
     stage_start = time.perf_counter()
@@ -1777,14 +1821,7 @@ def train_phase(args: argparse.Namespace) -> None:
         micro_batch_count = math.ceil(args.batch_size / effective_micro_batch_size)
         total_examples = 0
         loss_sum = 0.0
-        metric_sums = {
-            "accuracy": 0.0,
-            "coding_phase_accuracy": 0.0,
-            "not_coding_accuracy": 0.0,
-            "exact_match": 0.0,
-            "coding_exact_match": 0.0,
-            "confidence": 0.0,
-        }
+        metric_sums: dict[str, float] = {}
         target_lengths_all = []
         genome_lengths = []
         intron_lengths = []
@@ -1843,7 +1880,8 @@ def train_phase(args: argparse.Namespace) -> None:
             with torch.no_grad():
                 metrics = phase_metrics(logits, phase_target, genome_mask)
                 loss_sum += loss.item() * micro_batch_size
-                for key in metric_sums:
+                for key in metrics:
+                    metric_sums.setdefault(key, 0.0)
                     metric_sums[key] += metrics[key] * micro_batch_size
                 total_examples += micro_batch_size
                 target_lengths_all.extend(int(example["protein_codons"]) for example in examples)
@@ -1969,6 +2007,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--headdim", type=int, default=8)
+    parser.add_argument("--local-conv-kernel", type=int, default=9)
+    parser.add_argument("--head-conv-kernel", type=int, default=7)
     parser.add_argument("--use-prior-emit-mask", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--min-learning-rate", type=float, default=1e-6)
