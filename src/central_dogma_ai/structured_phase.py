@@ -67,6 +67,8 @@ class SyntheticPhaseGene:
     stop_codon_start: int
     utr5_length: int
     utr3_length: int
+    exon_lengths: tuple[int, ...] = ()
+    intron_lengths: tuple[int, ...] = ()
 
 
 @dataclass
@@ -123,6 +125,130 @@ def generate_single_exon_phase_gene(
         stop_codon_start=stop,
         utr5_length=utr5_length,
         utr3_length=utr3_length,
+        exon_lengths=(len(dna),),
+        intron_lengths=(),
+    )
+
+
+def _split_lengths(total_length: int, parts: int, *, min_part: int, rng: random.Random) -> tuple[int, ...]:
+    if parts < 1:
+        raise ValueError("parts must be at least 1")
+    if total_length < parts * min_part:
+        raise ValueError("total_length is too short for the requested split")
+    remaining = total_length
+    lengths = []
+    for part in range(parts - 1):
+        max_length = remaining - min_part * (parts - part - 1)
+        length = rng.randint(min_part, max_length)
+        lengths.append(length)
+        remaining -= length
+    lengths.append(remaining)
+    return tuple(lengths)
+
+
+def _build_phase_target_for_path(
+    *,
+    genome_length: int,
+    path_indices: list[int],
+    start_offset: int,
+    stop_offset: int,
+) -> torch.Tensor:
+    target = torch.full((genome_length,), N_STATE, dtype=torch.long)
+    for transcript_offset, genomic_index in enumerate(path_indices):
+        if transcript_offset < start_offset:
+            target[genomic_index] = N_STATE
+        elif transcript_offset <= stop_offset + 2:
+            target[genomic_index] = C0_STATE + ((transcript_offset - start_offset) % 3)
+        else:
+            target[genomic_index] = T_STATE
+    return target
+
+
+def generate_multiexon_phase_gene(
+    *,
+    utr5_length: int = 12,
+    coding_codons: int = 8,
+    utr3_length: int = 10,
+    exon_count: int = 3,
+    exon_lengths: tuple[int, ...] | None = None,
+    min_exon_length: int = 4,
+    min_intron_length: int = 8,
+    max_intron_length: int = 20,
+    seed: int = 1,
+) -> SyntheticPhaseGene:
+    """Generate a positive-strand multiexon gene with one mature transcript path.
+
+    The start and stop codons are still chosen in the mature spliced transcript.
+    Internal coding codons may cross exon junctions depending on `exon_lengths`.
+    For now, callers should avoid splitting the start/stop codons themselves if
+    they want the simple genomic-window motif extractor to recover them exactly.
+    """
+
+    if coding_codons < 2:
+        raise ValueError("coding_codons must include at least ATG and stop")
+    if min_intron_length < 4:
+        raise ValueError("min_intron_length must allow GT...AG introns")
+    if max_intron_length < min_intron_length:
+        raise ValueError("max_intron_length must be >= min_intron_length")
+
+    rng = random.Random(seed)
+    utr5 = _random_dna_without_atg(utr5_length, rng)
+    internal_choices = tuple(codon for codon in NON_STOP_CODONS if codon != "ATG")
+    internal_codons = [rng.choice(internal_choices) for _ in range(coding_codons - 2)]
+    cds = "ATG" + "".join(internal_codons) + rng.choice(STOP_CODONS)
+    utr3 = "".join(rng.choice(DNA_BASES) for _ in range(utr3_length))
+    transcript = utr5 + cds + utr3
+    transcript_length = len(transcript)
+
+    if exon_lengths is None:
+        exon_lengths = _split_lengths(transcript_length, exon_count, min_part=min_exon_length, rng=rng)
+    else:
+        exon_lengths = tuple(exon_lengths)
+        if sum(exon_lengths) != transcript_length:
+            raise ValueError("exon_lengths must sum to the mature transcript length")
+        exon_count = len(exon_lengths)
+        if any(length < 1 for length in exon_lengths):
+            raise ValueError("exon lengths must be positive")
+
+    genome_parts: list[str] = []
+    path_indices: list[int] = []
+    intron_lengths = []
+    transcript_cursor = 0
+    for exon_index, exon_length in enumerate(exon_lengths):
+        exon = transcript[transcript_cursor : transcript_cursor + exon_length]
+        for base in exon:
+            path_indices.append(len(genome_parts))
+            genome_parts.append(base)
+        transcript_cursor += exon_length
+        if exon_index < exon_count - 1:
+            intron_length = rng.randint(min_intron_length, max_intron_length)
+            intron_lengths.append(intron_length)
+            genome_parts.extend("GT" + "".join(rng.choice(DNA_BASES) for _ in range(intron_length - 4)) + "AG")
+
+    dna = "".join(genome_parts)
+    start_offset = utr5_length
+    stop_offset = utr5_length + len(cds) - 3
+    start_genomic = path_indices[start_offset]
+    stop_genomic = path_indices[stop_offset]
+    target = _build_phase_target_for_path(
+        genome_length=len(dna),
+        path_indices=path_indices,
+        start_offset=start_offset,
+        stop_offset=stop_offset,
+    )
+
+    path = SplicePath(genomic_indices=torch.tensor(path_indices, dtype=torch.long))
+    return SyntheticPhaseGene(
+        dna=dna,
+        dna_one_hot=one_hot_dna_tensor(dna),
+        paths=(path,),
+        target_states=target,
+        start_codon_start=start_genomic,
+        stop_codon_start=stop_genomic,
+        utr5_length=utr5_length,
+        utr3_length=utr3_length,
+        exon_lengths=exon_lengths,
+        intron_lengths=tuple(intron_lengths),
     )
 
 
@@ -241,6 +367,9 @@ class StructuredPhaseLayer(nn.Module):
         termination_log_probs = start_logits.new_full((genome_length,), -torch.inf)
 
         for genomic_index in range(genome_length):
+            if not any(state_buckets[genomic_index]):
+                state_log_probs[genomic_index, N_STATE] = start_logits.new_zeros(())
+                continue
             for state in range(len(PHASE_STATES)):
                 if state_buckets[genomic_index][state]:
                     state_log_probs[genomic_index, state] = (
