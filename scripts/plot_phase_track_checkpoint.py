@@ -34,6 +34,8 @@ STATE_COLORS = [
     "#4575b4",
     "#91bfdb",
     "#e0f3f8",
+    "#66c2a5",
+    "#3288bd",
 ]
 COLLAPSED_COLORS = ["#d73027", "#fc8d59", "#fee08b", "#d9d9d9"]
 
@@ -154,7 +156,7 @@ def plot_phase(
     x = np.arange(start, end)
 
     state_cmap = ListedColormap(STATE_COLORS)
-    state_norm = BoundaryNorm(np.arange(-0.5, 6.5, 1), state_cmap.N)
+    state_norm = BoundaryNorm(np.arange(-0.5, len(module.PHASE_LABELS) + 0.5, 1), state_cmap.N)
     collapsed_cmap = ListedColormap(COLLAPSED_COLORS)
     collapsed_norm = BoundaryNorm(np.arange(-0.5, 4.5, 1), collapsed_cmap.N)
 
@@ -165,7 +167,7 @@ def plot_phase(
     confidence = probs[example_index, sl].max(dim=-1).values.detach().cpu().numpy()
     donor = splice_tracks[example_index, sl, 0].detach().cpu().numpy()
     acceptor = splice_tracks[example_index, sl, 1].detach().cpu().numpy()
-    correct_6 = (true_6 == pred_6).astype(float)
+    correct_state = (true_6 == pred_6).astype(float)
 
     fig, axes = plt.subplots(
         6,
@@ -175,16 +177,16 @@ def plot_phase(
         gridspec_kw={"height_ratios": [0.45, 0.45, 0.45, 0.45, 1.0, 1.0]},
     )
     axes[0].imshow(true_6[None, :], aspect="auto", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
-    axes[0].set_ylabel("true\n6-state", rotation=0, ha="right", va="center")
+    axes[0].set_ylabel("true\nstate", rotation=0, ha="right", va="center")
     axes[1].imshow(pred_6[None, :], aspect="auto", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
-    axes[1].set_ylabel("pred\n6-state", rotation=0, ha="right", va="center")
+    axes[1].set_ylabel("pred\nstate", rotation=0, ha="right", va="center")
     axes[2].imshow(true_4[None, :], aspect="auto", cmap=collapsed_cmap, norm=collapsed_norm, extent=[start, end, 0, 1])
     axes[2].set_ylabel("true\n4-track", rotation=0, ha="right", va="center")
     axes[3].imshow(pred_4[None, :], aspect="auto", cmap=collapsed_cmap, norm=collapsed_norm, extent=[start, end, 0, 1])
     axes[3].set_ylabel("pred\n4-track", rotation=0, ha="right", va="center")
 
-    axes[4].fill_between(x, 0, correct_6, step="pre", color="#1a9850", alpha=0.75, label="6-state correct")
-    axes[4].fill_between(x, correct_6, 1, step="pre", color="#d73027", alpha=0.75, label="6-state wrong")
+    axes[4].fill_between(x, 0, correct_state, step="pre", color="#1a9850", alpha=0.75, label="state correct")
+    axes[4].fill_between(x, correct_state, 1, step="pre", color="#d73027", alpha=0.75, label="state wrong")
     axes[4].plot(x, confidence, color="black", lw=1.0, label="confidence")
     axes[4].set_ylim(-0.05, 1.05)
     axes[4].set_ylabel("correct\nconf", rotation=0, ha="right", va="center")
@@ -280,7 +282,7 @@ def main() -> None:
         example = examples[example_index]
         genome_length = len(str(example["genome"]))
         real_mask = genome_mask[example_index]
-        wrong_6 = int(((pred[example_index] != targets[example_index]) & real_mask).sum().item())
+        wrong_state = int(((pred[example_index] != targets[example_index]) & real_mask).sum().item())
         wrong_4 = int(
             (
                 (collapse_to_4(pred[example_index]) != collapse_to_4(targets[example_index]))
@@ -296,7 +298,7 @@ def main() -> None:
             "exon_count": int(example["exon_count"]),
             "exon_lengths": list(map(int, example["exon_lengths"])),
             "intron_lengths": list(map(int, example["intron_lengths"])),
-            "wrong_6_state_bases": wrong_6,
+            "wrong_state_bases": wrong_state,
             "wrong_collapsed_4_track_bases": wrong_4,
         }
         summary["examples"].append(example_summary)
@@ -333,7 +335,7 @@ def main() -> None:
             targets=targets,
             pred=pred,
             probs=probs,
-            output_path=args.output_dir / f"example_{example_index:02d}_first_6_state_error.png",
+            output_path=args.output_dir / f"example_{example_index:02d}_first_state_error.png",
         )
 
     summary_path = args.output_dir / "summary.json"

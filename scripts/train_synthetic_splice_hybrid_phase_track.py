@@ -61,8 +61,20 @@ except ImportError as exc:
 
 
 NONSTOP_AA = [aa for aa in AMINO_ACIDS if aa != "*"]
-MODEL_TRACK_NAMES = ("donor", "acceptor")
-ANNOTATION_TRACK_NAMES = ("exon_prior", "donor", "acceptor", "true_transcript_rank")
+MODEL_TRACK_NAMES = ("donor", "acceptor", "start_codon", "stop_codon")
+ANNOTATION_TRACK_NAMES = (
+    "exon_prior",
+    "donor",
+    "acceptor",
+    "true_cds_rank",
+    "region_code",
+    "start_codon",
+    "stop_codon",
+)
+REGION_INTRON = 0.0
+REGION_CDS = 1.0
+REGION_UTR5 = 2.0
+REGION_UTR3 = 3.0
 
 
 def random_dna(length: int, rng: random.Random) -> str:
@@ -82,8 +94,23 @@ def random_protein(codons: int, rng: random.Random, terminal_stop: bool = True) 
     return "".join(rng.choice(NONSTOP_AA) for _ in range(codons))
 
 
+def random_coding_protein(codons: int, rng: random.Random) -> str:
+    if codons < 2:
+        raise ValueError("coding sequences need at least a start and stop codon")
+    return "M" + "".join(rng.choice(NONSTOP_AA) for _ in range(codons - 2)) + "*"
+
+
 def reverse_translate(protein: str, rng: random.Random) -> str:
     return "".join(rng.choice(CODONS_BY_AA[amino_acid]) for amino_acid in protein)
+
+
+def reverse_translate_coding_protein(protein: str, rng: random.Random) -> str:
+    if not protein or protein[0] != "M" or protein[-1] != "*":
+        raise ValueError("coding proteins must start with M and end with *")
+    codons = ["ATG"]
+    codons.extend(rng.choice(CODONS_BY_AA[amino_acid]) for amino_acid in protein[1:-1])
+    codons.append(rng.choice(CODONS_BY_AA["*"]))
+    return "".join(codons)
 
 
 def random_split_lengths(total_length: int, parts: int, rng: random.Random, min_part: int = 5) -> list[int]:
@@ -107,6 +134,7 @@ def random_sampled_exon_lengths(
     max_exon_bases: int,
     median_exon_bases: int,
     rare_short_exon_prob: float,
+    force_total_multiple_of_3: bool = True,
 ) -> list[int]:
     """Sample exon lengths with a long tail and occasional very short exons."""
 
@@ -123,7 +151,7 @@ def random_sampled_exon_lengths(
         lengths.append(length)
 
     remainder = sum(lengths) % 3
-    if remainder:
+    if force_total_multiple_of_3 and remainder:
         add_bases = 3 - remainder
         for index in range(len(lengths) - 1, -1, -1):
             if lengths[index] + add_bases <= max_exon_bases:
@@ -150,43 +178,102 @@ def make_synthetic_example(
     median_exon_bases: int = 50,
     rare_short_exon_prob: float = 0.05,
     exon_length_mode: str = "split",
+    min_utr5_length: int = 0,
+    max_utr5_length: int = 0,
+    min_utr3_length: int = 0,
+    max_utr3_length: int = 0,
 ) -> dict[str, object]:
     if exon_length_mode == "sampled":
-        exon_lengths = random_sampled_exon_lengths(
-            exon_count=exon_count,
-            rng=rng,
-            min_exon_bases=min_exon_bases,
-            max_exon_bases=max_exon_bases,
-            median_exon_bases=median_exon_bases,
-            rare_short_exon_prob=rare_short_exon_prob,
-        )
-        protein_codons = sum(exon_lengths) // 3
-        protein = random_protein(protein_codons, rng)
-        cds = reverse_translate(protein, rng)
+        for _attempt in range(100):
+            exon_lengths = random_sampled_exon_lengths(
+                exon_count=exon_count,
+                rng=rng,
+                min_exon_bases=min_exon_bases,
+                max_exon_bases=max_exon_bases,
+                median_exon_bases=median_exon_bases,
+                rare_short_exon_prob=rare_short_exon_prob,
+                force_total_multiple_of_3=False,
+            )
+            total_exonic_bases = sum(exon_lengths)
+            if total_exonic_bases < min_utr5_length + min_utr3_length + 6:
+                continue
+            effective_max_utr5 = min(max_utr5_length, total_exonic_bases - min_utr3_length - 6)
+            if effective_max_utr5 < min_utr5_length:
+                continue
+            utr5_length = rng.randint(min_utr5_length, effective_max_utr5)
+            effective_max_utr3 = min(max_utr3_length, total_exonic_bases - utr5_length - 6)
+            if effective_max_utr3 < min_utr3_length:
+                continue
+            utr3_length = rng.randint(min_utr3_length, effective_max_utr3)
+            coding_bases = total_exonic_bases - utr5_length - utr3_length
+            if coding_bases < 6:
+                continue
+            remainder = coding_bases % 3
+            if remainder:
+                if utr3_length + remainder <= max_utr3_length:
+                    utr3_length += remainder
+                elif utr5_length + remainder <= max_utr5_length:
+                    utr5_length += remainder
+                else:
+                    continue
+            coding_bases = sum(exon_lengths) - utr5_length - utr3_length
+            if coding_bases >= 6 and coding_bases % 3 == 0:
+                break
+        else:
+            raise ValueError("could not sample exon/UTR lengths with an in-frame CDS")
+        protein_codons = coding_bases // 3
     else:
-        protein = random_protein(protein_codons, rng)
-        cds = reverse_translate(protein, rng)
-        exon_lengths = random_split_lengths(len(cds), exon_count, rng, min_part=min_exon_bases)
+        utr5_length = rng.randint(min_utr5_length, max_utr5_length)
+        utr3_length = rng.randint(min_utr3_length, max_utr3_length)
+        exon_lengths = random_split_lengths(
+            utr5_length + protein_codons * 3 + utr3_length,
+            exon_count,
+            rng,
+            min_part=min_exon_bases,
+        )
+
+    protein = random_coding_protein(protein_codons, rng)
+    cds = reverse_translate_coding_protein(protein, rng)
+    utr5 = random_dna(utr5_length, rng)
+    utr3 = random_dna(utr3_length, rng)
+    transcript = utr5 + cds + utr3
 
     genome_parts = []
     exon_prior = []
     donor_track = []
     acceptor_track = []
-    true_transcript_rank = []
+    start_codon_track = []
+    stop_codon_track = []
+    true_cds_rank = []
+    region_code = []
     intron_lengths = []
 
-    cds_cursor = 0
+    transcript_length = len(transcript)
     transcript_cursor = 0
     for exon_index, exon_length in enumerate(exon_lengths):
-        exon = cds[cds_cursor : cds_cursor + exon_length]
-        cds_cursor += exon_length
+        exon = transcript[transcript_cursor : transcript_cursor + exon_length]
         for base_index, base in enumerate(exon):
+            transcript_index = transcript_cursor + base_index
+            cds_rank = transcript_index - utr5_length
+            is_cds = 0 <= cds_rank < len(cds)
+            is_utr5 = transcript_index < utr5_length
+            is_utr3 = transcript_index >= utr5_length + len(cds)
             genome_parts.append(base)
             exon_prior.append(1.0)
             donor_track.append(1.0 if exon_index < exon_count - 1 and base_index == exon_length - 1 else 0.0)
             acceptor_track.append(1.0 if exon_index > 0 and base_index == 0 else 0.0)
-            true_transcript_rank.append(float(transcript_cursor))
-            transcript_cursor += 1
+            start_codon_track.append(1.0 if 0 <= cds_rank < 3 else 0.0)
+            stop_codon_track.append(1.0 if len(cds) - 3 <= cds_rank < len(cds) else 0.0)
+            true_cds_rank.append(float(cds_rank) if is_cds else -1.0)
+            if is_cds:
+                region_code.append(REGION_CDS)
+            elif is_utr5:
+                region_code.append(REGION_UTR5)
+            elif is_utr3:
+                region_code.append(REGION_UTR3)
+            else:
+                raise RuntimeError(f"transcript index outside transcript: {transcript_index=} {transcript_length=}")
+        transcript_cursor += exon_length
 
         if exon_index < exon_count - 1:
             intron_length = rng.randint(min_intron_length, max_intron_length)
@@ -197,25 +284,33 @@ def make_synthetic_example(
                 exon_prior.append(0.0)
                 donor_track.append(0.0)
                 acceptor_track.append(0.0)
-                true_transcript_rank.append(-1.0)
+                start_codon_track.append(0.0)
+                stop_codon_track.append(0.0)
+                true_cds_rank.append(-1.0)
+                region_code.append(REGION_INTRON)
 
     genome = "".join(genome_parts)
     target = torch.tensor([AA_TO_INDEX[amino_acid] for amino_acid in protein], dtype=torch.long)
     cds_target = torch.tensor([DNA_TO_INDEX[base] for base in cds], dtype=torch.long)
-    model_tracks = torch.tensor(list(zip(donor_track, acceptor_track)), dtype=torch.float32)
+    model_tracks = torch.tensor(list(zip(donor_track, acceptor_track, start_codon_track, stop_codon_track)), dtype=torch.float32)
     emit_target = torch.tensor(exon_prior, dtype=torch.float32)
     annotations = torch.tensor(
-        list(zip(exon_prior, donor_track, acceptor_track, true_transcript_rank)),
+        list(zip(exon_prior, donor_track, acceptor_track, true_cds_rank, region_code, start_codon_track, stop_codon_track)),
         dtype=torch.float32,
     )
     return {
         "genome": genome,
         "protein": protein,
         "cds": cds,
+        "utr5": utr5,
+        "utr3": utr3,
+        "transcript": transcript,
         "protein_codons": protein_codons,
         "exon_count": exon_count,
         "exon_lengths": exon_lengths,
         "intron_lengths": intron_lengths,
+        "utr5_length": utr5_length,
+        "utr3_length": utr3_length,
         "dna": one_hot_dna(genome),
         "tracks": model_tracks,
         "annotations": annotations,
@@ -237,6 +332,10 @@ def make_batch(
     median_exon_bases: int = 50,
     rare_short_exon_prob: float = 0.05,
     exon_length_mode: str = "split",
+    min_utr5_length: int = 0,
+    max_utr5_length: int = 0,
+    min_utr3_length: int = 0,
+    max_utr3_length: int = 0,
     min_intron_length: int = 30,
     max_intron_length: int = 300,
     length_bucket_size: int = 256,
@@ -276,6 +375,10 @@ def make_batch(
                 median_exon_bases=median_exon_bases,
                 rare_short_exon_prob=rare_short_exon_prob,
                 exon_length_mode=exon_length_mode,
+                min_utr5_length=min_utr5_length,
+                max_utr5_length=max_utr5_length,
+                min_utr3_length=min_utr3_length,
+                max_utr3_length=max_utr3_length,
             )
         )
     max_length = round_up_to_multiple(max(example["dna"].shape[0] for example in examples), length_bucket_size)
@@ -607,8 +710,9 @@ def estimate_max_genome_length(args: argparse.Namespace) -> int:
         max_cds_bases = args.max_exon_count * args.max_exon_bases
     else:
         max_cds_bases = args.max_protein_codons * 3
+    max_utr_bases = args.max_utr5_length + args.max_utr3_length
     max_intronic_bases = max(0, args.max_exon_count - 1) * args.max_intron_length
-    return max_cds_bases + max_intronic_bases
+    return max_cds_bases + max_utr_bases + max_intronic_bases
 
 
 def resolve_micro_batch_size(args: argparse.Namespace) -> int:
@@ -1026,6 +1130,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--assignment-entropy-weight must be non-negative")
     if args.not_coding_weight < 0:
         raise ValueError("--not-coding-weight must be non-negative")
+    if args.utr_weight < 0:
+        raise ValueError("--utr-weight must be non-negative")
+    if args.min_utr5_length < 0 or args.min_utr3_length < 0:
+        raise ValueError("minimum UTR lengths must be non-negative")
+    if args.max_utr5_length < args.min_utr5_length:
+        raise ValueError("--max-utr5-length must be >= --min-utr5-length")
+    if args.max_utr3_length < args.min_utr3_length:
+        raise ValueError("--max-utr3-length must be >= --min-utr3-length")
     if args.local_conv_kernel < 1 or args.local_conv_kernel % 2 == 0:
         raise ValueError("--local-conv-kernel must be a positive odd integer")
     if args.head_conv_kernel < 1 or args.head_conv_kernel % 2 == 0:
@@ -1085,6 +1197,11 @@ def train(args: argparse.Namespace) -> None:
         "exon length target: "
         f"min={args.min_exon_bases} bp, median~{args.median_exon_bases} bp, "
         f"max={args.max_exon_bases} bp, rare short exon probability={args.rare_short_exon_prob:.3f}"
+    )
+    print(
+        "UTR length target: "
+        f"5prime={args.min_utr5_length}-{args.max_utr5_length} bp, "
+        f"3prime={args.min_utr3_length}-{args.max_utr3_length} bp"
     )
     print(
         "protein length controls: "
@@ -1153,6 +1270,10 @@ def train(args: argparse.Namespace) -> None:
             median_exon_bases=args.median_exon_bases,
             rare_short_exon_prob=args.rare_short_exon_prob,
             exon_length_mode=args.exon_length_mode,
+            min_utr5_length=args.min_utr5_length,
+            max_utr5_length=args.max_utr5_length,
+            min_utr3_length=args.min_utr3_length,
+            max_utr3_length=args.max_utr3_length,
             min_intron_length=args.min_intron_length,
             max_intron_length=args.max_intron_length,
             length_bucket_size=args.length_bucket_size,
@@ -1235,6 +1356,8 @@ def train(args: argparse.Namespace) -> None:
         target_lengths_all = []
         genome_lengths = []
         intron_lengths = []
+        utr5_lengths = []
+        utr3_lengths = []
         assignment_entropy_sum = 0.0
         aa_confidence_sum = 0.0
         nucleotide_confidence_sum = 0.0
@@ -1586,20 +1709,24 @@ PHASE_LABELS = (
     "intron_carry_0",
     "intron_carry_1",
     "intron_carry_2",
+    "utr_5",
+    "utr_3",
 )
 DEFAULT_INTRON_CARRY_INDEX = 3
+UTR5_INDEX = 6
+UTR3_INDEX = 7
 
 
 class MambaPhaseTrackPredictor(nn.Module):
     """Genome-registered CDS phase predictor.
 
-    The output has shape B x L x 6 and stays aligned to the input DNA bases:
-    exon phase 0/1/2, or intron carrying the next exon phase 0/1/2.
+    The output has shape B x L x 8 and stays aligned to the input DNA bases:
+    exon phase 0/1/2, intron carrying the next exon phase 0/1/2, 5' UTR, or 3' UTR.
     """
 
     def __init__(
         self,
-        input_dim: int = 6,
+        input_dim: int = 8,
         hidden_dim: int = 64,
         layers: int = 3,
         chunk_size: int = 32,
@@ -1717,7 +1844,15 @@ def phase_targets_from_examples(
         genome_length = annotations.shape[0]
         genome_mask[:genome_length] = True
         transcript_rank = annotations[:, 3]
+        region_code = annotations[:, 4] if annotations.shape[1] > 4 else torch.where(
+            transcript_rank >= 0,
+            torch.full_like(transcript_rank, REGION_CDS),
+            torch.full_like(transcript_rank, REGION_INTRON),
+        )
         coding_mask = transcript_rank >= 0
+        intron_mask = region_code == REGION_INTRON
+        target[:genome_length][region_code == REGION_UTR5] = UTR5_INDEX
+        target[:genome_length][region_code == REGION_UTR3] = UTR3_INDEX
         coding_indices = torch.nonzero(coding_mask, as_tuple=False).flatten()
         if coding_indices.numel() > 0:
             coding_phase = transcript_rank[coding_mask].long() % 3
@@ -1725,15 +1860,20 @@ def phase_targets_from_examples(
             first_coding_index = int(coding_indices[0].item())
             last_seen_next_phase = 0
             if first_coding_index > 0:
-                target[:first_coding_index] = 3
+                prefix_mask = intron_mask[:first_coding_index]
+                target[:first_coding_index][prefix_mask] = 3
             previous_index = None
             for genomic_index, phase in zip(coding_indices.tolist(), coding_phase.tolist()):
                 if previous_index is not None and genomic_index > previous_index + 1:
-                    target[previous_index + 1 : genomic_index] = 3 + last_seen_next_phase
+                    gap = slice(previous_index + 1, genomic_index)
+                    gap_intron_mask = intron_mask[gap]
+                    target[gap][gap_intron_mask] = 3 + last_seen_next_phase
                 last_seen_next_phase = (int(phase) + 1) % 3
                 previous_index = int(genomic_index)
             if previous_index is not None and previous_index + 1 < genome_length:
-                target[previous_index + 1 : genome_length] = 3 + last_seen_next_phase
+                suffix = slice(previous_index + 1, genome_length)
+                suffix_intron_mask = intron_mask[suffix]
+                target[suffix][suffix_intron_mask] = 3
         rows.append(target)
         mask_rows.append(genome_mask)
     return torch.stack(rows).to(device), torch.stack(mask_rows).to(device)
@@ -1742,10 +1882,15 @@ def phase_targets_from_examples(
 def phase_metrics(logits: torch.Tensor, target: torch.Tensor, genome_mask: torch.Tensor) -> dict[str, float]:
     predicted = logits.argmax(dim=-1)
     coding_mask = genome_mask & (target < 3)
+    intron_carry_mask = genome_mask & (target >= 3) & (target < 6)
+    utr5_mask = genome_mask & (target == UTR5_INDEX)
+    utr3_mask = genome_mask & (target == UTR3_INDEX)
     noncoding_mask = genome_mask & (target >= 3)
     correct = (predicted == target) & genome_mask
     coding_correct = (predicted == target) & coding_mask
-    noncoding_correct = (predicted == target) & noncoding_mask
+    intron_carry_correct = (predicted == target) & intron_carry_mask
+    utr5_correct = (predicted == target) & utr5_mask
+    utr3_correct = (predicted == target) & utr3_mask
     collapsed_predicted = torch.where(predicted < 3, predicted, torch.full_like(predicted, 3))
     collapsed_target = torch.where(target < 3, target, torch.full_like(target, 3))
     collapsed_correct = (collapsed_predicted == collapsed_target) & genome_mask
@@ -1760,7 +1905,7 @@ def phase_metrics(logits: torch.Tensor, target: torch.Tensor, genome_mask: torch
         phase_metrics_by_class[f"exon_phase_{phase_index}_accuracy"] = (
             float(phase_correct.sum().item()) / max(1, int(phase_mask.sum().item()))
         )
-        carry_mask = noncoding_mask & (target == phase_index + 3)
+        carry_mask = intron_carry_mask & (target == phase_index + 3)
         carry_correct = (predicted == target) & carry_mask
         phase_metrics_by_class[f"intron_carry_{phase_index}_accuracy"] = (
             float(carry_correct.sum().item()) / max(1, int(carry_mask.sum().item()))
@@ -1770,7 +1915,9 @@ def phase_metrics(logits: torch.Tensor, target: torch.Tensor, genome_mask: torch
         "collapsed_accuracy": float(collapsed_correct.sum().item()) / max(1, int(genome_mask.sum().item())),
         "coding_phase_accuracy": float(coding_correct.sum().item()) / max(1, int(coding_mask.sum().item())),
         "exon_phase_accuracy": float(coding_correct.sum().item()) / max(1, int(coding_mask.sum().item())),
-        "intron_carry_accuracy": float(noncoding_correct.sum().item()) / max(1, int(noncoding_mask.sum().item())),
+        "intron_carry_accuracy": float(intron_carry_correct.sum().item()) / max(1, int(intron_carry_mask.sum().item())),
+        "utr5_accuracy": float(utr5_correct.sum().item()) / max(1, int(utr5_mask.sum().item())),
+        "utr3_accuracy": float(utr3_correct.sum().item()) / max(1, int(utr3_mask.sum().item())),
         "not_coding_accuracy": float(collapsed_noncoding_correct.sum().item()) / max(1, int(noncoding_mask.sum().item())),
         "exact_match": float(exact.item()),
         "coding_exact_match": float(coding_exact.item()),
@@ -1784,7 +1931,7 @@ def format_phase_report(label: str, metrics: dict[str, float]) -> str:
     return (
         f"{label:<10} loss={metrics['loss']:.4f}\n"
         f"{'':<10} genome exact={metrics['exact_match']:.3f}, "
-        f"6-state accuracy={metrics['accuracy']:.3f}, collapsed 4-track={metrics['collapsed_accuracy']:.3f}\n"
+        f"8-state accuracy={metrics['accuracy']:.3f}, collapsed 4-track={metrics['collapsed_accuracy']:.3f}\n"
         f"{'':<10} exon phase exact={metrics['coding_exact_match']:.3f}, "
         f"exon phase base={metrics['exon_phase_accuracy']:.3f}, "
         f"phase0={metrics['exon_phase_0_accuracy']:.3f}, "
@@ -1795,6 +1942,7 @@ def format_phase_report(label: str, metrics: dict[str, float]) -> str:
         f"carry0={metrics['intron_carry_0_accuracy']:.3f}, "
         f"carry1={metrics['intron_carry_1_accuracy']:.3f}, "
         f"carry2={metrics['intron_carry_2_accuracy']:.3f}\n"
+        f"{'':<10} UTR base 5prime={metrics['utr5_accuracy']:.3f}, 3prime={metrics['utr3_accuracy']:.3f}\n"
         f"{'':<10} confidence={metrics['confidence']:.3f}"
     )
 
@@ -1803,7 +1951,7 @@ def timed(message: str, start_time: float) -> None:
     print(f"{message} ({time.perf_counter() - start_time:.1f}s)", flush=True)
 
 
-def load_matching_model_weights(path: Path, *, model: nn.Module, device: torch.device) -> None:
+def load_matching_model_weights(path: Path, *, model: nn.Module, device: torch.device) -> set[str]:
     start_time = time.perf_counter()
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
@@ -1812,15 +1960,37 @@ def load_matching_model_weights(path: Path, *, model: nn.Module, device: torch.d
     timed("checkpoint loaded on CPU", start_time)
     source_state = checkpoint["model_state_dict"]
     target_state = model.state_dict()
-    matching_state = {
-        key: value
-        for key, value in source_state.items()
-        if key in target_state and tuple(value.shape) == tuple(target_state[key].shape)
-    }
+    adapted_state = dict(target_state)
+    exact_count = 0
+    partial_count = 0
+    partial_names = []
+    for key, source_value in source_state.items():
+        if key not in target_state:
+            continue
+        target_value = target_state[key]
+        if tuple(source_value.shape) == tuple(target_value.shape):
+            adapted_state[key] = source_value
+            exact_count += 1
+            continue
+        if source_value.ndim != target_value.ndim:
+            continue
+        if any(source_dim <= 0 or target_dim <= 0 for source_dim, target_dim in zip(source_value.shape, target_value.shape)):
+            continue
+        copied_value = target_value.clone()
+        if key == "input_projection.weight" and target_value.shape[1] > source_value.shape[1]:
+            copied_value[:, source_value.shape[1] :] = 0.0
+        slices = tuple(slice(0, min(source_dim, target_dim)) for source_dim, target_dim in zip(source_value.shape, target_value.shape))
+        copied_value[slices] = source_value[slices]
+        adapted_state[key] = copied_value
+        partial_count += 1
+        partial_names.append(key)
     copy_start = time.perf_counter()
-    model.load_state_dict({**target_state, **matching_state})
-    timed(f"copied {len(matching_state)} compatible tensors into phase model", copy_start)
+    model.load_state_dict(adapted_state)
+    timed(f"copied {exact_count} exact tensors and {partial_count} partial tensors into phase model", copy_start)
+    if partial_names:
+        print("partially initialized widened tensors: " + ", ".join(partial_names), flush=True)
     print(f"loaded compatible tensors from: {path}", flush=True)
+    return set(source_state)
 
 
 def slice_training_batch(
@@ -1892,6 +2062,11 @@ def train_phase(args: argparse.Namespace) -> None:
         f"max={args.max_exon_bases} bp, rare short exon probability={args.rare_short_exon_prob:.3f}"
     )
     print(
+        "UTR length target: "
+        f"5prime={args.min_utr5_length}-{args.max_utr5_length} bp, "
+        f"3prime={args.min_utr3_length}-{args.max_utr3_length} bp"
+    )
+    print(
         "architecture: "
         f"local conv + {'bidirectional' if args.bidirectional else 'forward-only'} Mamba2 "
         f"+ {args.attention_layers} local attention blocks, "
@@ -1927,10 +2102,13 @@ def train_phase(args: argparse.Namespace) -> None:
         if not init_path.exists():
             raise FileNotFoundError(f"Initial checkpoint does not exist: {init_path}")
         print(f"loading compatible weights from: {init_path}", flush=True)
-        load_matching_model_weights(init_path, model=model, device=device)
+        loaded_weight_names = load_matching_model_weights(init_path, model=model, device=device)
         if args.bidirectional:
-            model.seed_reverse_from_forward()
-            print("seeded reverse Mamba blocks from loaded forward blocks", flush=True)
+            if any(name.startswith("reverse_scan_blocks.") for name in loaded_weight_names):
+                print("loaded reverse Mamba blocks from checkpoint", flush=True)
+            else:
+                model.seed_reverse_from_forward()
+                print("seeded reverse Mamba blocks from loaded forward blocks", flush=True)
 
     checkpoint_dir = resolve_checkpoint_path(args.checkpoint_dir)
     print(f"checkpoint directory: {checkpoint_dir}")
@@ -1953,6 +2131,10 @@ def train_phase(args: argparse.Namespace) -> None:
             median_exon_bases=args.median_exon_bases,
             rare_short_exon_prob=args.rare_short_exon_prob,
             exon_length_mode=args.exon_length_mode,
+            min_utr5_length=args.min_utr5_length,
+            max_utr5_length=args.max_utr5_length,
+            min_utr3_length=args.min_utr3_length,
+            max_utr3_length=args.max_utr3_length,
             min_intron_length=args.min_intron_length,
             max_intron_length=args.max_intron_length,
             length_bucket_size=args.length_bucket_size,
@@ -1963,7 +2145,16 @@ def train_phase(args: argparse.Namespace) -> None:
         print("fixed validation disabled", flush=True)
 
     class_weights = torch.tensor(
-        [1.0, 1.0, 1.0, args.not_coding_weight, args.not_coding_weight, args.not_coding_weight],
+        [
+            1.0,
+            1.0,
+            1.0,
+            args.not_coding_weight,
+            args.not_coding_weight,
+            args.not_coding_weight,
+            args.utr_weight,
+            args.utr_weight,
+        ],
         dtype=torch.float32,
         device=device,
     )
@@ -2004,6 +2195,10 @@ def train_phase(args: argparse.Namespace) -> None:
             median_exon_bases=args.median_exon_bases,
             rare_short_exon_prob=args.rare_short_exon_prob,
             exon_length_mode=args.exon_length_mode,
+            min_utr5_length=args.min_utr5_length,
+            max_utr5_length=args.max_utr5_length,
+            min_utr3_length=args.min_utr3_length,
+            max_utr3_length=args.max_utr3_length,
             min_intron_length=args.min_intron_length,
             max_intron_length=args.max_intron_length,
             length_bucket_size=args.length_bucket_size,
@@ -2053,6 +2248,8 @@ def train_phase(args: argparse.Namespace) -> None:
                 total_examples += micro_batch_size
                 target_lengths_all.extend(int(example["protein_codons"]) for example in examples)
                 genome_lengths.extend(len(str(example["genome"])) for example in examples)
+                utr5_lengths.extend(int(example["utr5_length"]) for example in examples)
+                utr3_lengths.extend(int(example["utr3_length"]) for example in examples)
                 intron_lengths.extend(
                     int(intron_length)
                     for example in examples
@@ -2074,6 +2271,10 @@ def train_phase(args: argparse.Namespace) -> None:
             "max_genome_length": max(genome_lengths) if genome_lengths else 0,
             "mean_intron_length": sum(intron_lengths) / len(intron_lengths) if intron_lengths else 0.0,
             "max_intron_length": max(intron_lengths) if intron_lengths else 0,
+            "mean_utr5_length": sum(utr5_lengths) / max(1, len(utr5_lengths)),
+            "max_utr5_length": max(utr5_lengths) if utr5_lengths else 0,
+            "mean_utr3_length": sum(utr3_lengths) / max(1, len(utr3_lengths)),
+            "max_utr3_length": max(utr3_lengths) if utr3_lengths else 0,
             **{key: value / max(1, total_examples) for key, value in metric_sums.items()},
         }
 
@@ -2128,6 +2329,11 @@ def train_phase(args: argparse.Namespace) -> None:
                     f"{final_metrics['max_intron_length']} bp, microbatch="
                     f"{effective_micro_batch_size}/{args.batch_size}"
                 ),
+                (
+                    f"UTRs       5prime mean/max={final_metrics['mean_utr5_length']:.0f}/"
+                    f"{final_metrics['max_utr5_length']} bp, 3prime mean/max="
+                    f"{final_metrics['mean_utr3_length']:.0f}/{final_metrics['max_utr3_length']} bp"
+                ),
                 format_phase_report("train", final_metrics),
             ]
             if validation_metrics is not None:
@@ -2165,6 +2371,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--median-exon-bases", type=int, default=50)
     parser.add_argument("--rare-short-exon-prob", type=float, default=0.05)
     parser.add_argument("--exon-length-mode", choices=("split", "sampled"), default="split")
+    parser.add_argument("--min-utr5-length", type=int, default=0)
+    parser.add_argument("--max-utr5-length", type=int, default=0)
+    parser.add_argument("--min-utr3-length", type=int, default=0)
+    parser.add_argument("--max-utr3-length", type=int, default=0)
     parser.add_argument("--eval-protein-codons", type=int, default=48)
     parser.add_argument("--eval-exon-count", type=int, default=3)
     parser.add_argument("--min-intron-length", type=int, default=10)
@@ -2188,6 +2398,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adam-beta2", type=float, default=0.95)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--not-coding-weight", type=float, default=0.25)
+    parser.add_argument("--utr-weight", type=float, default=0.5)
     parser.add_argument("--nucleotide-loss-weight", type=float, default=0.5)
     parser.add_argument("--emit-loss-weight", type=float, default=1.0)
     parser.add_argument("--emit-loss-anneal-steps", type=int, default=0)
