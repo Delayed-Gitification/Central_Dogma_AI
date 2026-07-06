@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 import sys
 from pathlib import Path
@@ -12,6 +13,30 @@ import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+
+def configure_mamba_cache() -> Path:
+    """Keep Triton/Mamba JIT artifacts out of quota-limited default caches."""
+
+    cache_root = Path(
+        os.environ.get(
+            "CACHE_ROOT",
+            ROOT / ".cache" / "synthetic_splice_official_mamba2_emit_skip_splice_sites",
+        )
+    ).expanduser()
+    cache_dirs = {
+        "TRITON_CACHE_DIR": cache_root / "triton",
+        "TORCH_EXTENSIONS_DIR": cache_root / "torch",
+        "XDG_CACHE_HOME": cache_root / "xdg",
+        "TMPDIR": cache_root / "tmp",
+    }
+    for env_name, path in cache_dirs.items():
+        os.environ.setdefault(env_name, str(path))
+        Path(os.environ[env_name]).mkdir(parents=True, exist_ok=True)
+    return cache_root
+
+
+MAMBA_CACHE_ROOT = configure_mamba_cache()
 
 from central_dogma_ai.biology import (  # noqa: E402
     AMINO_ACIDS,
@@ -883,6 +908,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"Using device: {device}")
     if device.type == "cuda":
         print(f"CUDA device: {torch.cuda.get_device_name(device)}")
+    print(f"Mamba/Triton cache root: {MAMBA_CACHE_ROOT}")
     print(f"model tracks: {MODEL_TRACK_NAMES}")
     print(f"annotation tracks generated: {ANNOTATION_TRACK_NAMES}")
     print("true_transcript_rank is used only for monotonic assignment diagnostics")
