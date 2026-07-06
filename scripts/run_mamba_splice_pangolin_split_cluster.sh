@@ -4,6 +4,19 @@ set -euo pipefail
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 
+if [[ -z "${CONDA_PREFIX:-}" ]] && command -v conda >/dev/null 2>&1; then
+  # Slurm batch shells often do not inherit the interactive conda activation.
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate bipangolin
+fi
+
+echo "host: $(hostname)"
+echo "python: $(command -v python)"
+echo "CONDA_PREFIX: ${CONDA_PREFIX:-unset}"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-unset}"
+nvidia-smi -L || true
+python -c 'import torch; print("torch", torch.__version__, "cuda_available", torch.cuda.is_available(), "torch_cuda", torch.version.cuda, "device_count", torch.cuda.device_count())'
+
 # Keep Mamba/Triton JIT artifacts out of home/conda cache space on the cluster.
 CACHE_ROOT="${CACHE_ROOT:-/nemo/lab/ulej/home/users/wilkino/tmp/mamba_splice_pangolin_split_cache}"
 mkdir -p "$CACHE_ROOT"/{triton,torch,xdg,tmp}
