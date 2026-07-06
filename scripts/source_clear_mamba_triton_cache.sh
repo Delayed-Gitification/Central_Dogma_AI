@@ -19,7 +19,7 @@ fail_mamba_cache_setup() {
   return 1 2>/dev/null || exit 1
 }
 
-CACHE_ROOT="${MAMBA_TRITON_CACHE_ROOT:-/nemo/lab/ulej/home/users/wilkino/tmp/mamba_triton_cache}"
+CACHE_ROOT="${MAMBA_TRITON_CACHE_ROOT:-/nemo/lab/ulej/home/users/${USER:-wilkino}/tmp/mamba_triton_cache}"
 
 case "$CACHE_ROOT" in
   ""|"/"|"$HOME"|"$HOME/"|"/camp/lab/ulej/home/shared/Oscar/.conda"|"/camp/lab/ulej/home/shared/Oscar/.conda/")
@@ -30,6 +30,12 @@ esac
 
 echo "Clearing Mamba/Triton cache root:"
 echo "  $CACHE_ROOT"
+
+echo "Clearing Triton default runtime caches:"
+echo "  $HOME/.triton"
+echo "  $HOME/.cache/triton"
+rm -rf "$HOME"/.triton \
+       "$HOME"/.cache/triton || fail_mamba_cache_setup "could not clear Triton default caches"
 
 rm -rf "$CACHE_ROOT"/triton \
        "$CACHE_ROOT"/torch_extensions \

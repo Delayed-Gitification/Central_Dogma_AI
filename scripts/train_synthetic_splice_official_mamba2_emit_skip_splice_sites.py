@@ -19,10 +19,9 @@ def configure_mamba_cache() -> Path:
     """Keep Triton/Mamba JIT artifacts out of quota-limited default caches."""
 
     cache_root = Path(
-        os.environ.get(
-            "CACHE_ROOT",
-            ROOT / ".cache" / "synthetic_splice_official_mamba2_emit_skip_splice_sites",
-        )
+        os.environ.get("MAMBA_TRITON_CACHE_ROOT")
+        or os.environ.get("CACHE_ROOT")
+        or ROOT / ".cache" / "synthetic_splice_official_mamba2_emit_skip_splice_sites"
     ).expanduser()
     cache_dirs = {
         "TRITON_CACHE_DIR": cache_root / "triton",
