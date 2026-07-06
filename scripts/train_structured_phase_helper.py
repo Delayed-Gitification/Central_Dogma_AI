@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--examples-per-step", type=int, default=4)
     parser.add_argument("--validation-examples", type=int, default=64)
     parser.add_argument("--print-every", type=int, default=25)
+    parser.add_argument("--validate-every", type=int, default=250)
     parser.add_argument("--checkpoint-every", type=int, default=250)
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -312,7 +313,10 @@ def main() -> None:
         print(f"CUDA device: {torch.cuda.get_device_name(device)}")
     print("task: structured translated phase helper")
     print(f"states: {PHASE_STATES}")
-    print(f"mode: {args.mode}; examples_per_step={args.examples_per_step}; validation_examples={args.validation_examples}")
+    print(
+        f"mode: {args.mode}; examples_per_step={args.examples_per_step}; "
+        f"validation_examples={args.validation_examples}; validate_every={args.validate_every}"
+    )
     print(
         "synthetic data: "
         f"UTR5={args.min_utr5_length}-{args.max_utr5_length} bp, "
@@ -385,7 +389,14 @@ def main() -> None:
 
         should_print = step == 1 or step % args.print_every == 0 or step == args.steps
         should_save = step % args.checkpoint_every == 0 or step == args.steps
-        if should_print or should_save:
+        should_validate = (
+            step == 1
+            or step == args.steps
+            or should_save
+            or (args.validate_every > 0 and step % args.validate_every == 0)
+        )
+        validation = None
+        if should_validate:
             validation = evaluate(
                 model,
                 args,
@@ -404,19 +415,28 @@ def main() -> None:
                     validation=validation,
                 )
                 print(f"saved best checkpoint: {args.checkpoint_dir / 'best.pt'}")
-            if should_save:
-                save_checkpoint(
-                    args.checkpoint_dir / "latest.pt",
-                    model=model,
-                    optimizer=optimizer,
-                    args=args,
-                    step=step,
-                    validation=validation,
+        if should_save:
+            if validation is None:
+                validation = evaluate(
+                    model,
+                    args,
+                    device=device,
+                    seed=args.seed + 100000 + step,
+                    examples=args.validation_examples,
                 )
-                with (args.checkpoint_dir / "latest_metrics.json").open("w") as handle:
-                    json.dump({"step": step, "validation": validation}, handle, indent=2)
-                print(f"saved checkpoint: {args.checkpoint_dir / 'latest.pt'}")
+            save_checkpoint(
+                args.checkpoint_dir / "latest.pt",
+                model=model,
+                optimizer=optimizer,
+                args=args,
+                step=step,
+                validation=validation,
+            )
+            with (args.checkpoint_dir / "latest_metrics.json").open("w") as handle:
+                json.dump({"step": step, "validation": validation}, handle, indent=2)
+            print(f"saved checkpoint: {args.checkpoint_dir / 'latest.pt'}")
 
+        if should_print or should_validate or should_save:
             per_state = {
                 name: (state_correct[index] / state_total[index] if state_total[index] else float("nan"))
                 for index, name in enumerate(PHASE_STATES)
@@ -443,7 +463,8 @@ def main() -> None:
                 f"stop peak={train_counts['stop'] / args.examples_per_step:.3f}"
             )
             print("           per-state " + ", ".join(f"{name}={per_state[name]:.3f}" for name in PHASE_STATES))
-            print(format_metrics("validation", validation))
+            if validation is not None:
+                print(format_metrics("validation", validation))
 
 
 if __name__ == "__main__":

@@ -312,6 +312,37 @@ class StructuredPhaseLayer(nn.Module):
     def _empty_buckets(length: int, states: int) -> list[list[list[torch.Tensor]]]:
         return [[[] for _ in range(states)] for _ in range(length)]
 
+    @staticmethod
+    def _frame_prefix_logsum(values: torch.Tensor, max_codon_start: int) -> torch.Tensor:
+        """prefix[frame, i] = logsumexp(values[j]) for j <= i and j % 3 == frame."""
+
+        length = int(values.numel())
+        offsets = torch.arange(length, device=values.device)
+        prefix = values.new_full((3, length), -torch.inf)
+        valid_codon_start = offsets <= max_codon_start
+        for frame in range(3):
+            framed = values.masked_fill((offsets % 3 != frame) | ~valid_codon_start, -torch.inf)
+            prefix[frame] = torch.logcumsumexp(framed, dim=0)
+        return prefix
+
+    @staticmethod
+    def _frame_suffix_logsum(values: torch.Tensor, max_codon_start: int) -> torch.Tensor:
+        """suffix[frame, i] = logsumexp(values[j]) for j >= i and j % 3 == frame."""
+
+        length = int(values.numel())
+        offsets = torch.arange(length, device=values.device)
+        suffix = values.new_full((3, length + 1), -torch.inf)
+        valid_codon_start = offsets <= max_codon_start
+        for frame in range(3):
+            framed = values.masked_fill((offsets % 3 != frame) | ~valid_codon_start, -torch.inf)
+            suffix[frame, :length] = torch.flip(torch.logcumsumexp(torch.flip(framed, dims=(0,)), dim=0), dims=(0,))
+        return suffix
+
+    @staticmethod
+    def _append_if_finite(bucket: list[torch.Tensor], value: torch.Tensor) -> None:
+        if bool(torch.isfinite(value).item()):
+            bucket.append(value)
+
     def forward(
         self,
         *,
@@ -339,25 +370,71 @@ class StructuredPhaseLayer(nn.Module):
                 path_weight = path_weight.to(device=start_logits.device, dtype=start_logits.dtype)
 
             max_codon_start = transcript_length - 3
-            for start_offset in range(0, max_codon_start + 1):
-                min_stop_offset = start_offset + (self.min_orf_codons - 1) * 3
-                for stop_offset in range(min_stop_offset, max_codon_start + 1, 3):
-                    start_genomic = int(indices[start_offset].item())
-                    stop_genomic = int(indices[stop_offset].item())
-                    score = path_weight + start_logits[start_genomic] + stop_logits[stop_genomic]
-                    all_path_scores.append(score)
-                    initiation_buckets[start_genomic].append(score)
-                    termination_buckets[stop_genomic].append(score)
+            min_stop_delta = (self.min_orf_codons - 1) * 3
+            offsets = torch.arange(transcript_length, device=start_logits.device)
+            start_by_offset = start_logits[indices]
+            stop_by_offset = stop_logits[indices]
 
-                    for transcript_offset, genomic_tensor in enumerate(indices):
-                        genomic_index = int(genomic_tensor.item())
-                        if transcript_offset < start_offset:
-                            state = N_STATE
-                        elif transcript_offset <= stop_offset + 2:
-                            state = C0_STATE + ((transcript_offset - start_offset) % 3)
-                        else:
-                            state = T_STATE
-                        state_buckets[genomic_index][state].append(score)
+            suffix_stop = self._frame_suffix_logsum(stop_by_offset, max_codon_start)
+            prefix_start = self._frame_prefix_logsum(start_by_offset, max_codon_start)
+
+            min_stop_by_start = offsets + min_stop_delta
+            has_valid_stop = min_stop_by_start <= max_codon_start
+            start_stop_logsum = start_by_offset + suffix_stop[offsets % 3, min_stop_by_start.clamp(max=transcript_length)]
+            init_by_offset = (path_weight + start_stop_logsum).masked_fill(~has_valid_stop, -torch.inf)
+            path_log_partition = torch.logsumexp(init_by_offset, dim=0)
+            if not bool(torch.isfinite(path_log_partition).item()):
+                continue
+            all_path_scores.append(path_log_partition)
+
+            term_by_offset = stop_by_offset.new_full((transcript_length,), -torch.inf)
+            stop_valid = offsets <= max_codon_start
+            start_limit_by_stop = offsets - min_stop_delta
+            valid_stop_with_start = stop_valid & (start_limit_by_stop >= 0)
+            term_by_offset[valid_stop_with_start] = (
+                path_weight
+                + stop_by_offset[valid_stop_with_start]
+                + prefix_start[
+                    offsets[valid_stop_with_start] % 3,
+                    start_limit_by_stop[valid_stop_with_start],
+                ]
+            )
+
+            suffix_init = torch.flip(torch.logcumsumexp(torch.flip(init_by_offset, dims=(0,)), dim=0), dims=(0,))
+            prefix_term = torch.logcumsumexp(term_by_offset, dim=0)
+
+            for transcript_offset, genomic_tensor in enumerate(indices):
+                genomic_index = int(genomic_tensor.item())
+
+                if transcript_offset + 1 < transcript_length:
+                    self._append_if_finite(state_buckets[genomic_index][N_STATE], suffix_init[transcript_offset + 1])
+                if transcript_offset >= 3:
+                    self._append_if_finite(state_buckets[genomic_index][T_STATE], prefix_term[transcript_offset - 3])
+
+                possible_starts = offsets[: transcript_offset + 1]
+                if possible_starts.numel() == 0:
+                    continue
+                minimum_stop = torch.maximum(
+                    possible_starts + min_stop_delta,
+                    possible_starts.new_full(possible_starts.shape, transcript_offset - 2),
+                ).clamp(min=0, max=transcript_length)
+                coding_scores = (
+                    path_weight
+                    + start_by_offset[possible_starts]
+                    + suffix_stop[possible_starts % 3, minimum_stop]
+                )
+                for phase in range(3):
+                    phase_mask = (transcript_offset - possible_starts) % 3 == phase
+                    if bool(phase_mask.any().item()):
+                        phase_score = torch.logsumexp(coding_scores[phase_mask], dim=0)
+                        self._append_if_finite(state_buckets[genomic_index][C0_STATE + phase], phase_score)
+
+            for start_offset in range(transcript_length):
+                start_genomic = int(indices[start_offset].item())
+                self._append_if_finite(initiation_buckets[start_genomic], init_by_offset[start_offset])
+            for stop_offset in range(transcript_length):
+                stop_genomic = int(indices[stop_offset].item())
+                self._append_if_finite(termination_buckets[stop_genomic], term_by_offset[stop_offset])
 
         if not all_path_scores:
             raise ValueError("No valid start/stop paths were available")
