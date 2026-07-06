@@ -99,6 +99,45 @@ def random_split_lengths(total_length: int, parts: int, rng: random.Random, min_
     return lengths
 
 
+def random_sampled_exon_lengths(
+    exon_count: int,
+    rng: random.Random,
+    min_exon_bases: int,
+    max_exon_bases: int,
+    median_exon_bases: int,
+    rare_short_exon_prob: float,
+) -> list[int]:
+    """Sample exon lengths with a long tail and occasional very short exons."""
+
+    if exon_count < 1:
+        raise ValueError("exon_count must be positive")
+    short_max = min(max_exon_bases, max(min_exon_bases, 12))
+    lengths = []
+    for _ in range(exon_count):
+        if rng.random() < rare_short_exon_prob:
+            length = rng.randint(min_exon_bases, short_max)
+        else:
+            length = round(rng.lognormvariate(math.log(float(median_exon_bases)), 0.75))
+            length = max(min_exon_bases, min(max_exon_bases, length))
+        lengths.append(length)
+
+    remainder = sum(lengths) % 3
+    if remainder:
+        add_bases = 3 - remainder
+        for index in range(len(lengths) - 1, -1, -1):
+            if lengths[index] + add_bases <= max_exon_bases:
+                lengths[index] += add_bases
+                break
+        else:
+            for index in range(len(lengths) - 1, -1, -1):
+                if lengths[index] - remainder >= min_exon_bases:
+                    lengths[index] -= remainder
+                    break
+            else:
+                lengths[-1] += add_bases
+    return lengths
+
+
 def make_synthetic_example(
     protein_codons: int,
     exon_count: int,
@@ -106,10 +145,27 @@ def make_synthetic_example(
     max_intron_length: int,
     rng: random.Random,
     min_exon_bases: int = 5,
+    max_exon_bases: int = 300,
+    median_exon_bases: int = 50,
+    rare_short_exon_prob: float = 0.05,
+    exon_length_mode: str = "split",
 ) -> dict[str, object]:
-    protein = random_protein(protein_codons, rng)
-    cds = reverse_translate(protein, rng)
-    exon_lengths = random_split_lengths(len(cds), exon_count, rng, min_part=min_exon_bases)
+    if exon_length_mode == "sampled":
+        exon_lengths = random_sampled_exon_lengths(
+            exon_count=exon_count,
+            rng=rng,
+            min_exon_bases=min_exon_bases,
+            max_exon_bases=max_exon_bases,
+            median_exon_bases=median_exon_bases,
+            rare_short_exon_prob=rare_short_exon_prob,
+        )
+        protein_codons = sum(exon_lengths) // 3
+        protein = random_protein(protein_codons, rng)
+        cds = reverse_translate(protein, rng)
+    else:
+        protein = random_protein(protein_codons, rng)
+        cds = reverse_translate(protein, rng)
+        exon_lengths = random_split_lengths(len(cds), exon_count, rng, min_part=min_exon_bases)
 
     genome_parts = []
     exon_prior = []
@@ -176,6 +232,10 @@ def make_batch(
     min_exon_count: int = 1,
     max_exon_count: int = 6,
     min_exon_bases: int = 5,
+    max_exon_bases: int = 300,
+    median_exon_bases: int = 50,
+    rare_short_exon_prob: float = 0.05,
+    exon_length_mode: str = "split",
     min_intron_length: int = 30,
     max_intron_length: int = 300,
     length_bucket_size: int = 256,
@@ -196,8 +256,12 @@ def make_batch(
     examples = []
     for _ in range(batch_size):
         protein_codons = rng.randint(min_protein_codons, max_protein_codons)
-        max_allowed_exons = max(1, min(max_exon_count, (protein_codons * 3) // min_exon_bases))
-        min_allowed_exons = min(min_exon_count, max_allowed_exons)
+        if exon_length_mode == "sampled":
+            max_allowed_exons = max_exon_count
+            min_allowed_exons = min_exon_count
+        else:
+            max_allowed_exons = max(1, min(max_exon_count, (protein_codons * 3) // min_exon_bases))
+            min_allowed_exons = min(min_exon_count, max_allowed_exons)
         exon_count = rng.randint(min_allowed_exons, max_allowed_exons)
         examples.append(
             make_synthetic_example(
@@ -207,6 +271,10 @@ def make_batch(
                 max_intron_length=max_intron_length,
                 rng=rng,
                 min_exon_bases=min_exon_bases,
+                max_exon_bases=max_exon_bases,
+                median_exon_bases=median_exon_bases,
+                rare_short_exon_prob=rare_short_exon_prob,
+                exon_length_mode=exon_length_mode,
             )
         )
     max_length = round_up_to_multiple(max(example["dna"].shape[0] for example in examples), length_bucket_size)
@@ -425,7 +493,6 @@ class MambaEmitSkipTranslator(nn.Module):
             "btl,bl->bt", assignment, splice_site_signal.squeeze(-1)
         ).mean()
         emit_count = emit_prob.sum(dim=1)
-        emit_mass_error = (emit_count - float(transcript_bases)).abs().mean()
 
         return amino_acid_probs, transcript_base_probs, assignment, assignment_logits, {
             "emit_logits": emit_logits,
@@ -433,8 +500,8 @@ class MambaEmitSkipTranslator(nn.Module):
             "assignment_entropy_loss": assignment_entropy,
             "assignment_entropy": assignment_entropy.detach(),
             "assignment_sharpness": assignment_sharpness.detach(),
+            "emit_count_by_example": emit_count.detach(),
             "emit_count": emit_count.detach().mean(),
-            "emit_mass_error": emit_mass_error.detach(),
             "mean_emit_probability": emit_prob.detach().mean(),
             "mean_splice_site_assignment": mean_splice_site_assignment.detach(),
         }
@@ -477,7 +544,10 @@ def round_up_to_multiple(value: int, multiple: int) -> int:
 
 
 def estimate_max_genome_length(args: argparse.Namespace) -> int:
-    max_cds_bases = args.max_protein_codons * 3
+    if args.exon_length_mode == "sampled":
+        max_cds_bases = args.max_exon_count * args.max_exon_bases
+    else:
+        max_cds_bases = args.max_protein_codons * 3
     max_intronic_bases = max(0, args.max_exon_count - 1) * args.max_intron_length
     return max_cds_bases + max_intronic_bases
 
@@ -551,6 +621,14 @@ def load_checkpoint(
     if final_metrics is not None and not isinstance(final_metrics, dict):
         final_metrics = None
     return start_step, best_loss, final_metrics
+
+
+def load_model_weights(path: Path, *, model: nn.Module, device: torch.device) -> None:
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
 
 
 def maybe_save_checkpoint(
@@ -706,30 +784,33 @@ def failure_metrics(stats: dict[str, float]) -> dict[str, float]:
 def format_report_metrics(label: str, metrics: dict[str, float | int]) -> str:
     return (
         f"{label:<10} "
-        f"loss {metrics['loss']:.3f} "
-        f"(aa {metrics['aa_loss']:.3f}, nt {metrics['nt_loss']:.3f}, emit {metrics['emit_loss']:.3f}) | "
-        f"acc tok {metrics['token_accuracy']:.3f}, exact {metrics['exact_match']:.3f}, "
-        f"nt {metrics['nucleotide_accuracy']:.3f}/{metrics['nucleotide_exact_match']:.3f}, "
-        f"assign {metrics['assignment_accuracy']:.3f}/{metrics['assignment_exact_match']:.3f} | "
-        f"conf aa {metrics['aa_confidence']:.3f}, nt {metrics['nucleotide_confidence']:.3f}, "
-        f"assign {metrics['assignment_confidence']:.3f} | "
-        f"assign entropy {metrics['assignment_entropy']:.3f}, sharp {metrics['assignment_sharpness']:.3f}; "
-        f"emit count {metrics['emit_count']:.2f}, mass_err {metrics['emit_mass_error']:.3f}; "
-        f"site_assign {metrics['mean_splice_site_assignment']:.3f}"
+        f"loss total={metrics['loss']:.3f} "
+        f"(protein={metrics['aa_loss']:.3f}, cds={metrics['nt_loss']:.3f}, emit_skip={metrics['emit_loss']:.3f})\n"
+        f"{'':<10} "
+        f"protein exact={metrics['exact_match']:.3f}, protein token={metrics['token_accuracy']:.3f}, "
+        f"CDS exact={metrics['nucleotide_exact_match']:.3f}, CDS base={metrics['nucleotide_accuracy']:.3f}\n"
+        f"{'':<10} "
+        f"splice route exact={metrics['assignment_exact_match']:.3f}, route base={metrics['assignment_accuracy']:.3f}, "
+        f"junction route={metrics['junction_pointer_accuracy']:.3f} (n={metrics['junction_pointer_total']:.0f})\n"
+        f"{'':<10} "
+        f"confidence protein={metrics['aa_confidence']:.3f}, CDS={metrics['nucleotide_confidence']:.3f}, "
+        f"route={metrics['assignment_confidence']:.3f}; route entropy={metrics['assignment_entropy']:.3f}, "
+        f"sharpness={metrics['assignment_sharpness']:.3f}\n"
+        f"{'':<10} "
+        f"emit mass predicted={metrics['emit_count']:.1f} bases, mean_abs_error={metrics['emit_mass_error']:.1f}, "
+        f"splice-site attention={metrics['mean_splice_site_assignment']:.3f}"
     )
 
 
 def format_failure_report(label: str, metrics: dict[str, float | int]) -> str:
     return (
         f"{label:<10} "
-        f"fail {metrics['failure_rate']:.3f}; "
-        f"len {metrics['failed_target_bases_mean']:.1f}, "
-        f"exons {metrics['failed_exon_count_mean']:.2f}, "
-        f"max_intron {metrics['failed_max_intron_mean']:.0f}, "
-        f"first_nt {metrics['failed_first_error_mean']:.1f}; "
-        f"ptr_err_dist {metrics['pointer_error_distance_mean']:.2f}, "
-        f"junc_ptr {metrics['junction_pointer_accuracy']:.3f} "
-        f"(n={metrics['junction_pointer_total']:.0f})"
+        f"failed examples={metrics['failure_rate']:.3f}; "
+        f"failed length={metrics['failed_target_bases_mean']:.1f} bases, "
+        f"failed exons={metrics['failed_exon_count_mean']:.2f}, "
+        f"failed max intron={metrics['failed_max_intron_mean']:.0f} bp, "
+        f"first CDS error={metrics['failed_first_error_mean']:.1f}, "
+        f"mean route miss={metrics['pointer_error_distance_mean']:.1f} bp"
     )
 
 
@@ -812,6 +893,8 @@ def evaluate_model_batch(
         junction_window=args.failure_junction_window,
     )
     failure = failure_metrics(stats)
+    target_emit_count = base_mask.sum(dim=1).to(diagnostics["emit_count_by_example"].dtype)
+    emit_mass_error = (diagnostics["emit_count_by_example"] - target_emit_count).abs().mean()
 
     return {
         "loss": float(loss.item()),
@@ -830,7 +913,7 @@ def evaluate_model_batch(
         "assignment_entropy": float(diagnostics["assignment_entropy"].item()),
         "assignment_sharpness": float(diagnostics["assignment_sharpness"].item()),
         "emit_count": float(diagnostics["emit_count"].item()),
-        "emit_mass_error": float(diagnostics["emit_mass_error"].item()),
+        "emit_mass_error": float(emit_mass_error.item()),
         "mean_emit_probability": float(diagnostics["mean_emit_probability"].item()),
         "mean_splice_site_assignment": float(diagnostics["mean_splice_site_assignment"].item()),
         **failure,
@@ -848,6 +931,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-exon-count must be >= --min-exon-count")
     if args.min_exon_bases < 1:
         raise ValueError("--min-exon-bases must be at least 1")
+    if args.max_exon_bases < args.min_exon_bases:
+        raise ValueError("--max-exon-bases must be >= --min-exon-bases")
+    if not args.min_exon_bases <= args.median_exon_bases <= args.max_exon_bases:
+        raise ValueError("--median-exon-bases must be between --min-exon-bases and --max-exon-bases")
+    if not 0 <= args.rare_short_exon_prob <= 1:
+        raise ValueError("--rare-short-exon-prob must be in [0, 1]")
     if args.min_intron_length < 4:
         raise ValueError("--min-intron-length must be at least 4")
     if args.max_intron_length < args.min_intron_length:
@@ -856,7 +945,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-protein-codons must be at least 1")
     if args.eval_exon_count < 1:
         raise ValueError("--eval-exon-count must be at least 1")
-    if args.eval_exon_count * args.min_exon_bases > args.eval_protein_codons * 3:
+    if args.exon_length_mode == "split" and args.eval_exon_count * args.min_exon_bases > args.eval_protein_codons * 3:
         raise ValueError("--eval-exon-count is too large for --eval-protein-codons and --min-exon-bases")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
@@ -886,6 +975,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--success-exact-threshold must be in [0, 1]")
     if not 0 <= args.success_nucleotide_exact_threshold <= 1:
         raise ValueError("--success-nucleotide-exact-threshold must be in [0, 1]")
+    if args.init_from and (args.resume_from or args.auto_resume):
+        raise ValueError("--init-from cannot be combined with --resume-from or --auto-resume")
     if args.print_every < 1:
         raise ValueError("--print-every must be at least 1")
     if args.checkpoint_every < 0:
@@ -912,10 +1003,20 @@ def train(args: argparse.Namespace) -> None:
     print(f"annotation tracks generated: {ANNOTATION_TRACK_NAMES}")
     print("true_transcript_rank is used only for monotonic assignment diagnostics")
     print(
-        "synthetic length regime: "
-        f"protein_codons={args.min_protein_codons}-{args.max_protein_codons}, "
+        "training data: "
         f"exons={args.min_exon_count}-{args.max_exon_count}, "
-        f"introns={args.min_intron_length}-{args.max_intron_length} bp"
+        f"introns={args.min_intron_length}-{args.max_intron_length} bp, "
+        f"exon lengths mode={args.exon_length_mode}"
+    )
+    print(
+        "exon length target: "
+        f"min={args.min_exon_bases} bp, median~{args.median_exon_bases} bp, "
+        f"max={args.max_exon_bases} bp, rare short exon probability={args.rare_short_exon_prob:.3f}"
+    )
+    print(
+        "protein length controls: "
+        f"codons={args.min_protein_codons}-{args.max_protein_codons} "
+        "(ignored when exon length mode is sampled)"
     )
     effective_micro_batch_size = resolve_micro_batch_size(args)
     micro_batch_mode = "auto" if args.micro_batch_size == 0 else "manual"
@@ -951,6 +1052,12 @@ def train(args: argparse.Namespace) -> None:
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.weight_decay,
     )
+    if args.init_from:
+        init_path = resolve_checkpoint_path(args.init_from)
+        if not init_path.exists():
+            raise FileNotFoundError(f"Initial checkpoint does not exist: {init_path}")
+        load_model_weights(init_path, model=model, device=device)
+        print(f"initialized model weights from: {init_path}")
 
     checkpoint_dir = resolve_checkpoint_path(args.checkpoint_dir)
     checkpointing_enabled = (
@@ -969,6 +1076,10 @@ def train(args: argparse.Namespace) -> None:
             min_exon_count=args.min_exon_count,
             max_exon_count=args.max_exon_count,
             min_exon_bases=args.min_exon_bases,
+            max_exon_bases=args.max_exon_bases,
+            median_exon_bases=args.median_exon_bases,
+            rare_short_exon_prob=args.rare_short_exon_prob,
+            exon_length_mode=args.exon_length_mode,
             min_intron_length=args.min_intron_length,
             max_intron_length=args.max_intron_length,
             length_bucket_size=args.length_bucket_size,
@@ -1075,6 +1186,10 @@ def train(args: argparse.Namespace) -> None:
                 min_exon_count=args.min_exon_count,
                 max_exon_count=args.max_exon_count,
                 min_exon_bases=args.min_exon_bases,
+                max_exon_bases=args.max_exon_bases,
+                median_exon_bases=args.median_exon_bases,
+                rare_short_exon_prob=args.rare_short_exon_prob,
+                exon_length_mode=args.exon_length_mode,
                 min_intron_length=args.min_intron_length,
                 max_intron_length=args.max_intron_length,
                 length_bucket_size=args.length_bucket_size,
@@ -1171,7 +1286,9 @@ def train(args: argparse.Namespace) -> None:
                 assignment_entropy_sum += diagnostics["assignment_entropy"].item() * micro_batch_size
                 assignment_sharpness_sum += diagnostics["assignment_sharpness"].item() * micro_batch_size
                 emit_count_sum += diagnostics["emit_count"].item() * micro_batch_size
-                emit_mass_error_sum += diagnostics["emit_mass_error"].item() * micro_batch_size
+                target_emit_count = base_mask.sum(dim=1).to(diagnostics["emit_count_by_example"].dtype)
+                emit_mass_error = (diagnostics["emit_count_by_example"] - target_emit_count).abs().mean()
+                emit_mass_error_sum += emit_mass_error.item() * micro_batch_size
                 mean_emit_probability_sum += diagnostics["mean_emit_probability"].item() * micro_batch_size
                 mean_splice_site_assignment_sum += diagnostics["mean_splice_site_assignment"].item() * micro_batch_size
 
@@ -1296,23 +1413,23 @@ def train(args: argparse.Namespace) -> None:
         if is_report_step:
             report_lines = [
                 (
-                    f"\nstep {step:06d} | lr {lr:.2e} (mult {current_lr_multiplier:.3f}) | "
-                    f"ema {loss_ema:.3f} | emit_w {emit_loss_weight:.3f} | "
-                    f"micro_batch {effective_micro_batch_size}/{args.batch_size}"
+                    f"\nStep {step:06d} | learning_rate={lr:.2e} "
+                    f"(schedule_mult={current_lr_multiplier:.3f}) | smoothed_loss={loss_ema:.3f}"
                 ),
                 (
-                    f"lengths    aa {mean_target_length:.1f}/{max_target_length}, "
-                    f"genome {mean_genome_length:.0f}/{max_genome_length}, "
-                    f"intron {mean_intron_length:.0f}/{max_intron_length}"
+                    f"Batch shape | proteins mean/max={mean_target_length:.1f}/{max_target_length} aa, "
+                    f"genomes mean/max={mean_genome_length:.0f}/{max_genome_length} bp, "
+                    f"introns mean/max={mean_intron_length:.0f}/{max_intron_length} bp, "
+                    f"microbatch={effective_micro_batch_size}/{args.batch_size}, emit_loss_weight={emit_loss_weight:.3f}"
                 ),
                 format_report_metrics("train", final_metrics),
-                format_failure_report("train fail", final_metrics),
+                format_failure_report("train errors", final_metrics),
             ]
             if validation_metrics is not None:
                 report_lines.extend(
                     [
-                        format_report_metrics("fixed", validation_metrics),
-                        format_failure_report("fixed fail", validation_metrics),
+                        format_report_metrics("validation", validation_metrics),
+                        format_failure_report("val errors", validation_metrics),
                     ]
                 )
             print("\n".join(report_lines), flush=True)
@@ -1336,6 +1453,10 @@ def train(args: argparse.Namespace) -> None:
         min_exon_count=args.eval_exon_count,
         max_exon_count=args.eval_exon_count,
         min_exon_bases=args.min_exon_bases,
+        max_exon_bases=args.max_exon_bases,
+        median_exon_bases=args.median_exon_bases,
+        rare_short_exon_prob=args.rare_short_exon_prob,
+        exon_length_mode=args.exon_length_mode,
         min_intron_length=args.min_intron_length,
         max_intron_length=args.max_intron_length,
         length_bucket_size=args.length_bucket_size,
@@ -1355,6 +1476,9 @@ def train(args: argparse.Namespace) -> None:
     eval_aa_confidence = amino_acid_probs.max(dim=-1).values[0, :eval_length].mean().item()
     eval_nucleotide_confidence = transcript_base_probs.max(dim=-1).values[0, :eval_base_length].mean().item()
     eval_assignment_confidence = assignment.max(dim=-1).values[0, :eval_base_length].mean().item()
+    eval_emit_mass_error = (
+        diagnostics["emit_count_by_example"][0] - base_mask.sum(dim=1).to(diagnostics["emit_count_by_example"].dtype)[0]
+    ).abs().item()
 
     print("\nFinal training metrics:")
     if final_metrics is not None:
@@ -1376,7 +1500,7 @@ def train(args: argparse.Namespace) -> None:
     print("nucleotide confidence:", eval_nucleotide_confidence)
     print("assignment confidence:", eval_assignment_confidence)
     print("emit count:", diagnostics["emit_count"].item())
-    print("emit mass error:", diagnostics["emit_mass_error"].item())
+    print("emit mass error:", eval_emit_mass_error)
     print("assignment sharpness:", diagnostics["assignment_sharpness"].item())
     print("mean emit probability:", diagnostics["mean_emit_probability"].item())
     print("mean splice-site assignment:", diagnostics["mean_splice_site_assignment"].item())
@@ -1397,6 +1521,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-exon-count", type=int, default=1)
     parser.add_argument("--max-exon-count", type=int, default=4)
     parser.add_argument("--min-exon-bases", type=int, default=9)
+    parser.add_argument("--max-exon-bases", type=int, default=300)
+    parser.add_argument("--median-exon-bases", type=int, default=50)
+    parser.add_argument("--rare-short-exon-prob", type=float, default=0.05)
+    parser.add_argument("--exon-length-mode", choices=("split", "sampled"), default="split")
     parser.add_argument("--eval-protein-codons", type=int, default=48)
     parser.add_argument("--eval-exon-count", type=int, default=3)
     parser.add_argument("--min-intron-length", type=int, default=10)
@@ -1434,6 +1562,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=1_000)
     parser.add_argument("--checkpoint-keep-every", type=int, default=10_000)
     parser.add_argument("--save-best-checkpoint", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--init-from", default="", help="Load model weights only, then start a fresh run.")
     parser.add_argument("--auto-resume", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resume-from", default="")
     return parser.parse_args()
