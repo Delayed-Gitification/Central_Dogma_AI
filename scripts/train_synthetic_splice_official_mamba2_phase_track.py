@@ -1513,15 +1513,22 @@ def train(args: argparse.Namespace) -> None:
     print("mean splice-site assignment:", diagnostics["mean_splice_site_assignment"].item())
 
 
-PHASE_LABELS = ("phase_0", "phase_1", "phase_2", "not_coding")
-NOT_CODING_INDEX = 3
+PHASE_LABELS = (
+    "exon_phase_0",
+    "exon_phase_1",
+    "exon_phase_2",
+    "intron_carry_0",
+    "intron_carry_1",
+    "intron_carry_2",
+)
+DEFAULT_INTRON_CARRY_INDEX = 3
 
 
 class MambaPhaseTrackPredictor(nn.Module):
     """Genome-registered CDS phase predictor.
 
-    The output has shape B x L x 4 and stays aligned to the input DNA bases:
-    phase_0, phase_1, phase_2, or not_coding.
+    The output has shape B x L x 6 and stays aligned to the input DNA bases:
+    exon phase 0/1/2, or intron carrying the next exon phase 0/1/2.
     """
 
     def __init__(
@@ -1624,13 +1631,28 @@ def phase_targets_from_examples(
     mask_rows = []
     for example in examples:
         annotations = example["annotations"]
-        target = torch.full((max_length,), NOT_CODING_INDEX, dtype=torch.long)
+        target = torch.full((max_length,), DEFAULT_INTRON_CARRY_INDEX, dtype=torch.long)
         genome_mask = torch.zeros(max_length, dtype=torch.bool)
         genome_length = annotations.shape[0]
         genome_mask[:genome_length] = True
         transcript_rank = annotations[:, 3]
         coding_mask = transcript_rank >= 0
-        target[:genome_length][coding_mask] = transcript_rank[coding_mask].long() % 3
+        coding_indices = torch.nonzero(coding_mask, as_tuple=False).flatten()
+        if coding_indices.numel() > 0:
+            coding_phase = transcript_rank[coding_mask].long() % 3
+            target[:genome_length][coding_mask] = coding_phase
+            first_coding_index = int(coding_indices[0].item())
+            last_seen_next_phase = 0
+            if first_coding_index > 0:
+                target[:first_coding_index] = 3
+            previous_index = None
+            for genomic_index, phase in zip(coding_indices.tolist(), coding_phase.tolist()):
+                if previous_index is not None and genomic_index > previous_index + 1:
+                    target[previous_index + 1 : genomic_index] = 3 + last_seen_next_phase
+                last_seen_next_phase = (int(phase) + 1) % 3
+                previous_index = int(genomic_index)
+            if previous_index is not None and previous_index + 1 < genome_length:
+                target[previous_index + 1 : genome_length] = 3 + last_seen_next_phase
         rows.append(target)
         mask_rows.append(genome_mask)
     return torch.stack(rows).to(device), torch.stack(mask_rows).to(device)
@@ -1638,11 +1660,15 @@ def phase_targets_from_examples(
 
 def phase_metrics(logits: torch.Tensor, target: torch.Tensor, genome_mask: torch.Tensor) -> dict[str, float]:
     predicted = logits.argmax(dim=-1)
-    coding_mask = genome_mask & (target != NOT_CODING_INDEX)
-    noncoding_mask = genome_mask & (target == NOT_CODING_INDEX)
+    coding_mask = genome_mask & (target < 3)
+    noncoding_mask = genome_mask & (target >= 3)
     correct = (predicted == target) & genome_mask
     coding_correct = (predicted == target) & coding_mask
     noncoding_correct = (predicted == target) & noncoding_mask
+    collapsed_predicted = torch.where(predicted < 3, predicted, torch.full_like(predicted, 3))
+    collapsed_target = torch.where(target < 3, target, torch.full_like(target, 3))
+    collapsed_correct = (collapsed_predicted == collapsed_target) & genome_mask
+    collapsed_noncoding_correct = collapsed_correct & noncoding_mask
     exact = ((predicted == target) | ~genome_mask).all(dim=1).float().mean()
     coding_exact = ((predicted == target) | ~coding_mask).all(dim=1).float().mean()
     confidence = logits.softmax(dim=-1).max(dim=-1).values
@@ -1653,11 +1679,18 @@ def phase_metrics(logits: torch.Tensor, target: torch.Tensor, genome_mask: torch
         phase_metrics_by_class[f"exon_phase_{phase_index}_accuracy"] = (
             float(phase_correct.sum().item()) / max(1, int(phase_mask.sum().item()))
         )
+        carry_mask = noncoding_mask & (target == phase_index + 3)
+        carry_correct = (predicted == target) & carry_mask
+        phase_metrics_by_class[f"intron_carry_{phase_index}_accuracy"] = (
+            float(carry_correct.sum().item()) / max(1, int(carry_mask.sum().item()))
+        )
     return {
         "accuracy": float(correct.sum().item()) / max(1, int(genome_mask.sum().item())),
+        "collapsed_accuracy": float(collapsed_correct.sum().item()) / max(1, int(genome_mask.sum().item())),
         "coding_phase_accuracy": float(coding_correct.sum().item()) / max(1, int(coding_mask.sum().item())),
         "exon_phase_accuracy": float(coding_correct.sum().item()) / max(1, int(coding_mask.sum().item())),
-        "not_coding_accuracy": float(noncoding_correct.sum().item()) / max(1, int(noncoding_mask.sum().item())),
+        "intron_carry_accuracy": float(noncoding_correct.sum().item()) / max(1, int(noncoding_mask.sum().item())),
+        "not_coding_accuracy": float(collapsed_noncoding_correct.sum().item()) / max(1, int(noncoding_mask.sum().item())),
         "exact_match": float(exact.item()),
         "coding_exact_match": float(coding_exact.item()),
         "confidence": float((confidence * genome_mask.to(confidence.dtype)).sum().item())
@@ -1669,13 +1702,18 @@ def phase_metrics(logits: torch.Tensor, target: torch.Tensor, genome_mask: torch
 def format_phase_report(label: str, metrics: dict[str, float]) -> str:
     return (
         f"{label:<10} loss={metrics['loss']:.4f}\n"
-        f"{'':<10} genome exact={metrics['exact_match']:.3f}, all-base accuracy={metrics['accuracy']:.3f}\n"
+        f"{'':<10} genome exact={metrics['exact_match']:.3f}, "
+        f"6-state accuracy={metrics['accuracy']:.3f}, collapsed 4-track={metrics['collapsed_accuracy']:.3f}\n"
         f"{'':<10} exon phase exact={metrics['coding_exact_match']:.3f}, "
         f"exon phase base={metrics['exon_phase_accuracy']:.3f}, "
         f"phase0={metrics['exon_phase_0_accuracy']:.3f}, "
         f"phase1={metrics['exon_phase_1_accuracy']:.3f}, "
         f"phase2={metrics['exon_phase_2_accuracy']:.3f}, "
-        f"not-coding base={metrics['not_coding_accuracy']:.3f}\n"
+        f"not-coding collapsed={metrics['not_coding_accuracy']:.3f}\n"
+        f"{'':<10} intron carry base={metrics['intron_carry_accuracy']:.3f}, "
+        f"carry0={metrics['intron_carry_0_accuracy']:.3f}, "
+        f"carry1={metrics['intron_carry_1_accuracy']:.3f}, "
+        f"carry2={metrics['intron_carry_2_accuracy']:.3f}\n"
         f"{'':<10} confidence={metrics['confidence']:.3f}"
     )
 
@@ -1839,7 +1877,7 @@ def train_phase(args: argparse.Namespace) -> None:
         print("fixed validation disabled", flush=True)
 
     class_weights = torch.tensor(
-        [1.0, 1.0, 1.0, args.not_coding_weight],
+        [1.0, 1.0, 1.0, args.not_coding_weight, args.not_coding_weight, args.not_coding_weight],
         dtype=torch.float32,
         device=device,
     )
