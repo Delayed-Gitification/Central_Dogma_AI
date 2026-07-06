@@ -6,8 +6,10 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 
 if [[ -z "${CONDA_PREFIX:-}" ]] && command -v conda >/dev/null 2>&1; then
   # Slurm batch shells often do not inherit the interactive conda activation.
+  set +u
   source "$(conda info --base)/etc/profile.d/conda.sh"
   conda activate bipangolin
+  set -u
 fi
 
 echo "host: $(hostname)"
