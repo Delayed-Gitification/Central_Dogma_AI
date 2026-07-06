@@ -1295,8 +1295,8 @@ def train(args: argparse.Namespace) -> None:
                 mean_emit_probability_sum += diagnostics["mean_emit_probability"].item() * micro_batch_size
                 mean_splice_site_assignment_sum += diagnostics["mean_splice_site_assignment"].item() * micro_batch_size
 
-    if args.grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
         loss_value = loss_sum / max(1, total_examples)
@@ -1628,6 +1628,48 @@ def load_matching_model_weights(path: Path, *, model: nn.Module, device: torch.d
     print(f"loaded compatible tensors from: {path}", flush=True)
 
 
+def slice_training_batch(
+    batch: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        list[dict[str, object]],
+    ],
+    start: int,
+    end: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    list[dict[str, object]],
+]:
+    dna, splice_tracks, target, target_mask, base_target, base_mask, emit_target, pointer_target, transcript_bases, examples = batch
+    return (
+        dna[start:end],
+        splice_tracks[start:end],
+        target[start:end],
+        target_mask[start:end],
+        base_target[start:end],
+        base_mask[start:end],
+        emit_target[start:end],
+        pointer_target[start:end],
+        transcript_bases,
+        examples[start:end],
+    )
+
+
 def train_phase(args: argparse.Namespace) -> None:
     validate_args(args)
     device = select_device(args.device)
@@ -1746,28 +1788,35 @@ def train_phase(args: argparse.Namespace) -> None:
         target_lengths_all = []
         genome_lengths = []
         intron_lengths = []
+        full_batch = make_batch(
+            batch_size=args.batch_size,
+            device=device,
+            min_protein_codons=args.min_protein_codons,
+            max_protein_codons=args.max_protein_codons,
+            min_exon_count=args.min_exon_count,
+            max_exon_count=args.max_exon_count,
+            min_exon_bases=args.min_exon_bases,
+            max_exon_bases=args.max_exon_bases,
+            median_exon_bases=args.median_exon_bases,
+            rare_short_exon_prob=args.rare_short_exon_prob,
+            exon_length_mode=args.exon_length_mode,
+            min_intron_length=args.min_intron_length,
+            max_intron_length=args.max_intron_length,
+            length_bucket_size=args.length_bucket_size,
+            seed=args.batch_seed_offset + step,
+        )
 
         for micro_batch_index in range(micro_batch_count):
             micro_batch_size = min(
                 effective_micro_batch_size,
                 args.batch_size - micro_batch_index * effective_micro_batch_size,
             )
-            dna, splice_tracks, _target, _target_mask, _base_target, _base_mask, _emit_target, _pointer_target, _transcript_bases, examples = make_batch(
-                batch_size=micro_batch_size,
-                device=device,
-                min_protein_codons=args.min_protein_codons,
-                max_protein_codons=args.max_protein_codons,
-                min_exon_count=args.min_exon_count,
-                max_exon_count=args.max_exon_count,
-                min_exon_bases=args.min_exon_bases,
-                max_exon_bases=args.max_exon_bases,
-                median_exon_bases=args.median_exon_bases,
-                rare_short_exon_prob=args.rare_short_exon_prob,
-                exon_length_mode=args.exon_length_mode,
-                min_intron_length=args.min_intron_length,
-                max_intron_length=args.max_intron_length,
-                length_bucket_size=args.length_bucket_size,
-                seed=args.batch_seed_offset + step * micro_batch_count + micro_batch_index,
+            start_index = micro_batch_index * effective_micro_batch_size
+            end_index = start_index + micro_batch_size
+            dna, splice_tracks, _target, _target_mask, _base_target, _base_mask, _emit_target, _pointer_target, _transcript_bases, examples = slice_training_batch(
+                full_batch,
+                start_index,
+                end_index,
             )
             phase_target, genome_mask = phase_targets_from_examples(
                 examples,
@@ -1786,7 +1835,10 @@ def train_phase(args: argparse.Namespace) -> None:
             ).reshape_as(phase_target)
             loss = (per_base_loss * genome_mask.to(per_base_loss.dtype)).sum() / genome_mask.sum().clamp_min(1)
             loss_scale = float(micro_batch_size) / float(args.batch_size)
+            first_backward_start = time.perf_counter() if step == 0 and micro_batch_index == 0 else None
             (loss * loss_scale).backward()
+            if first_backward_start is not None:
+                timed("first Mamba backward complete", first_backward_start)
 
             with torch.no_grad():
                 metrics = phase_metrics(logits, phase_target, genome_mask)
@@ -1802,8 +1854,8 @@ def train_phase(args: argparse.Namespace) -> None:
                     for intron_length in example["intron_lengths"]
                 )
 
-    if args.grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
         loss_value = loss_sum / max(1, total_examples)
