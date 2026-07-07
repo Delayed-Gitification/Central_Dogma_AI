@@ -36,15 +36,10 @@ def one_hot_dna_tensor(sequence: str) -> torch.Tensor:
     return encoded
 
 
-def _random_dna_without_atg(length: int, rng: random.Random) -> str:
-    """Generate a short UTR while avoiding ATG so the first ATG rule is clean."""
+def _random_dna(length: int, rng: random.Random) -> str:
+    """Generate unconstrained random DNA."""
 
-    bases = []
-    while len(bases) < length:
-        bases.append(rng.choice(DNA_BASES))
-        if len(bases) >= 3 and "".join(bases[-3:]) == "ATG":
-            bases.pop()
-    return "".join(bases)
+    return "".join(rng.choice(DNA_BASES) for _ in range(length))
 
 
 def _random_utr3_without_in_frame_stops(length: int, rng: random.Random) -> str:
@@ -143,14 +138,14 @@ def generate_single_exon_phase_gene(
     """Generate a single-exon gene for test 1.
 
     `coding_codons` includes the ATG start codon and terminal stop codon.
-    The 5' UTR is sampled without ATG, so the first ATG in the mature
-    transcript is the true initiation codon.
+    The 5' UTR is unconstrained and can contain upstream ATGs. Labels still
+    mark the intended main CDS start from the generated protein.
     """
 
     if coding_codons < 2:
         raise ValueError("coding_codons must include at least ATG and stop")
     rng = random.Random(seed)
-    utr5 = _random_dna_without_atg(utr5_length, rng)
+    utr5 = _random_dna(utr5_length, rng)
     protein = _random_protein(coding_codons - 1, rng)
     cds = _reverse_translate_with_stop(protein, rng)
     utr3 = _random_utr3_without_in_frame_stops(utr3_length, rng)
@@ -261,7 +256,7 @@ def generate_multiexon_phase_gene(
         raise ValueError("max_intron_length must be >= min_intron_length")
 
     rng = random.Random(seed)
-    utr5 = _random_dna_without_atg(utr5_length, rng)
+    utr5 = _random_dna(utr5_length, rng)
     protein = _random_protein(coding_codons - 1, rng)
     cds = _reverse_translate_with_stop(protein, rng)
     utr3 = _random_utr3_without_in_frame_stops(utr3_length, rng)
