@@ -359,6 +359,16 @@ class GenomeSweepPhaseLayer(nn.Module):
         log_z = torch.logsumexp(safe_scores, dim=-1, keepdim=True)
         return torch.where(finite.any(dim=-1, keepdim=True), scores - log_z, scores)
 
+    def compute_loss(state_log_probs: torch.Tensor, target_states: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        # state_log_probs: [B, L, 24]
+        # target_states: [B, L]
+        # padding_mask: [B, L] bool
+        loss = F.nll_loss(state_log_probs.transpose(1, 2), target_states, reduction="none")
+        if padding_mask is not None:
+            loss = torch.where(padding_mask, loss, 0.0)
+            return loss.sum() / padding_mask.sum().clamp_min(1.0)
+        return loss.mean()
+
     def forward(self, evidence_logits: torch.Tensor, padding_mask: torch.Tensor | None = None) -> SweepLayerOutput:
         is_batched = evidence_logits.ndim == 3
         if not is_batched:

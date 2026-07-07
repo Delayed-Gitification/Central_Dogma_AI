@@ -1,0 +1,26 @@
+{
+  "step": 3,
+  "validation": {
+    "loss": NaN,
+    "phase_loss": NaN,
+    "start_loss": NaN,
+    "stop_loss": NaN,
+    "donor_loss": NaN,
+    "acceptor_loss": NaN,
+    "evidence_loss": NaN,
+    "base_accuracy": 0.04726376228630746,
+    "gene_exact": 0.0,
+    "start_exact": 0.0,
+    "stop_exact": 0.0,
+    "donor_exact": 0.0,
+    "acceptor_exact": 0.0,
+    "mean_length": 1445.015625,
+    "mean_introns": 3.96875,
+    "state_groups": {
+      "U5": 0.6781181143596768,
+      "C": 0.0,
+      "I": 0.0,
+      "U3": 0.0
+    }
+  }
+}
