@@ -357,7 +357,7 @@ class StructuredPhaseLayer(nn.Module):
         valid_codon_start = offsets <= max_codon_start
         for frame in range(3):
             framed = values.masked_fill((offsets % 3 != frame) | ~valid_codon_start, -torch.inf)
-            prefix[frame] = torch.logcumsumexp(framed, dim=0)
+            prefix[frame] = StructuredPhaseLayer._safe_logcumsumexp(framed, dim=0)
         return prefix
 
     @staticmethod
@@ -370,13 +370,35 @@ class StructuredPhaseLayer(nn.Module):
         valid_codon_start = offsets <= max_codon_start
         for frame in range(3):
             framed = values.masked_fill((offsets % 3 != frame) | ~valid_codon_start, -torch.inf)
-            suffix[frame, :length] = torch.flip(torch.logcumsumexp(torch.flip(framed, dims=(0,)), dim=0), dims=(0,))
+            suffix[frame, :length] = torch.flip(
+                StructuredPhaseLayer._safe_logcumsumexp(torch.flip(framed, dims=(0,)), dim=0),
+                dims=(0,),
+            )
         return suffix
 
     @staticmethod
     def _append_if_finite(bucket: list[torch.Tensor], value: torch.Tensor) -> None:
         if bool(torch.isfinite(value).item()):
             bucket.append(value)
+
+    @staticmethod
+    def _safe_logcumsumexp(values: torch.Tensor, dim: int) -> torch.Tensor:
+        finite = torch.isfinite(values)
+        safe_values = values.masked_fill(~finite, -1.0e30)
+        result = torch.logcumsumexp(safe_values, dim=dim)
+        seen = torch.cumsum(finite.to(torch.long), dim=dim) > 0
+        return result.masked_fill(~seen, -torch.inf)
+
+    @staticmethod
+    def _finite_logaddexp(current: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
+        merged = current.clone()
+        finite_current = torch.isfinite(current)
+        finite_new = torch.isfinite(new)
+        take_new = finite_new & ~finite_current
+        combine = finite_new & finite_current
+        merged[take_new] = new[take_new]
+        merged[combine] = torch.logaddexp(current[combine], new[combine])
+        return merged
 
     def forward(
         self,
@@ -391,9 +413,10 @@ class StructuredPhaseLayer(nn.Module):
         if path_codon_logits is not None and len(path_codon_logits) != len(paths):
             raise ValueError("path_codon_logits must match paths")
         genome_length = int(start_logits.shape[0])
-        state_buckets = self._empty_buckets(genome_length, len(PHASE_STATES))
-        initiation_buckets: list[list[torch.Tensor]] = [[] for _ in range(genome_length)]
-        termination_buckets: list[list[torch.Tensor]] = [[] for _ in range(genome_length)]
+        state_scores = start_logits.new_full((genome_length, len(PHASE_STATES)), -torch.inf)
+        initiation_scores = start_logits.new_full((genome_length,), -torch.inf)
+        termination_scores = start_logits.new_full((genome_length,), -torch.inf)
+        covered = torch.zeros(genome_length, dtype=torch.bool, device=start_logits.device)
         all_path_scores: list[torch.Tensor] = []
 
         for path_index, path in enumerate(paths):
@@ -447,66 +470,58 @@ class StructuredPhaseLayer(nn.Module):
                 ]
             )
 
-            suffix_init = torch.flip(torch.logcumsumexp(torch.flip(init_by_offset, dims=(0,)), dim=0), dims=(0,))
-            prefix_term = torch.logcumsumexp(term_by_offset, dim=0)
+            suffix_init = torch.flip(
+                self._safe_logcumsumexp(torch.flip(init_by_offset, dims=(0,)), dim=0),
+                dims=(0,),
+            )
+            prefix_term = self._safe_logcumsumexp(term_by_offset, dim=0)
+            path_state_scores = start_logits.new_full((transcript_length, len(PHASE_STATES)), -torch.inf)
+            if transcript_length > 1:
+                path_state_scores[:-1, N_STATE] = suffix_init[1:]
+            if transcript_length > 3:
+                path_state_scores[3:, T_STATE] = prefix_term[:-3]
 
-            for transcript_offset, genomic_tensor in enumerate(indices):
-                genomic_index = int(genomic_tensor.item())
+            transcript_positions = offsets[:, None]
+            start_positions = offsets[None, :]
+            minimum_stop = torch.maximum(
+                start_positions + min_stop_delta,
+                transcript_positions - 2,
+            ).clamp(min=0, max=transcript_length)
+            valid_coding = (
+                (start_positions <= transcript_positions)
+                & (start_positions <= max_codon_start)
+                & (minimum_stop <= max_codon_start)
+            )
+            coding_scores = (
+                path_weight
+                + start_by_offset[start_positions.expand(transcript_length, transcript_length)]
+                + suffix_stop[
+                    (start_positions % 3).expand(transcript_length, transcript_length),
+                    minimum_stop,
+                ]
+            )
+            phase_by_start = (transcript_positions - start_positions) % 3
+            for phase in range(3):
+                phase_mask = valid_coding & (phase_by_start == phase)
+                finite_phase_mask = phase_mask & torch.isfinite(coding_scores)
+                valid_rows = finite_phase_mask.any(dim=1)
+                if bool(valid_rows.any().item()):
+                    phase_scores = coding_scores[valid_rows].masked_fill(~finite_phase_mask[valid_rows], -torch.inf)
+                    path_state_scores[valid_rows, C0_STATE + phase] = torch.logsumexp(phase_scores, dim=1)
 
-                if transcript_offset + 1 < transcript_length:
-                    self._append_if_finite(state_buckets[genomic_index][N_STATE], suffix_init[transcript_offset + 1])
-                if transcript_offset >= 3:
-                    self._append_if_finite(state_buckets[genomic_index][T_STATE], prefix_term[transcript_offset - 3])
-
-                possible_starts = offsets[: transcript_offset + 1]
-                if possible_starts.numel() == 0:
-                    continue
-                minimum_stop = torch.maximum(
-                    possible_starts + min_stop_delta,
-                    possible_starts.new_full(possible_starts.shape, transcript_offset - 2),
-                ).clamp(min=0, max=transcript_length)
-                coding_scores = (
-                    path_weight
-                    + start_by_offset[possible_starts]
-                    + suffix_stop[possible_starts % 3, minimum_stop]
-                )
-                for phase in range(3):
-                    phase_mask = (transcript_offset - possible_starts) % 3 == phase
-                    if bool(phase_mask.any().item()):
-                        phase_score = torch.logsumexp(coding_scores[phase_mask], dim=0)
-                        self._append_if_finite(state_buckets[genomic_index][C0_STATE + phase], phase_score)
-
-            for start_offset in range(transcript_length):
-                start_genomic = int(indices[start_offset].item())
-                self._append_if_finite(initiation_buckets[start_genomic], init_by_offset[start_offset])
-            for stop_offset in range(transcript_length):
-                stop_genomic = int(indices[stop_offset].item())
-                self._append_if_finite(termination_buckets[stop_genomic], term_by_offset[stop_offset])
+            state_scores[indices] = self._finite_logaddexp(state_scores[indices], path_state_scores)
+            initiation_scores[indices] = self._finite_logaddexp(initiation_scores[indices], init_by_offset)
+            termination_scores[indices] = self._finite_logaddexp(termination_scores[indices], term_by_offset)
+            covered[indices] = True
 
         if not all_path_scores:
             raise ValueError("No valid start/stop paths were available")
         log_partition = torch.logsumexp(torch.stack(all_path_scores), dim=0)
-        state_log_probs = start_logits.new_full((genome_length, len(PHASE_STATES)), -torch.inf)
-        initiation_log_probs = start_logits.new_full((genome_length,), -torch.inf)
-        termination_log_probs = start_logits.new_full((genome_length,), -torch.inf)
-
-        for genomic_index in range(genome_length):
-            if not any(state_buckets[genomic_index]):
-                state_log_probs[genomic_index, N_STATE] = start_logits.new_zeros(())
-                continue
-            for state in range(len(PHASE_STATES)):
-                if state_buckets[genomic_index][state]:
-                    state_log_probs[genomic_index, state] = (
-                        torch.logsumexp(torch.stack(state_buckets[genomic_index][state]), dim=0) - log_partition
-                    )
-            if initiation_buckets[genomic_index]:
-                initiation_log_probs[genomic_index] = (
-                    torch.logsumexp(torch.stack(initiation_buckets[genomic_index]), dim=0) - log_partition
-                )
-            if termination_buckets[genomic_index]:
-                termination_log_probs[genomic_index] = (
-                    torch.logsumexp(torch.stack(termination_buckets[genomic_index]), dim=0) - log_partition
-                )
+        state_log_probs = state_scores - log_partition
+        state_log_probs[~covered] = -torch.inf
+        state_log_probs[~covered, N_STATE] = start_logits.new_zeros(())
+        initiation_log_probs = initiation_scores - log_partition
+        termination_log_probs = termination_scores - log_partition
 
         return PhaseLayerOutput(
             state_log_probs=state_log_probs,
