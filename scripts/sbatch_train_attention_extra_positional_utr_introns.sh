@@ -9,8 +9,8 @@
 #SBATCH --error=slurm-%x-%j.err
 
 source ~/.bashrc
-set -euo pipefail
 conda activate bipangolin
+set -eo pipefail
 
 cd /nemo/lab/ulej/home/users/wilkino/POSTDOC/software/Dogmamba/Central_Dogma_AI
 
