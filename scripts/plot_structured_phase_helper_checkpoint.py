@@ -30,6 +30,9 @@ STATE_NAMES = ("N", "C0", "C1", "C2", "T")
 STATE_COLORS = ("#bdbdbd", "#1b9e77", "#d95f02", "#7570b3", "#525252")
 REGION_NAMES = ("intron", "5' UTR", "C0", "C1", "C2", "3' UTR")
 REGION_COLORS = ("#f0f0f0", "#80cdc1", "#1b9e77", "#d95f02", "#7570b3", "#c2a5cf")
+STOP_CODONS = {"TAA", "TAG", "TGA"}
+CODON_SIGNAL_NAMES = ("blank", "ATG", "stop")
+CODON_SIGNAL_COLORS = ("#ffffff", "#1a9850", "#d73027")
 
 
 def import_training_script(path: Path):
@@ -184,6 +187,21 @@ def junction_windows(gene, pad: int, limit: int = 2) -> list[tuple[int, int, str
     return windows
 
 
+def raw_genome_codon_signal(dna: str, start: int, end: int) -> np.ndarray:
+    """Return a 3 x window matrix: blank=0, ATG=1, stop=2 in raw genomic frames."""
+
+    signal = np.zeros((3, end - start), dtype=int)
+    for pos in range(start, end):
+        if pos + 3 > len(dna):
+            continue
+        codon = dna[pos : pos + 3]
+        if codon == "ATG":
+            signal[pos % 3, pos - start] = 1
+        elif codon in STOP_CODONS:
+            signal[pos % 3, pos - start] = 2
+    return signal
+
+
 def plot_example(
     *,
     module,
@@ -218,13 +236,16 @@ def plot_example(
     state_norm = BoundaryNorm(np.arange(-0.5, len(STATE_NAMES) + 0.5), state_cmap.N)
     region_cmap = ListedColormap(REGION_COLORS)
     region_norm = BoundaryNorm(np.arange(-0.5, len(REGION_NAMES) + 0.5), region_cmap.N)
+    codon_signal = raw_genome_codon_signal(gene.dna, start, end)
+    codon_cmap = ListedColormap(CODON_SIGNAL_COLORS)
+    codon_norm = BoundaryNorm(np.arange(-0.5, len(CODON_SIGNAL_NAMES) + 0.5), codon_cmap.N)
 
     fig, axes = plt.subplots(
-        6,
+        7,
         1,
-        figsize=(16 if zoom else 18, 8.2 if zoom else 7.5),
+        figsize=(16 if zoom else 18, 9.2 if zoom else 8.5),
         sharex=True,
-        gridspec_kw={"height_ratios": [0.85, 0.45, 0.45, 0.75, 0.75, 0.9]},
+        gridspec_kw={"height_ratios": [0.85, 0.8, 0.45, 0.45, 0.75, 0.75, 0.9]},
     )
 
     axes[0].imshow(
@@ -249,23 +270,36 @@ def plot_example(
         axes[0].axvline(gene.stop_codon_start, color="#7f0000", lw=1.6, label="stop")
     axes[0].set_ylabel("gene\nfeatures", rotation=0, ha="right", va="center")
 
-    axes[1].imshow(target_np[sl][None, :], aspect="auto", interpolation="nearest", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
-    axes[1].set_ylabel("true\nphase", rotation=0, ha="right", va="center")
-    axes[2].imshow(pred_np[sl][None, :], aspect="auto", interpolation="nearest", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
-    axes[2].set_ylabel("model\nphase", rotation=0, ha="right", va="center")
+    axes[1].imshow(
+        codon_signal,
+        aspect="auto",
+        interpolation="nearest",
+        origin="lower",
+        cmap=codon_cmap,
+        norm=codon_norm,
+        extent=[start, end, -0.5, 2.5],
+    )
+    axes[1].set_yticks([0, 1, 2])
+    axes[1].set_yticklabels(["0", "1", "2"], fontsize=8)
+    axes[1].set_ylabel("raw\nframes", rotation=0, ha="right", va="center")
 
-    axes[3].fill_between(x, 0, correct, step="pre", color="#1a9850", alpha=0.75, label="correct")
-    axes[3].fill_between(x, correct, 1, step="pre", color="#d73027", alpha=0.75, label="wrong")
-    axes[3].plot(x, confidence, color="black", lw=1.0, label="confidence")
-    axes[3].set_ylim(-0.05, 1.05)
-    axes[3].set_ylabel("correct\nconf", rotation=0, ha="right", va="center")
-    axes[3].legend(loc="upper right", fontsize=8, ncols=3)
+    axes[2].imshow(target_np[sl][None, :], aspect="auto", interpolation="nearest", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
+    axes[2].set_ylabel("true\nphase", rotation=0, ha="right", va="center")
+    axes[3].imshow(pred_np[sl][None, :], aspect="auto", interpolation="nearest", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
+    axes[3].set_ylabel("model\nphase", rotation=0, ha="right", va="center")
 
-    axes[4].plot(x, init_post, color="#00441b", lw=1.2, label="start posterior")
-    axes[4].plot(x, term_post, color="#7f0000", lw=1.2, label="stop posterior")
-    axes[4].set_ylim(-0.02, max(0.08, float(max(init_post.max(initial=0), term_post.max(initial=0))) * 1.15))
-    axes[4].set_ylabel("ORF\nposts", rotation=0, ha="right", va="center")
-    axes[4].legend(loc="upper right", fontsize=8)
+    axes[4].fill_between(x, 0, correct, step="pre", color="#1a9850", alpha=0.75, label="correct")
+    axes[4].fill_between(x, correct, 1, step="pre", color="#d73027", alpha=0.75, label="wrong")
+    axes[4].plot(x, confidence, color="black", lw=1.0, label="confidence")
+    axes[4].set_ylim(-0.05, 1.05)
+    axes[4].set_ylabel("correct\nconf", rotation=0, ha="right", va="center")
+    axes[4].legend(loc="upper right", fontsize=8, ncols=3)
+
+    axes[5].plot(x, init_post, color="#00441b", lw=1.2, label="start posterior")
+    axes[5].plot(x, term_post, color="#7f0000", lw=1.2, label="stop posterior")
+    axes[5].set_ylim(-0.02, max(0.08, float(max(init_post.max(initial=0), term_post.max(initial=0))) * 1.15))
+    axes[5].set_ylabel("ORF\nposts", rotation=0, ha="right", va="center")
+    axes[5].legend(loc="upper right", fontsize=8)
 
     path_set = set(gene.paths[0].genomic_indices.tolist())
     donor = np.zeros(len(gene.dna), dtype=float)
@@ -275,13 +309,13 @@ def plot_example(
         if path[offset + 1] != path[offset] + 1:
             donor[path[offset]] = 1.0
             acceptor[path[offset + 1]] = 1.0
-    axes[5].plot(x, donor[sl], color="#762a83", lw=1.5, label="donor")
-    axes[5].plot(x, acceptor[sl], color="#1b7837", lw=1.5, label="acceptor")
-    axes[5].set_ylim(-0.05, 1.05)
-    axes[5].set_ylabel("splice\nsites", rotation=0, ha="right", va="center")
-    axes[5].legend(loc="upper right", fontsize=8)
+    axes[6].plot(x, donor[sl], color="#762a83", lw=1.5, label="donor")
+    axes[6].plot(x, acceptor[sl], color="#1b7837", lw=1.5, label="acceptor")
+    axes[6].set_ylim(-0.05, 1.05)
+    axes[6].set_ylabel("splice\nsites", rotation=0, ha="right", va="center")
+    axes[6].legend(loc="upper right", fontsize=8)
 
-    for ax in axes[:3]:
+    for ax in (axes[0], axes[2], axes[3]):
         ax.set_yticks([])
     for ax in axes:
         ax.set_xlim(start, end)
@@ -309,7 +343,14 @@ def plot_example(
 
     region_handles = [Patch(color=color, label=name) for name, color in zip(REGION_NAMES, REGION_COLORS)]
     state_handles = [Patch(color=color, label=name) for name, color in zip(STATE_NAMES, STATE_COLORS)]
-    fig.legend(handles=region_handles + state_handles, loc="lower center", ncols=6, bbox_to_anchor=(0.5, -0.09), fontsize=8)
+    codon_handles = [Patch(color="#1a9850", label="raw ATG"), Patch(color="#d73027", label="raw stop")]
+    fig.legend(
+        handles=region_handles + state_handles + codon_handles,
+        loc="lower center",
+        ncols=7,
+        bbox_to_anchor=(0.5, -0.09),
+        fontsize=8,
+    )
     fig.tight_layout()
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
