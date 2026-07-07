@@ -165,6 +165,25 @@ def random_dna(length: int, rng: random.Random) -> str:
     return "".join(rng.choices(DNA_BASES, k=length))
 
 
+def has_atg_in_frame(sequence: str, frame: int) -> bool:
+    return any(sequence[pos : pos + 3] == "ATG" for pos in range(frame, max(0, len(sequence) - 2), 3))
+
+
+def random_utr5_dna(length: int, rng: random.Random) -> str:
+    """Allow upstream ATGs, except in the frame of the annotated CDS start."""
+
+    start_frame = length % 3
+    for _ in range(1000):
+        sequence = random_dna(length, rng)
+        if not has_atg_in_frame(sequence, start_frame):
+            return sequence
+    bases = list(random_dna(length, rng))
+    for pos in range(start_frame, max(0, length - 2), 3):
+        if "".join(bases[pos : pos + 3]) == "ATG":
+            bases[pos + 2] = rng.choice(("A", "C", "T"))
+    return "".join(bases)
+
+
 def random_protein(codons: int, rng: random.Random) -> str:
     amino_acids = tuple(aa for aa in CODONS_BY_AA if aa not in {"*", "M"})
     return "M" + "".join(rng.choices(amino_acids, k=codons - 1))
@@ -227,7 +246,7 @@ def generate_dense_gene(
         raise ValueError("min_intron_length must allow GT...AG introns")
 
     rng = random.Random(seed)
-    utr5 = random_dna(utr5_length, rng)
+    utr5 = random_utr5_dna(utr5_length, rng)
     cds = reverse_translate_with_stop(random_protein(coding_codons - 1, rng), rng)
     utr3 = random_dna(utr3_length, rng)
     cuts = sample_cds_cut_points(len(cds), exon_count - 1, min_exon_length, rng)
