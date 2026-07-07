@@ -137,6 +137,8 @@ class DenseLayerOutput:
     stop_posterior: torch.Tensor
     donor_posterior: torch.Tensor
     acceptor_posterior: torch.Tensor
+    alpha: torch.Tensor | None = None
+    beta: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -442,97 +444,6 @@ class DenseTransitionPhaseLayer(nn.Module):
             d *= 2
         return P
 
-    def forward_backward(self, evidence_logits: torch.Tensor, state_0_back: torch.Tensor | None = None) -> tuple[DenseLayerOutput, DenseLayerOutput]:
-        squeeze_batch = False
-        if evidence_logits.ndim == 2:
-            evidence_logits = evidence_logits.unsqueeze(0)
-            squeeze_batch = True
-        batch, length, _channels = evidence_logits.shape
-        evidence_logits = evidence_logits.float()
-
-        # --- 1. Forward Pass ---
-        T_all_fw = self._build_transition_matrices(evidence_logits)
-        P_fw = self._parallel_prefix_product(T_all_fw)
-
-        state_0_fw = evidence_logits.new_zeros((batch, S))
-        state_0_fw[:, self.initial_state] = 1.0
-        state_probs_fw = torch.matmul(state_0_fw[:, None, None, :], P_fw).squeeze(-2)
-
-        prev_states_fw = torch.cat([state_0_fw.unsqueeze(1), state_probs_fw[:, :-1]], dim=1)
-        transition_marginals_fw = prev_states_fw.unsqueeze(-1) * T_all_fw
-        transition_type_posteriors_fw = torch.einsum(
-            "blsd,ksd->blk", transition_marginals_fw, self.edge_type_masks
-        )
-
-        state_log_probs_fw = torch.log(state_probs_fw.clamp_min(1.0e-30))
-        output_fw = DenseLayerOutput(
-            state_probs=state_probs_fw,
-            state_log_probs=state_log_probs_fw,
-            transition_type_posteriors=transition_type_posteriors_fw,
-            start_posterior=transition_type_posteriors_fw[:, :, TYPE_TO_INDEX["start"]],
-            stop_posterior=transition_type_posteriors_fw[:, :, TYPE_TO_INDEX["stop"]],
-            donor_posterior=transition_type_posteriors_fw[:, :, TYPE_TO_INDEX["donor"]],
-            acceptor_posterior=transition_type_posteriors_fw[:, :, TYPE_TO_INDEX["acceptor"]],
-        )
-
-        # --- 2. Backward Pass ---
-        # Flip along length dimension to run HMM backwards
-        evidence_logits_rev = evidence_logits.flip(dims=[1])
-
-        allowed_back = self.edge_type_matrix.t() >= 0
-        safe_types_back = self.edge_type_matrix.t().clamp_min(0)
-        logits_back = evidence_logits_rev[..., safe_types_back]
-        logits_back = logits_back.masked_fill(~allowed_back, float("-inf"))
-        T_all_bw = torch.softmax(logits_back, dim=-1)
-
-        P_bw = self._parallel_prefix_product(T_all_bw)
-
-        # Anchor backward initial state to the final forward state distribution (at index L-1)
-        if state_0_back is None:
-            state_0_bw = state_probs_fw[:, -1]
-        else:
-            state_0_bw = state_0_back
-
-        state_probs_bw_rev = torch.matmul(state_0_bw[:, None, None, :], P_bw).squeeze(-2)
-
-        prev_states_bw_rev = torch.cat([state_0_bw.unsqueeze(1), state_probs_bw_rev[:, :-1]], dim=1)
-        transition_marginals_bw_rev = prev_states_bw_rev.unsqueeze(-1) * T_all_bw
-        
-        edge_type_masks_back = self.edge_type_masks.transpose(-2, -1)
-        transition_type_posteriors_bw_rev = torch.einsum(
-            "blsd,ksd->blk", transition_marginals_bw_rev, edge_type_masks_back
-        )
-
-        # Flip backward states and posteriors back to standard 5'->3' orientation
-        state_probs_bw = state_probs_bw_rev.flip(dims=[1])
-        state_log_probs_bw = torch.log(state_probs_bw.clamp_min(1.0e-30))
-        transition_type_posteriors_bw = transition_type_posteriors_bw_rev.flip(dims=[1])
-
-        output_bw = DenseLayerOutput(
-            state_probs=state_probs_bw,
-            state_log_probs=state_log_probs_bw,
-            transition_type_posteriors=transition_type_posteriors_bw,
-            start_posterior=transition_type_posteriors_bw[:, :, TYPE_TO_INDEX["start"]],
-            stop_posterior=transition_type_posteriors_bw[:, :, TYPE_TO_INDEX["stop"]],
-            donor_posterior=transition_type_posteriors_bw[:, :, TYPE_TO_INDEX["donor"]],
-            acceptor_posterior=transition_type_posteriors_bw[:, :, TYPE_TO_INDEX["acceptor"]],
-        )
-
-        if squeeze_batch:
-            def squeeze_output(out):
-                return DenseLayerOutput(
-                    state_probs=out.state_probs.squeeze(0),
-                    state_log_probs=out.state_log_probs.squeeze(0),
-                    transition_type_posteriors=out.transition_type_posteriors.squeeze(0),
-                    start_posterior=out.start_posterior.squeeze(0),
-                    stop_posterior=out.stop_posterior.squeeze(0),
-                    donor_posterior=out.donor_posterior.squeeze(0),
-                    acceptor_posterior=out.acceptor_posterior.squeeze(0),
-                )
-            return squeeze_output(output_fw), squeeze_output(output_bw)
-
-        return output_fw, output_bw
-
     def forward(self, evidence_logits: torch.Tensor) -> DenseLayerOutput:
         squeeze_batch = False
         if evidence_logits.ndim == 2:
@@ -543,34 +454,68 @@ class DenseTransitionPhaseLayer(nn.Module):
         # Ensure float32 for numerical stability in chained matrix products
         evidence_logits = evidence_logits.float()
 
+        # --- 1. Forward Pass (Alpha) ---
         # Build all S×S transition matrices at once: (B, L, S, S)
         T_all = self._build_transition_matrices(evidence_logits)
 
-        # Parallel prefix product: P[t] = T[0] @ T[1] @ ... @ T[t]
-        P = self._parallel_prefix_product(T_all)
+        # Parallel prefix product: P_fw[t] = T[0] @ T[1] @ ... @ T[t]
+        P_fw = self._parallel_prefix_product(T_all)
 
-        # State probabilities: state[t] = initial_state @ P[t]
-        state_0 = evidence_logits.new_zeros((batch, S))
-        state_0[:, self.initial_state] = 1.0
-        # (B, 1, 1, S) @ (B, L, S, S) -> (B, L, 1, S) -> (B, L, S)
-        state_probs = torch.matmul(state_0[:, None, None, :], P).squeeze(-2)
+        # State probabilities: alpha[t] = initial_state @ P_fw[t]
+        state_0_fw = evidence_logits.new_zeros((batch, S))
+        state_0_fw[:, self.initial_state] = 1.0
+        alpha = torch.matmul(state_0_fw[:, None, None, :], P_fw).squeeze(-2)
 
-        # Transition-type posteriors: marginal flow through each edge type
-        prev_states = torch.cat([state_0.unsqueeze(1), state_probs[:, :-1]], dim=1)
-        transition_marginals = prev_states.unsqueeze(-1) * T_all
+        # --- 2. Backward Pass (Beta) ---
+        # Compute Suffix Products of transition matrices:
+        # Suffix_all[t] = T_{t+1} @ T_{t+2} @ ... @ T_{L-1}
+        # Using the matrix transpose identity: (A @ B)^T = B^T @ A^T
+        T_all_T = T_all.transpose(-2, -1)
+        T_all_T_rev = T_all_T.flip(dims=[1])
+        P_bw_rev = self._parallel_prefix_product(T_all_T_rev)
+        P_bw = P_bw_rev.flip(dims=[1])
+        Suffix_all = P_bw.transpose(-2, -1)
+
+        # Terminal vector beta_L: mass over UTR3 states (indices 21, 22, 23)
+        beta_L = evidence_logits.new_zeros((batch, S))
+        beta_L[:, 21:24] = 1.0
+
+        # Compute beta_t = Suffix_all[t+1] @ beta_L, with beta_{L-1} = beta_L
+        beta = Suffix_all.new_zeros((batch, length, S))
+        if length > 1:
+            beta[:, :-1] = torch.matmul(Suffix_all[:, 1:], beta_L[:, None, :, None]).squeeze(-1)
+        beta[:, -1] = beta_L
+
+        # --- 3. Combined Posterior ---
+        # Unnormalized alpha * beta
+        alpha_beta = alpha * beta
+        # Normalize over states at each position
+        alpha_beta_posterior = alpha_beta / alpha_beta.sum(dim=-1, keepdim=True).clamp_min(1.0e-30)
+
+        # --- 4. Transition-type posteriors (Edge Marginals) ---
+        # P(s_t-1 = s, s_t = d | O) = alpha_t-1(s) * T_t(s, d) * beta_t(d)
+        prev_alpha = torch.cat([state_0_fw.unsqueeze(1), alpha[:, :-1]], dim=1)
+        transition_marginals = prev_alpha.unsqueeze(-1) * T_all * beta.unsqueeze(-2)
+        # Normalize
+        normalizer = transition_marginals.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0e-30)
+        transition_marginals = transition_marginals / normalizer
+        
+        # Marginal flow for each transition type
         transition_type_posteriors = torch.einsum(
             "blsd,ksd->blk", transition_marginals, self.edge_type_masks
         )
 
-        state_log_probs = torch.log(state_probs.clamp_min(1.0e-30))
+        state_log_probs = torch.log(alpha_beta_posterior.clamp_min(1.0e-30))
         output = DenseLayerOutput(
-            state_probs=state_probs,
+            state_probs=alpha_beta_posterior,
             state_log_probs=state_log_probs,
             transition_type_posteriors=transition_type_posteriors,
             start_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["start"]],
             stop_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["stop"]],
             donor_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["donor"]],
             acceptor_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["acceptor"]],
+            alpha=alpha,
+            beta=beta,
         )
         if squeeze_batch:
             return DenseLayerOutput(
@@ -581,6 +526,8 @@ class DenseTransitionPhaseLayer(nn.Module):
                 stop_posterior=output.stop_posterior.squeeze(0),
                 donor_posterior=output.donor_posterior.squeeze(0),
                 acceptor_posterior=output.acceptor_posterior.squeeze(0),
+                alpha=output.alpha.squeeze(0) if output.alpha is not None else None,
+                beta=output.beta.squeeze(0) if output.beta is not None else None,
             )
         return output
 
@@ -627,8 +574,8 @@ class StackedDenseTransitionPhaseModel(nn.Module):
         )
         self.phase_layer1 = DenseTransitionPhaseLayer(materialize_transitions=materialize_transitions)
         
-        # Unit 2 (takes input_dim1 + 2 * 24 state_probs + 2 * 8 transition_type_posteriors)
-        input_dim2 = input_dim1 + 2 * (24 + 8)
+        # Unit 2 (takes input_dim1 + 24 alpha + 24 beta + 24 state_probs + 8 transition_type_posteriors)
+        input_dim2 = input_dim1 + 24 + 24 + 24 + 8
         self.evidence2 = DilatedConvEvidenceModel(
             hidden_dim=hidden_dim,
             layers=conv_layers,
@@ -637,8 +584,8 @@ class StackedDenseTransitionPhaseModel(nn.Module):
         self.phase_layer2 = DenseTransitionPhaseLayer(materialize_transitions=materialize_transitions)
 
     def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor | None = None) -> tuple[
-        tuple[DenseLayerOutput, DenseLayerOutput, torch.Tensor],
-        tuple[DenseLayerOutput, DenseLayerOutput, torch.Tensor]
+        tuple[DenseLayerOutput, torch.Tensor],
+        tuple[DenseLayerOutput, torch.Tensor]
     ]:
         squeeze_batch = False
         if dna_one_hot.ndim == 2:
@@ -647,7 +594,7 @@ class StackedDenseTransitionPhaseModel(nn.Module):
         if splice_tracks is not None and splice_tracks.ndim == 2:
             splice_tracks = splice_tracks.unsqueeze(0)
             
-        # Unit 1 Forward/Backward
+        # Unit 1 Forward
         features1 = dna_one_hot
         if self.use_splice_tracks:
             if splice_tracks is None:
@@ -655,18 +602,18 @@ class StackedDenseTransitionPhaseModel(nn.Module):
             features1 = torch.cat([dna_one_hot, splice_tracks], dim=-1)
             
         evidence1_logits = self.evidence1(features1)
-        output1_fw, output1_bw = self.phase_layer1.forward_backward(evidence1_logits, state_0_back=None)
+        output1 = self.phase_layer1(evidence1_logits)
         
-        # Unit 2 Forward/Backward
+        # Unit 2 Forward
         features2 = torch.cat([
             features1, 
-            output1_fw.state_probs, output1_fw.transition_type_posteriors,
-            output1_bw.state_probs, output1_bw.transition_type_posteriors
+            output1.alpha, 
+            output1.beta, 
+            output1.state_probs, 
+            output1.transition_type_posteriors
         ], dim=-1)
         evidence2_logits = self.evidence2(features2)
-        
-        # Use final state of forward pass to anchor backward pass
-        output2_fw, output2_bw = self.phase_layer2.forward_backward(evidence2_logits, state_0_back=None)
+        output2 = self.phase_layer2(evidence2_logits)
         
         if squeeze_batch:
             def squeeze_output(out):
@@ -678,10 +625,12 @@ class StackedDenseTransitionPhaseModel(nn.Module):
                     stop_posterior=out.stop_posterior.squeeze(0),
                     donor_posterior=out.donor_posterior.squeeze(0),
                     acceptor_posterior=out.acceptor_posterior.squeeze(0),
+                    alpha=out.alpha.squeeze(0) if out.alpha is not None else None,
+                    beta=out.beta.squeeze(0) if out.beta is not None else None,
                 )
-            return (squeeze_output(output1_fw), squeeze_output(output1_bw), evidence1_logits.squeeze(0)), (squeeze_output(output2_fw), squeeze_output(output2_bw), evidence2_logits.squeeze(0))
+            return (squeeze_output(output1), evidence1_logits.squeeze(0)), (squeeze_output(output2), evidence2_logits.squeeze(0))
             
-        return (output1_fw, output1_bw, evidence1_logits), (output2_fw, output2_bw, evidence2_logits)
+        return (output1, evidence1_logits), (output2, evidence2_logits)
 
 
 def randint(rng: random.Random, low: int, high: int) -> int:
@@ -917,9 +866,9 @@ def evaluate(model: StackedDenseTransitionPhaseModel, args: argparse.Namespace, 
         chunk_size = min(args.eval_batch_size, remaining)
         genes = [make_gene(args, rng) for _ in range(chunk_size)]
         batch = batch_to_device(genes, device)
-        (output1_fw, output1_bw, evidence1_logits), (output2_fw, output2_bw, evidence2_logits) = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
-        loss1_fw, parts1_fw = compute_batch_loss(
-            output1_fw,
+        (output1, evidence1_logits), (output2, evidence2_logits) = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
+        loss1, parts1 = compute_batch_loss(
+            output1,
             evidence1_logits,
             batch,
             evidence_loss_weight=args.evidence_loss_weight,
@@ -928,28 +877,8 @@ def evaluate(model: StackedDenseTransitionPhaseModel, args: argparse.Namespace, 
             donor_loss_weight=args.donor_loss_weight,
             acceptor_loss_weight=args.acceptor_loss_weight,
         )
-        loss1_bw, parts1_bw = compute_batch_loss(
-            output1_bw,
-            evidence1_logits,
-            batch,
-            evidence_loss_weight=args.evidence_loss_weight,
-            start_loss_weight=args.start_loss_weight,
-            stop_loss_weight=args.stop_loss_weight,
-            donor_loss_weight=args.donor_loss_weight,
-            acceptor_loss_weight=args.acceptor_loss_weight,
-        )
-        loss2_fw, parts2_fw = compute_batch_loss(
-            output2_fw,
-            evidence2_logits,
-            batch,
-            evidence_loss_weight=args.evidence_loss_weight,
-            start_loss_weight=args.start_loss_weight,
-            stop_loss_weight=args.stop_loss_weight,
-            donor_loss_weight=args.donor_loss_weight,
-            acceptor_loss_weight=args.acceptor_loss_weight,
-        )
-        loss2_bw, parts2_bw = compute_batch_loss(
-            output2_bw,
+        loss2, parts2 = compute_batch_loss(
+            output2,
             evidence2_logits,
             batch,
             evidence_loss_weight=args.evidence_loss_weight,
@@ -959,11 +888,8 @@ def evaluate(model: StackedDenseTransitionPhaseModel, args: argparse.Namespace, 
             acceptor_loss_weight=args.acceptor_loss_weight,
         )
         for key in loss_sums:
-            loss_sums[key] += 0.25 * (
-                float(parts1_fw[key].item()) + float(parts1_bw[key].item()) +
-                float(parts2_fw[key].item()) + float(parts2_bw[key].item())
-            ) * chunk_size
-        output = output2_fw
+            loss_sums[key] += (0.2 * float(parts1[key].item()) + 1.0 * float(parts2[key].item())) * chunk_size
+        output = output2
         predicted = output.state_log_probs.argmax(dim=-1)
         matches = (predicted == batch.target_states) & batch.mask
         bases += int(batch.mask.sum().item())
@@ -1179,9 +1105,9 @@ def main() -> None:
         else:
             cpu_batch = next(dataloader_iter)
             batch = transfer_batch_to_device(cpu_batch, device)
-        (output1_fw, output1_bw, evidence1_logits), (output2_fw, output2_bw, evidence2_logits) = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
-        loss1_fw, parts1_fw = compute_batch_loss(
-            output1_fw,
+        (output1, evidence1_logits), (output2, evidence2_logits) = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
+        loss1, parts1 = compute_batch_loss(
+            output1,
             evidence1_logits,
             batch,
             evidence_loss_weight=args.evidence_loss_weight,
@@ -1190,18 +1116,8 @@ def main() -> None:
             donor_loss_weight=args.donor_loss_weight,
             acceptor_loss_weight=args.acceptor_loss_weight,
         )
-        loss1_bw, parts1_bw = compute_batch_loss(
-            output1_bw,
-            evidence1_logits,
-            batch,
-            evidence_loss_weight=args.evidence_loss_weight,
-            start_loss_weight=args.start_loss_weight,
-            stop_loss_weight=args.stop_loss_weight,
-            donor_loss_weight=args.donor_loss_weight,
-            acceptor_loss_weight=args.acceptor_loss_weight,
-        )
-        loss2_fw, parts2_fw = compute_batch_loss(
-            output2_fw,
+        loss2, parts2 = compute_batch_loss(
+            output2,
             evidence2_logits,
             batch,
             evidence_loss_weight=args.evidence_loss_weight,
@@ -1210,19 +1126,9 @@ def main() -> None:
             donor_loss_weight=args.donor_loss_weight,
             acceptor_loss_weight=args.acceptor_loss_weight,
         )
-        loss2_bw, parts2_bw = compute_batch_loss(
-            output2_bw,
-            evidence2_logits,
-            batch,
-            evidence_loss_weight=args.evidence_loss_weight,
-            start_loss_weight=args.start_loss_weight,
-            stop_loss_weight=args.stop_loss_weight,
-            donor_loss_weight=args.donor_loss_weight,
-            acceptor_loss_weight=args.acceptor_loss_weight,
-        )
-        step_loss = 0.5 * (loss1_fw + loss1_bw + loss2_fw + loss2_bw)
-        output = output2_fw
-        parts = {key: 0.25 * (parts1_fw[key] + parts1_bw[key] + parts2_fw[key] + parts2_bw[key]) for key in parts1_fw}
+        step_loss = 0.2 * loss1 + 1.0 * loss2
+        output = output2
+        parts = {key: 0.2 * parts1[key] + 1.0 * parts2[key] for key in parts1}
         if should_report:
             with torch.no_grad():
                 predicted = output.state_log_probs.argmax(dim=-1)

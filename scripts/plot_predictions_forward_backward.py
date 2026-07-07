@@ -61,7 +61,7 @@ def main():
 
         # Run forward pass
         with torch.no_grad():
-            _, (output, _, _) = model(batch.dna_one_hot, batch.splice_tracks if cfg.use_splice_tracks else None)
+            _, (output, _) = model(batch.dna_one_hot, batch.splice_tracks if cfg.use_splice_tracks else None)
 
         # Extract sequences to CPU
         true_states = batch.target_states[0].cpu().numpy()
