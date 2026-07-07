@@ -171,12 +171,14 @@ def first_split_window(module, gene, pad: int) -> tuple[int, int] | None:
     return None
 
 
-def junction_windows(gene, pad: int, limit: int = 2) -> list[tuple[int, int]]:
+def junction_windows(gene, pad: int, limit: int = 2) -> list[tuple[int, int, str]]:
     spans = exon_spans(gene)
     windows = []
-    for left, right in zip(spans[:-1], spans[1:]):
-        centre = (left[1] + right[0]) // 2
-        windows.append((max(0, centre - pad), min(len(gene.dna), centre + pad)))
+    for junction_index, (left, right) in enumerate(zip(spans[:-1], spans[1:])):
+        donor = left[1] - 1
+        acceptor = right[0]
+        windows.append((max(0, donor - pad), min(len(gene.dna), donor + pad), f"donor {junction_index}"))
+        windows.append((max(0, acceptor - pad), min(len(gene.dna), acceptor + pad), f"acceptor {junction_index}"))
         if len(windows) >= limit:
             break
     return windows
@@ -193,6 +195,7 @@ def plot_example(
     start: int = 0,
     end: int | None = None,
     show_bases: bool = False,
+    zoom: bool = False,
 ) -> dict[str, float | int | bool]:
     if end is None:
         end = len(gene.dna)
@@ -219,22 +222,36 @@ def plot_example(
     fig, axes = plt.subplots(
         6,
         1,
-        figsize=(18, 7.5),
+        figsize=(16 if zoom else 18, 8.2 if zoom else 7.5),
         sharex=True,
         gridspec_kw={"height_ratios": [0.85, 0.45, 0.45, 0.75, 0.75, 0.9]},
     )
 
-    axes[0].imshow(regions[None, :], aspect="auto", cmap=region_cmap, norm=region_norm, extent=[start, end, 0, 1])
+    axes[0].imshow(
+        regions[None, :],
+        aspect="auto",
+        interpolation="nearest",
+        cmap=region_cmap,
+        norm=region_norm,
+        extent=[start, end, 0, 1],
+    )
     for exon_start, exon_end in exon_spans(gene):
         if exon_end >= start and exon_start <= end:
             axes[0].axvspan(max(start, exon_start), min(end, exon_end), ymin=0.05, ymax=0.95, fill=False, edgecolor="black", lw=0.7)
-    axes[0].axvline(gene.start_codon_start, color="#00441b", lw=1.6, label="start")
-    axes[0].axvline(gene.stop_codon_start, color="#7f0000", lw=1.6, label="stop")
+            if zoom:
+                if exon_start < start:
+                    axes[0].text(start, 1.05, "exon continues", ha="left", va="bottom", fontsize=7, color="black")
+                if exon_end > end:
+                    axes[0].text(end, 1.05, "exon continues", ha="right", va="bottom", fontsize=7, color="black")
+    if start <= gene.start_codon_start < end:
+        axes[0].axvline(gene.start_codon_start, color="#00441b", lw=1.6, label="start")
+    if start <= gene.stop_codon_start < end:
+        axes[0].axvline(gene.stop_codon_start, color="#7f0000", lw=1.6, label="stop")
     axes[0].set_ylabel("gene\nfeatures", rotation=0, ha="right", va="center")
 
-    axes[1].imshow(target_np[sl][None, :], aspect="auto", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
+    axes[1].imshow(target_np[sl][None, :], aspect="auto", interpolation="nearest", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
     axes[1].set_ylabel("true\nphase", rotation=0, ha="right", va="center")
-    axes[2].imshow(pred_np[sl][None, :], aspect="auto", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
+    axes[2].imshow(pred_np[sl][None, :], aspect="auto", interpolation="nearest", cmap=state_cmap, norm=state_norm, extent=[start, end, 0, 1])
     axes[2].set_ylabel("model\nphase", rotation=0, ha="right", va="center")
 
     axes[3].fill_between(x, 0, correct, step="pre", color="#1a9850", alpha=0.75, label="correct")
@@ -267,12 +284,15 @@ def plot_example(
     for ax in axes[:3]:
         ax.set_yticks([])
     for ax in axes:
-        ax.axvline(gene.start_codon_start, color="#00441b", lw=0.8, alpha=0.6)
-        ax.axvline(gene.stop_codon_start, color="#7f0000", lw=0.8, alpha=0.6)
-    if show_bases and end - start <= 160:
+        ax.set_xlim(start, end)
+        if start <= gene.start_codon_start < end:
+            ax.axvline(gene.start_codon_start, color="#00441b", lw=0.8, alpha=0.6)
+        if start <= gene.stop_codon_start < end:
+            ax.axvline(gene.stop_codon_start, color="#7f0000", lw=0.8, alpha=0.6)
+    if show_bases and end - start <= 220:
         for pos in range(start, end):
             color = "black" if pos in path_set else "#9e9e9e"
-            axes[0].text(pos + 0.5, 0.5, gene.dna[pos], ha="center", va="center", fontsize=6, color=color)
+            axes[0].text(pos + 0.5, 0.5, gene.dna[pos], ha="center", va="center", fontsize=5.5, color=color, clip_on=True)
 
     start_split, stop_split = split_status(module, gene)
     accuracy = float((pred == target.cpu()).float().mean().item())
@@ -393,6 +413,7 @@ def main() -> None:
                 start=gene.start_codon_start - args.zoom_pad,
                 end=gene.start_codon_start + args.zoom_pad,
                 show_bases=True,
+                zoom=True,
             )
             plot_example(
                 module=module,
@@ -404,6 +425,7 @@ def main() -> None:
                 start=gene.stop_codon_start - args.zoom_pad,
                 end=gene.stop_codon_start + args.zoom_pad,
                 show_bases=True,
+                zoom=True,
             )
             split_window = first_split_window(module, gene, args.zoom_pad)
             if split_window is not None:
@@ -417,18 +439,20 @@ def main() -> None:
                     start=split_window[0],
                     end=split_window[1],
                     show_bases=True,
+                    zoom=True,
                 )
-            for junction_index, (start, end) in enumerate(junction_windows(gene, args.zoom_pad, limit=2)):
+            for junction_index, (start, end, label) in enumerate(junction_windows(gene, args.zoom_pad, limit=4)):
                 plot_example(
                     module=module,
                     gene=gene,
                     output=output,
                     target=target,
                     output_path=args.output_dir / f"{base_name}_junction_{junction_index:02d}_zoom.png",
-                    title=f"{base_name} splice junction zoom {junction_index}",
+                    title=f"{base_name} splice junction zoom {label}",
                     start=start,
                     end=end,
                     show_bases=True,
+                    zoom=True,
                 )
             summary["examples"].append(info)
 
