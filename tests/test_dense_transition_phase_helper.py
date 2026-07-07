@@ -66,10 +66,10 @@ def test_dense_layer_gradients_flow():
     model = dense.DenseTransitionPhaseModel(
         hidden_dim=16,
         conv_layers=2,
-        use_evidence_targets=True,
+        use_splice_tracks=True,
         materialize_transitions=False,
     )
-    output, logits = model(gene.dna_one_hot, gene.evidence_targets)
+    output, logits = model(gene.dna_one_hot, gene.splice_tracks)
     logits.retain_grad()
     loss, _parts = dense.compute_loss(
         output,

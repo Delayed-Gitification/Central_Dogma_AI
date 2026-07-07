@@ -92,7 +92,7 @@ def default_model_args() -> argparse.Namespace:
         grad_clip=5.0,
         hidden_dim=96,
         conv_layers=4,
-        use_evidence_targets=True,
+        use_splice_tracks=True,
         materialize_transitions=True,
         evidence_loss_weight=0.1,
         start_loss_weight=0.25,
@@ -120,7 +120,7 @@ def merged_args(checkpoint_args: dict[str, object], cli_args: argparse.Namespace
     for key in (
         "hidden_dim",
         "conv_layers",
-        "use_evidence_targets",
+        "use_splice_tracks",
         "materialize_transitions",
         "min_utr5_length",
         "max_utr5_length",
@@ -356,7 +356,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-bases", type=int, default=2200)
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--conv-layers", type=int, default=None)
-    parser.add_argument("--use-evidence-targets", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--use-splice-tracks", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--materialize-transitions", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--min-utr5-length", type=int, default=None)
     parser.add_argument("--max-utr5-length", type=int, default=None)
@@ -386,7 +386,7 @@ def main() -> None:
     model = module.DenseTransitionPhaseModel(
         hidden_dim=model_args.hidden_dim,
         conv_layers=model_args.conv_layers,
-        use_evidence_targets=model_args.use_evidence_targets,
+        use_splice_tracks=model_args.use_splice_tracks,
         materialize_transitions=model_args.materialize_transitions,
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -398,9 +398,9 @@ def main() -> None:
         for example_index in range(args.examples):
             gene = module.make_gene(model_args, rng)
             dna_one_hot = gene.dna_one_hot.to(device)
-            evidence_targets = gene.evidence_targets.to(device)
+            splice_tracks = gene.splice_tracks.to(device)
             target = gene.target_states.to(device)
-            output, _evidence_logits = model(dna_one_hot, evidence_targets if model_args.use_evidence_targets else None)
+            output, _evidence_logits = model(dna_one_hot, splice_tracks if model_args.use_splice_tracks else None)
 
             base_name = f"example_{example_index:02d}"
             overview_end = min(len(gene.dna), args.window_bases)

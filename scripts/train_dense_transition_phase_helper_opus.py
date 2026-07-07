@@ -125,7 +125,7 @@ class DenseGene:
     intron_lengths: tuple[int, ...]
 
 
-@dataclass(frozen=True)
+@dataclass
 class DenseLayerOutput:
     state_probs: torch.Tensor
     state_log_probs: torch.Tensor

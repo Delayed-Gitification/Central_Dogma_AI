@@ -101,6 +101,7 @@ def edge_list_from_matrix(edge_type_matrix: torch.Tensor) -> tuple[torch.Tensor,
 class DenseGene:
     dna: str
     dna_one_hot: torch.Tensor
+    splice_tracks: torch.Tensor
     target_states: torch.Tensor
     evidence_targets: torch.Tensor
     start_codon_start: int
@@ -128,6 +129,7 @@ class DenseLayerOutput:
 @dataclass(frozen=True)
 class DenseBatch:
     dna_one_hot: torch.Tensor
+    splice_tracks: torch.Tensor
     evidence_targets: torch.Tensor
     target_states: torch.Tensor
     mask: torch.Tensor
@@ -250,6 +252,7 @@ def generate_dense_gene(
 
     dna = "".join(base for base, _region, _phase in rows)
     target = torch.empty(len(rows), dtype=torch.long)
+    splice_tracks = torch.zeros(len(rows), 2, dtype=torch.float32)
     evidence_targets = torch.zeros(len(rows), K, dtype=torch.float32)
     transition_donor_positions = tuple(position + 1 for position in donor_positions)
     donor_set = set(transition_donor_positions)
@@ -276,6 +279,10 @@ def generate_dense_gene(
         transition_types[pos] = "donor"
     for pos in acceptor_positions:
         transition_types[pos] = "acceptor"
+    for pos in transition_donor_positions:
+        splice_tracks[pos, 0] = 1.0
+    for pos in acceptor_positions:
+        splice_tracks[pos, 1] = 1.0
 
     current_state = idx_U(0)
     stop_transition_pos = None
@@ -314,6 +321,7 @@ def generate_dense_gene(
     return DenseGene(
         dna=dna,
         dna_one_hot=one_hot_dna(dna),
+        splice_tracks=splice_tracks,
         target_states=target,
         evidence_targets=evidence_targets,
         start_codon_start=start_pos,
@@ -440,10 +448,10 @@ class DenseTransitionPhaseLayer(nn.Module):
 
 
 class DilatedConvEvidenceModel(nn.Module):
-    def __init__(self, *, hidden_dim: int, layers: int, use_evidence_targets: bool):
+    def __init__(self, *, hidden_dim: int, layers: int, use_splice_tracks: bool):
         super().__init__()
-        self.use_evidence_targets = use_evidence_targets
-        input_dim = 4 + (K if use_evidence_targets else 0)
+        self.use_splice_tracks = use_splice_tracks
+        input_dim = 4 + (2 if use_splice_tracks else 0)
         blocks = [nn.Conv1d(input_dim, hidden_dim, kernel_size=7, padding=3), nn.GELU()]
         for layer_index in range(layers):
             dilation = 2 ** (layer_index % 5)
@@ -458,7 +466,7 @@ class DilatedConvEvidenceModel(nn.Module):
         blocks.append(nn.Conv1d(hidden_dim, K, kernel_size=1))
         self.net = nn.Sequential(*blocks)
 
-    def forward(self, dna_one_hot: torch.Tensor, evidence_targets: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor | None = None) -> torch.Tensor:
         squeeze_batch = False
         if dna_one_hot.ndim == 2:
             dna_one_hot = dna_one_hot.unsqueeze(0)
@@ -466,28 +474,30 @@ class DilatedConvEvidenceModel(nn.Module):
         if dna_one_hot.ndim != 3:
             raise ValueError("dna_one_hot must have shape L x 4 or B x L x 4")
         features = dna_one_hot
-        if self.use_evidence_targets:
-            if evidence_targets is None:
-                raise ValueError("evidence_targets are required when --use-evidence-targets is enabled")
-            if evidence_targets.ndim == 2:
-                evidence_targets = evidence_targets.unsqueeze(0)
-            features = torch.cat([dna_one_hot, evidence_targets], dim=-1)
+        if self.use_splice_tracks:
+            if splice_tracks is None:
+                raise ValueError("splice_tracks are required when --use-splice-tracks is enabled")
+            if splice_tracks.ndim == 2:
+                splice_tracks = splice_tracks.unsqueeze(0)
+            if splice_tracks.shape[-1] != 2:
+                raise ValueError("splice_tracks must contain donor and acceptor channels")
+            features = torch.cat([dna_one_hot, splice_tracks], dim=-1)
         output = self.net(features.transpose(1, 2)).transpose(1, 2)
         return output.squeeze(0) if squeeze_batch else output
 
 
 class DenseTransitionPhaseModel(nn.Module):
-    def __init__(self, *, hidden_dim: int, conv_layers: int, use_evidence_targets: bool, materialize_transitions: bool):
+    def __init__(self, *, hidden_dim: int, conv_layers: int, use_splice_tracks: bool, materialize_transitions: bool):
         super().__init__()
         self.evidence = DilatedConvEvidenceModel(
             hidden_dim=hidden_dim,
             layers=conv_layers,
-            use_evidence_targets=use_evidence_targets,
+            use_splice_tracks=use_splice_tracks,
         )
         self.phase_layer = DenseTransitionPhaseLayer(materialize_transitions=materialize_transitions)
 
-    def forward(self, dna_one_hot: torch.Tensor, evidence_targets: torch.Tensor | None = None) -> tuple[DenseLayerOutput, torch.Tensor]:
-        evidence_logits = self.evidence(dna_one_hot, evidence_targets)
+    def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor | None = None) -> tuple[DenseLayerOutput, torch.Tensor]:
+        evidence_logits = self.evidence(dna_one_hot, splice_tracks)
         return self.phase_layer(evidence_logits), evidence_logits
 
 
@@ -512,13 +522,14 @@ def make_gene(args: argparse.Namespace, rng: random.Random) -> DenseGene:
 
 
 def tensors_to_device(gene: DenseGene, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return gene.dna_one_hot.to(device), gene.evidence_targets.to(device), gene.target_states.to(device)
+    return gene.dna_one_hot.to(device), gene.splice_tracks.to(device), gene.target_states.to(device)
 
 
 def batch_to_device(genes: list[DenseGene], device: torch.device) -> DenseBatch:
     batch = len(genes)
     max_length = max(len(gene.dna) for gene in genes)
     dna = torch.zeros(batch, max_length, 4, dtype=torch.float32, device=device)
+    splice_tracks = torch.zeros(batch, max_length, 2, dtype=torch.float32, device=device)
     evidence = torch.zeros(batch, max_length, K, dtype=torch.float32, device=device)
     targets = torch.zeros(batch, max_length, dtype=torch.long, device=device)
     mask = torch.zeros(batch, max_length, dtype=torch.bool, device=device)
@@ -532,6 +543,7 @@ def batch_to_device(genes: list[DenseGene], device: torch.device) -> DenseBatch:
     for index, gene in enumerate(genes):
         length = len(gene.dna)
         dna[index, :length] = gene.dna_one_hot.to(device)
+        splice_tracks[index, :length] = gene.splice_tracks.to(device)
         evidence[index, :length] = gene.evidence_targets.to(device)
         targets[index, :length] = gene.target_states.to(device)
         mask[index, :length] = True
@@ -546,6 +558,7 @@ def batch_to_device(genes: list[DenseGene], device: torch.device) -> DenseBatch:
 
     return DenseBatch(
         dna_one_hot=dna,
+        splice_tracks=splice_tracks,
         evidence_targets=evidence,
         target_states=targets,
         mask=mask,
@@ -697,7 +710,7 @@ def evaluate(model: DenseTransitionPhaseModel, args: argparse.Namespace, *, devi
         chunk_size = min(args.eval_batch_size, remaining)
         genes = [make_gene(args, rng) for _ in range(chunk_size)]
         batch = batch_to_device(genes, device)
-        output, evidence_logits = model(batch.dna_one_hot, batch.evidence_targets if args.use_evidence_targets else None)
+        output, evidence_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
         _loss, parts = compute_batch_loss(
             output,
             evidence_logits,
@@ -813,7 +826,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--hidden-dim", type=int, default=96)
     parser.add_argument("--conv-layers", type=int, default=4)
-    parser.add_argument("--use-evidence-targets", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-splice-tracks", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--materialize-transitions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--evidence-loss-weight", type=float, default=0.1)
     parser.add_argument("--start-loss-weight", type=float, default=0.25)
@@ -847,7 +860,7 @@ def main() -> None:
     model = DenseTransitionPhaseModel(
         hidden_dim=args.hidden_dim,
         conv_layers=args.conv_layers,
-        use_evidence_targets=args.use_evidence_targets,
+        use_splice_tracks=args.use_splice_tracks,
         materialize_transitions=args.materialize_transitions,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -860,7 +873,7 @@ def main() -> None:
         print(f"CUDA device: {torch.cuda.get_device_name(device)}")
     print("task: dense transition-matrix phase helper")
     print(f"states: {S}; transition types: {TRANSITION_TYPES}")
-    print(f"CNN evidence model: hidden={args.hidden_dim}, layers={args.conv_layers}, evidence_targets={args.use_evidence_targets}")
+    print(f"CNN evidence model: hidden={args.hidden_dim}, layers={args.conv_layers}, splice_tracks={args.use_splice_tracks}")
     print(f"dense transitions materialized: {args.materialize_transitions}")
     print(
         "synthetic data: "
@@ -887,7 +900,7 @@ def main() -> None:
 
         genes = [make_gene(args, train_rng) for _ in range(args.examples_per_step)]
         batch = batch_to_device(genes, device)
-        output, evidence_logits = model(batch.dna_one_hot, batch.evidence_targets if args.use_evidence_targets else None)
+        output, evidence_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
         step_loss, parts = compute_batch_loss(
             output,
             evidence_logits,
