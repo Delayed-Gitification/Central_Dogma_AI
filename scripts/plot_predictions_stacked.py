@@ -14,8 +14,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from train_dense_transition_phase_helper_async_prefix import (
-    DenseTransitionPhaseModel, make_gene, batch_to_device, 
+from train_dense_transition_phase_helper_stacked import (
+    StackedDenseTransitionPhaseModel, make_gene, batch_to_device, 
     S, K, STATE_NAMES, TYPE_TO_INDEX
 )
 
@@ -33,7 +33,7 @@ def main():
 
     # Reconstruct model parameters
     ckpt_args = checkpoint["args"]
-    model = DenseTransitionPhaseModel(
+    model = StackedDenseTransitionPhaseModel(
         hidden_dim=ckpt_args["hidden_dim"],
         conv_layers=ckpt_args["conv_layers"],
         use_splice_tracks=ckpt_args["use_splice_tracks"],
@@ -61,7 +61,7 @@ def main():
 
         # Run forward pass
         with torch.no_grad():
-            output, _ = model(batch.dna_one_hot, batch.splice_tracks if cfg.use_splice_tracks else None)
+            _, (output, _) = model(batch.dna_one_hot, batch.splice_tracks if cfg.use_splice_tracks else None)
 
         # Extract sequences to CPU
         true_states = batch.target_states[0].cpu().numpy()
