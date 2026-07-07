@@ -897,10 +897,9 @@ def main() -> None:
     
     scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
     if hasattr(torch, "compile") and not args.disable_compile:
-        # Compile if possible
         try:
-            model = torch.compile(model)
-            print("Successfully applied torch.compile()")
+            model.evidence = torch.compile(model.evidence)
+            print("Successfully applied torch.compile() to evidence CNN")
         except Exception as e:
             print(f"Could not apply torch.compile(): {e}")
 
