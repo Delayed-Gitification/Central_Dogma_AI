@@ -79,14 +79,16 @@ def build_edge_type_matrix() -> torch.Tensor:
     for g in range(3):
         g_next = (g + 1) % 3
         add(idx_U(g), idx_U(g_next), "u5")
-        add(idx_U(g), idx_C(g, 0), "start")
+        add(idx_U(g), idx_C(g_next, 0), "start")
         add(idx_T(g), idx_T(g_next), "u3")
         for p in range(3):
             p_next = (p + 1) % 3
             add(idx_C(g, p), idx_C(g, p_next), "coding")
-            add(idx_C(g, p), idx_I(g_next, p_next), "donor")
+            intron_g_start = (g + p + 1) % 3
+            add(idx_C(g, p), idx_I(intron_g_start, p_next), "donor")
             add(idx_I(g, p), idx_I(g_next, p), "intron")
-            add(idx_I(g, p), idx_C(g, p), "acceptor")
+            exon_track = (g_next - p) % 3
+            add(idx_I(g, p), idx_C(exon_track, p), "acceptor")
         add(idx_C(g, 2), idx_T(g), "stop")
     return edge
 
