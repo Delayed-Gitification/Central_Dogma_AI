@@ -444,7 +444,7 @@ class DenseTransitionPhaseLayer(nn.Module):
             d *= 2
         return P
 
-    def forward(self, evidence_logits: torch.Tensor) -> DenseLayerOutput:
+    def forward(self, evidence_logits: torch.Tensor, run_backward: bool = True) -> DenseLayerOutput:
         squeeze_batch = False
         if evidence_logits.ndim == 2:
             evidence_logits = evidence_logits.unsqueeze(0)
@@ -455,59 +455,52 @@ class DenseTransitionPhaseLayer(nn.Module):
         evidence_logits = evidence_logits.float()
 
         # --- 1. Forward Pass (Alpha) ---
-        # Build all S×S transition matrices at once: (B, L, S, S)
         T_all = self._build_transition_matrices(evidence_logits)
-
-        # Parallel prefix product: P_fw[t] = T[0] @ T[1] @ ... @ T[t]
         P_fw = self._parallel_prefix_product(T_all)
-
-        # State probabilities: alpha[t] = initial_state @ P_fw[t]
         state_0_fw = evidence_logits.new_zeros((batch, S))
         state_0_fw[:, self.initial_state] = 1.0
         alpha = torch.matmul(state_0_fw[:, None, None, :], P_fw).squeeze(-2)
 
-        # --- 2. Backward Pass (Beta) ---
-        # Compute Suffix Products of transition matrices:
-        # Suffix_all[t] = T_{t+1} @ T_{t+2} @ ... @ T_{L-1}
-        # Using the matrix transpose identity: (A @ B)^T = B^T @ A^T
-        T_all_T = T_all.transpose(-2, -1)
-        T_all_T_rev = T_all_T.flip(dims=[1])
-        P_bw_rev = self._parallel_prefix_product(T_all_T_rev)
-        P_bw = P_bw_rev.flip(dims=[1])
-        Suffix_all = P_bw.transpose(-2, -1)
+        if run_backward:
+            # --- 2. Backward Pass (Beta) ---
+            T_all_T = T_all.transpose(-2, -1)
+            T_all_T_rev = T_all_T.flip(dims=[1])
+            P_bw_rev = self._parallel_prefix_product(T_all_T_rev)
+            P_bw = P_bw_rev.flip(dims=[1])
+            Suffix_all = P_bw.transpose(-2, -1)
 
-        # Terminal vector beta_L: mass over UTR3 states (indices 21, 22, 23)
-        beta_L = evidence_logits.new_zeros((batch, S))
-        beta_L[:, 21:24] = 1.0
+            beta_L = evidence_logits.new_zeros((batch, S))
+            beta_L[:, 21:24] = 1.0
 
-        # Compute beta_t = Suffix_all[t+1] @ beta_L, with beta_{L-1} = beta_L
-        beta = Suffix_all.new_zeros((batch, length, S))
-        if length > 1:
-            beta[:, :-1] = torch.matmul(Suffix_all[:, 1:], beta_L[:, None, :, None]).squeeze(-1)
-        beta[:, -1] = beta_L
+            beta = Suffix_all.new_zeros((batch, length, S))
+            if length > 1:
+                beta[:, :-1] = torch.matmul(Suffix_all[:, 1:], beta_L[:, None, :, None]).squeeze(-1)
+            beta[:, -1] = beta_L
 
-        # --- 3. Combined Posterior ---
-        # Unnormalized alpha * beta
-        alpha_beta = alpha * beta
-        # Normalize over states at each position
-        alpha_beta_posterior = alpha_beta / alpha_beta.sum(dim=-1, keepdim=True).clamp_min(1.0e-30)
+            # --- 3. Combined Posterior ---
+            alpha_beta = alpha * beta
+            state_probs = alpha_beta / alpha_beta.sum(dim=-1, keepdim=True).clamp_min(1.0e-30)
 
-        # --- 4. Transition-type posteriors (Edge Marginals) ---
-        # P(s_t-1 = s, s_t = d | O) = alpha_t-1(s) * T_t(s, d) * beta_t(d)
-        prev_alpha = torch.cat([state_0_fw.unsqueeze(1), alpha[:, :-1]], dim=1)
-        transition_marginals = prev_alpha.unsqueeze(-1) * T_all * beta.unsqueeze(-2)
-        # Normalize
-        normalizer = transition_marginals.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0e-30)
-        transition_marginals = transition_marginals / normalizer
-        
-        # Marginal flow for each transition type
-        transition_type_posteriors = torch.einsum(
-            "blsd,ksd->blk", transition_marginals, self.edge_type_masks
-        )
+            # --- 4. Transition posteriors (Edge Marginals) ---
+            prev_alpha = torch.cat([state_0_fw.unsqueeze(1), alpha[:, :-1]], dim=1)
+            transition_marginals = prev_alpha.unsqueeze(-1) * T_all * beta.unsqueeze(-2)
+            normalizer = transition_marginals.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0e-30)
+            transition_marginals = transition_marginals / normalizer
+            transition_type_posteriors = torch.einsum(
+                "blsd,ksd->blk", transition_marginals, self.edge_type_masks
+            )
+        else:
+            state_probs = alpha
+            beta = None
+            prev_states = torch.cat([state_0_fw.unsqueeze(1), alpha[:, :-1]], dim=1)
+            transition_marginals = prev_states.unsqueeze(-1) * T_all
+            transition_type_posteriors = torch.einsum(
+                "blsd,ksd->blk", transition_marginals, self.edge_type_masks
+            )
 
-        state_log_probs = torch.log(alpha_beta_posterior.clamp_min(1.0e-30))
+        state_log_probs = torch.log(state_probs.clamp_min(1.0e-30))
         output = DenseLayerOutput(
-            state_probs=alpha_beta_posterior,
+            state_probs=state_probs,
             state_log_probs=state_log_probs,
             transition_type_posteriors=transition_type_posteriors,
             start_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["start"]],
@@ -560,10 +553,117 @@ class DilatedConvEvidenceModel(nn.Module):
         return output.squeeze(0) if squeeze_batch else output
 
 
+class AttentionRefinementBlock(nn.Module):
+    def __init__(self, *, input_dim1: int, attention_dim: int, downsample: int, layers: int, heads: int, use_backward_features: bool = True):
+        super().__init__()
+        self.use_backward_features = use_backward_features
+        self.downsample = downsample
+        
+        # Calculate input feature dimension
+        # DNA/splice + evidence1_logits + state_probs + transition_posteriors + 2 entropy channels
+        # If use_backward_features, we add state_probs_bw (24 channels) + state_entropy_bw (1 channel)
+        self.feature_dim = input_dim1 + K + S + K + 2
+        if use_backward_features:
+            self.feature_dim += S + 1
+            
+        self.proj_in = nn.Conv1d(self.feature_dim, attention_dim, kernel_size=1)
+        
+        if downsample > 1:
+            self.downsample_conv = nn.Conv1d(
+                attention_dim, 
+                attention_dim, 
+                kernel_size=downsample, 
+                stride=downsample,
+                padding=0
+            )
+            
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=attention_dim,
+            nhead=heads,
+            dim_feedforward=attention_dim * 4,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+        
+        # Final prediction Conv1d head (predict delta_logits)
+        self.head = nn.Sequential(
+            nn.Conv1d(attention_dim, attention_dim, kernel_size=5, stride=1, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(attention_dim, K, kernel_size=5, stride=1, padding=2)
+        )
+        
+        # Initialize final conv layers to yield small delta_logits initially
+        nn.init.normal_(self.head[-1].weight, std=0.01)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, features1: torch.Tensor, evidence1_logits: torch.Tensor, output1_fw: DenseLayerOutput) -> torch.Tensor:
+        state_probs = output1_fw.state_probs
+        state_entropy = - (state_probs * torch.log(state_probs.clamp_min(1.0e-30))).sum(dim=-1, keepdim=True)
+        
+        transition_posteriors = output1_fw.transition_type_posteriors
+        transition_entropy = - (transition_posteriors * torch.log(transition_posteriors.clamp_min(1.0e-30))).sum(dim=-1, keepdim=True)
+        
+        refinement_features = [
+            features1,
+            evidence1_logits,
+            state_probs,
+            transition_posteriors,
+            state_entropy,
+            transition_entropy
+        ]
+        
+        if self.use_backward_features and output1_fw.beta is not None:
+            beta = output1_fw.beta
+            beta_entropy = - (beta * torch.log(beta.clamp_min(1.0e-30))).sum(dim=-1, keepdim=True)
+            refinement_features.extend([beta, beta_entropy])
+            
+        # Concatenate along channel dimension: (B, L, feature_dim)
+        x = torch.cat(refinement_features, dim=-1)
+        
+        # Conv1d expects shape (B, feature_dim, L)
+        x_base = self.proj_in(x.transpose(1, 2))
+        
+        if self.downsample > 1:
+            x_down = self.downsample_conv(x_base)
+        else:
+            x_down = x_base
+            
+        # Transformer expects (B, L_down, D)
+        x_att_down = self.transformer(x_down.transpose(1, 2)).transpose(1, 2)
+        
+        # Upsample back to L
+        L = features1.shape[1]
+        x_upsampled = F.interpolate(x_att_down, size=L, mode="linear", align_corners=False)
+        
+        # Skip connection / fusion
+        x_fused = x_base + x_upsampled
+        
+        # Predict delta_logits: (B, K, L) -> (B, L, K)
+        delta_logits = self.head(x_fused).transpose(1, 2)
+        return delta_logits
+
+
 class StackedDenseTransitionPhaseModel(nn.Module):
-    def __init__(self, *, hidden_dim: int, conv_layers: int, use_splice_tracks: bool, materialize_transitions: bool):
+    def __init__(self, *, 
+                 hidden_dim: int, 
+                 conv_layers: int, 
+                 use_splice_tracks: bool, 
+                 materialize_transitions: bool,
+                 use_attention_refinement: bool = True,
+                 use_residual_refinement: bool = False,
+                 attention_downsample: int = 8,
+                 attention_layers: int = 2,
+                 attention_heads: int = 4,
+                 attention_dim: int = 96,
+                 delta_logit_scale: float = 1.0,
+                 use_backward_features: bool = True):
         super().__init__()
         self.use_splice_tracks = use_splice_tracks
+        self.use_attention_refinement = use_attention_refinement
+        self.use_residual_refinement = use_residual_refinement
+        self.delta_logit_scale = delta_logit_scale
+        self.use_backward_features = use_backward_features
         
         # Unit 1
         input_dim1 = 4 + (2 if use_splice_tracks else 0)
@@ -574,18 +674,42 @@ class StackedDenseTransitionPhaseModel(nn.Module):
         )
         self.phase_layer1 = DenseTransitionPhaseLayer(materialize_transitions=materialize_transitions)
         
-        # Unit 2 (takes input_dim1 + 24 alpha + 24 beta + 24 state_probs + 8 transition_type_posteriors)
-        input_dim2 = input_dim1 + 24 + 24 + 24 + 8
-        self.evidence2 = DilatedConvEvidenceModel(
-            hidden_dim=hidden_dim,
-            layers=conv_layers,
-            input_dim=input_dim2,
-        )
+        if use_attention_refinement:
+            self.refiner = AttentionRefinementBlock(
+                input_dim1=input_dim1,
+                attention_dim=attention_dim,
+                downsample=attention_downsample,
+                layers=attention_layers,
+                heads=attention_heads,
+                use_backward_features=use_backward_features,
+            )
+        elif use_residual_refinement:
+            # Ablation 2: local residual CNN refinement (no attention)
+            feature_dim = input_dim1 + K + S + K + 2
+            if use_backward_features:
+                feature_dim += S + 1
+            self.refiner = nn.Sequential(
+                nn.Conv1d(feature_dim, attention_dim, kernel_size=5, stride=1, padding=2),
+                nn.ReLU(),
+                nn.Conv1d(attention_dim, K, kernel_size=5, stride=1, padding=2)
+            )
+            nn.init.normal_(self.refiner[-1].weight, std=0.01)
+            nn.init.zeros_(self.refiner[-1].bias)
+        else:
+            # Ablation 1: standard stacked CNN
+            input_dim2 = input_dim1 + 24 + 8
+            self.evidence2 = DilatedConvEvidenceModel(
+                hidden_dim=hidden_dim,
+                layers=conv_layers,
+                input_dim=input_dim2,
+            )
+            
         self.phase_layer2 = DenseTransitionPhaseLayer(materialize_transitions=materialize_transitions)
 
     def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor | None = None) -> tuple[
         tuple[DenseLayerOutput, torch.Tensor],
-        tuple[DenseLayerOutput, torch.Tensor]
+        tuple[DenseLayerOutput, torch.Tensor],
+        torch.Tensor | None
     ]:
         squeeze_batch = False
         if dna_one_hot.ndim == 2:
@@ -602,18 +726,38 @@ class StackedDenseTransitionPhaseModel(nn.Module):
             features1 = torch.cat([dna_one_hot, splice_tracks], dim=-1)
             
         evidence1_logits = self.evidence1(features1)
-        output1 = self.phase_layer1(evidence1_logits)
+        output1 = self.phase_layer1(evidence1_logits, run_backward=self.use_backward_features)
         
-        # Unit 2 Forward
-        features2 = torch.cat([
-            features1, 
-            output1.alpha, 
-            output1.beta, 
-            output1.state_probs, 
-            output1.transition_type_posteriors
-        ], dim=-1)
-        evidence2_logits = self.evidence2(features2)
-        output2 = self.phase_layer2(evidence2_logits)
+        # Unit 2 Forward (Residual Refinement or Standard Stacked)
+        delta_logits = None
+        if self.use_attention_refinement:
+            delta_logits = self.refiner(features1, evidence1_logits, output1)
+            evidence2_logits = evidence1_logits + self.delta_logit_scale * delta_logits
+        elif self.use_residual_refinement:
+            state_probs = output1.state_probs
+            state_entropy = - (state_probs * torch.log(state_probs.clamp_min(1.0e-30))).sum(dim=-1, keepdim=True)
+            transition_posteriors = output1.transition_type_posteriors
+            transition_entropy = - (transition_posteriors * torch.log(transition_posteriors.clamp_min(1.0e-30))).sum(dim=-1, keepdim=True)
+            refinement_features = [
+                features1,
+                evidence1_logits,
+                state_probs,
+                transition_posteriors,
+                state_entropy,
+                transition_entropy
+            ]
+            if self.use_backward_features and output1.beta is not None:
+                beta = output1.beta
+                beta_entropy = - (beta * torch.log(beta.clamp_min(1.0e-30))).sum(dim=-1, keepdim=True)
+                refinement_features.extend([beta, beta_entropy])
+            x = torch.cat(refinement_features, dim=-1)
+            delta_logits = self.refiner(x.transpose(1, 2)).transpose(1, 2)
+            evidence2_logits = evidence1_logits + self.delta_logit_scale * delta_logits
+        else:
+            features2 = torch.cat([features1, output1.state_probs, output1.transition_type_posteriors], dim=-1)
+            evidence2_logits = self.evidence2(features2)
+            
+        output2 = self.phase_layer2(evidence2_logits, run_backward=False)
         
         if squeeze_batch:
             def squeeze_output(out):
@@ -628,9 +772,9 @@ class StackedDenseTransitionPhaseModel(nn.Module):
                     alpha=out.alpha.squeeze(0) if out.alpha is not None else None,
                     beta=out.beta.squeeze(0) if out.beta is not None else None,
                 )
-            return (squeeze_output(output1), evidence1_logits.squeeze(0)), (squeeze_output(output2), evidence2_logits.squeeze(0))
+            return (squeeze_output(output1), evidence1_logits.squeeze(0)), (squeeze_output(output2), evidence2_logits.squeeze(0)), (delta_logits.squeeze(0) if delta_logits is not None else None)
             
-        return (output1, evidence1_logits), (output2, evidence2_logits)
+        return (output1, evidence1_logits), (output2, evidence2_logits), delta_logits
 
 
 def randint(rng: random.Random, low: int, high: int) -> int:
@@ -866,7 +1010,7 @@ def evaluate(model: StackedDenseTransitionPhaseModel, args: argparse.Namespace, 
         chunk_size = min(args.eval_batch_size, remaining)
         genes = [make_gene(args, rng) for _ in range(chunk_size)]
         batch = batch_to_device(genes, device)
-        (output1, evidence1_logits), (output2, evidence2_logits) = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
+        (output1, evidence1_logits), (output2, evidence2_logits), delta_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
         loss1, parts1 = compute_batch_loss(
             output1,
             evidence1_logits,
@@ -888,7 +1032,7 @@ def evaluate(model: StackedDenseTransitionPhaseModel, args: argparse.Namespace, 
             acceptor_loss_weight=args.acceptor_loss_weight,
         )
         for key in loss_sums:
-            loss_sums[key] += (0.2 * float(parts1[key].item()) + 1.0 * float(parts2[key].item())) * chunk_size
+            loss_sums[key] += (args.layer1_loss_weight * float(parts1[key].item()) + args.layer2_loss_weight * float(parts2[key].item())) * chunk_size
         output = output2
         predicted = output.state_log_probs.argmax(dim=-1)
         matches = (predicted == batch.target_states) & batch.mask
@@ -1012,6 +1156,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-intron-length", type=int, default=50)
     parser.add_argument("--max-intron-length", type=int, default=300)
     parser.add_argument("--intron-mod", choices=("any", "0", "1", "2", "nonzero"), default="any")
+    parser.add_argument("--use-attention-refinement", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-residual-refinement", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--attention-downsample", type=int, default=8)
+    parser.add_argument("--attention-layers", type=int, default=2)
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--attention-dim", type=int, default=None)
+    parser.add_argument("--delta-logit-scale", type=float, default=1.0)
+    parser.add_argument("--use-backward-features", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--layer1-loss-weight", type=float, default=0.2)
+    parser.add_argument("--layer2-loss-weight", type=float, default=1.0)
     parser.add_argument("--overfit-single-batch", action="store_true",
                         help="Generate a single batch once and reuse it every step to profile model speed.")
     parser.add_argument("--num-workers", type=int, default=4,
@@ -1030,11 +1184,20 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
+    attention_dim = args.attention_dim if args.attention_dim is not None else args.hidden_dim
     model = StackedDenseTransitionPhaseModel(
         hidden_dim=args.hidden_dim,
         conv_layers=args.conv_layers,
         use_splice_tracks=args.use_splice_tracks,
         materialize_transitions=args.materialize_transitions,
+        use_attention_refinement=args.use_attention_refinement,
+        use_residual_refinement=args.use_residual_refinement,
+        attention_downsample=args.attention_downsample,
+        attention_layers=args.attention_layers,
+        attention_heads=args.attention_heads,
+        attention_dim=attention_dim,
+        delta_logit_scale=args.delta_logit_scale,
+        use_backward_features=args.use_backward_features,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     train_rng = random.Random(args.seed + 101)
@@ -1105,7 +1268,7 @@ def main() -> None:
         else:
             cpu_batch = next(dataloader_iter)
             batch = transfer_batch_to_device(cpu_batch, device)
-        (output1, evidence1_logits), (output2, evidence2_logits) = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
+        (output1, evidence1_logits), (output2, evidence2_logits), delta_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
         loss1, parts1 = compute_batch_loss(
             output1,
             evidence1_logits,
@@ -1126,9 +1289,35 @@ def main() -> None:
             donor_loss_weight=args.donor_loss_weight,
             acceptor_loss_weight=args.acceptor_loss_weight,
         )
-        step_loss = 0.2 * loss1 + 1.0 * loss2
+        step_loss = args.layer1_loss_weight * loss1 + args.layer2_loss_weight * loss2
         output = output2
-        parts = {key: 0.2 * parts1[key] + 1.0 * parts2[key] for key in parts1}
+        parts = {key: args.layer1_loss_weight * parts1[key] + args.layer2_loss_weight * parts2[key] for key in parts1}
+        
+        # Log evidence / delta stats
+        if should_print:
+            with torch.no_grad():
+                print(f"Stats | evidence1 mean={evidence1_logits.mean().item():.3f} std={evidence1_logits.std().item():.3f} norm={evidence1_logits.norm().item():.3f}")
+                if delta_logits is not None:
+                    print(f"      | delta_logits mean={delta_logits.mean().item():.3f} std={delta_logits.std().item():.3f} norm={delta_logits.norm().item():.3f}")
+                    print(f"      | evidence2 mean={evidence2_logits.mean().item():.3f} std={evidence2_logits.std().item():.3f} norm={evidence2_logits.norm().item():.3f}")
+                
+                # Check layer 2 improvements over layer 1
+                pred1 = output1.state_log_probs.argmax(dim=-1)
+                pred2 = output2.state_log_probs.argmax(dim=-1)
+                exact1 = int(((pred1 == batch.target_states) | ~batch.mask).all(dim=1).sum().item())
+                exact2 = int(((pred2 == batch.target_states) | ~batch.mask).all(dim=1).sum().item())
+                
+                batch_index = torch.arange(args.examples_per_step, device=device)
+                start_l1 = int((output1.start_posterior.argmax(dim=1) == batch.start_positions).sum().item())
+                start_l2 = int((output2.start_posterior.argmax(dim=1) == batch.start_positions).sum().item())
+                stop_l1 = int((output1.stop_posterior.argmax(dim=1) == batch.stop_transition_positions).sum().item())
+                stop_l2 = int((output2.stop_posterior.argmax(dim=1) == batch.stop_transition_positions).sum().item())
+                donor_l1 = int(batch.donor_mask[batch_index, output1.donor_posterior.argmax(dim=1)].sum().item())
+                donor_l2 = int(batch.donor_mask[batch_index, output2.donor_posterior.argmax(dim=1)].sum().item())
+                acceptor_l1 = int(batch.acceptor_mask[batch_index, output1.acceptor_posterior.argmax(dim=1)].sum().item())
+                acceptor_l2 = int(batch.acceptor_mask[batch_index, output2.acceptor_posterior.argmax(dim=1)].sum().item())
+                
+                print(f"L1 vs L2 | exact: {exact1} vs {exact2} | start: {start_l1} vs {start_l2} | stop: {stop_l1} vs {stop_l2} | donor: {donor_l1} vs {donor_l2} | acceptor: {acceptor_l1} vs {acceptor_l2}")
         if should_report:
             with torch.no_grad():
                 predicted = output.state_log_probs.argmax(dim=-1)
