@@ -299,7 +299,9 @@ def plot_example(
     exact = bool(torch.equal(pred, target.cpu()))
     fig.suptitle(
         f"{title} | genome={len(gene.dna)} bp, exons={len(gene.exon_lengths)}, "
-        f"introns={len(gene.intron_lengths)}, split start={start_split}, split stop={stop_split}, "
+        f"introns={len(gene.intron_lengths)}, UTR5={gene.utr5_length} bp, "
+        f"start={gene.start_codon_start}, stop={gene.stop_codon_start}, "
+        f"split start={start_split}, split stop={stop_split}, "
         f"accuracy={accuracy:.3f}, exact={exact}",
         y=1.02,
     )
@@ -322,6 +324,10 @@ def plot_example(
         "exact": exact,
         "start_codon_start": int(gene.start_codon_start),
         "stop_codon_start": int(gene.stop_codon_start),
+        "utr5_length": int(gene.utr5_length),
+        "utr3_length": int(gene.utr3_length),
+        "plot_start": int(start),
+        "plot_end": int(end),
     }
 
 
@@ -386,12 +392,6 @@ def main() -> None:
             output = module.run_model_on_gene(model, model_args, gene, dna_one_hot)
 
             overview_window = (0, min(len(gene.dna), args.window_bases))
-            if len(gene.dna) > args.window_bases:
-                centre = max(0, min(len(gene.dna), gene.start_codon_start + args.window_bases // 2))
-                overview_window = (
-                    max(0, centre - args.window_bases // 2),
-                    min(len(gene.dna), centre + args.window_bases // 2),
-                )
             base_name = f"example_{example_index:02d}"
             info = plot_example(
                 module=module,
