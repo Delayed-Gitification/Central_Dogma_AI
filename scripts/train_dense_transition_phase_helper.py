@@ -112,13 +112,25 @@ class DenseGene:
 class DenseLayerOutput:
     state_probs: torch.Tensor
     state_log_probs: torch.Tensor
-    transition_probs: torch.Tensor
-    transition_log_probs: torch.Tensor
-    transition_marginals: torch.Tensor
+    transition_type_posteriors: torch.Tensor
     start_posterior: torch.Tensor
     stop_posterior: torch.Tensor
     donor_posterior: torch.Tensor
     acceptor_posterior: torch.Tensor
+
+
+@dataclass(frozen=True)
+class DenseBatch:
+    dna_one_hot: torch.Tensor
+    evidence_targets: torch.Tensor
+    target_states: torch.Tensor
+    mask: torch.Tensor
+    start_positions: torch.Tensor
+    stop_transition_positions: torch.Tensor
+    donor_mask: torch.Tensor
+    acceptor_mask: torch.Tensor
+    lengths: torch.Tensor
+    intron_counts: torch.Tensor
 
 
 def one_hot_dna(sequence: str) -> torch.Tensor:
@@ -315,6 +327,8 @@ class DenseTransitionPhaseLayer(nn.Module):
         super().__init__()
         matrix = EDGE_TYPE_MATRIX if edge_type_matrix is None else edge_type_matrix
         self.register_buffer("edge_type_matrix", matrix.to(torch.long), persistent=False)
+        type_masks = torch.stack([(matrix == type_index).to(torch.float32) for type_index in range(K)], dim=0)
+        self.register_buffer("edge_type_masks", type_masks, persistent=False)
         self.initial_state = initial_state
         self.materialize_transitions = materialize_transitions
 
@@ -334,10 +348,8 @@ class DenseTransitionPhaseLayer(nn.Module):
         logits = logits.masked_fill(~allowed[None, :, :], -torch.inf)
         return torch.log_softmax(logits, dim=-1)
 
-    @staticmethod
-    def _transition_posterior(transition_marginals: torch.Tensor, transition_type: int, edge_type_matrix: torch.Tensor) -> torch.Tensor:
-        mask = edge_type_matrix == transition_type
-        return transition_marginals.masked_fill(~mask[None, None, :, :], 0.0).sum(dim=(-2, -1))
+    def transition_type_posterior(self, transition_marginal_t: torch.Tensor) -> torch.Tensor:
+        return (transition_marginal_t[:, None, :, :] * self.edge_type_masks[None, :, :, :]).sum(dim=(-2, -1))
 
     def forward(self, evidence_logits: torch.Tensor) -> DenseLayerOutput:
         squeeze_batch = False
@@ -348,52 +360,42 @@ class DenseTransitionPhaseLayer(nn.Module):
         state = evidence_logits.new_zeros((batch, S))
         state[:, self.initial_state] = 1.0
         states = []
-        transition_probs_by_pos = []
-        transition_marginals_by_pos = []
+        type_posteriors = []
 
         if self.materialize_transitions:
             transition_log_probs = self.transition_log_probs(evidence_logits)
             for t in range(length):
                 transition_t = transition_log_probs[:, t].exp()
-                transition_probs_by_pos.append(transition_t)
-                transition_marginals_by_pos.append(state[:, :, None] * transition_t)
+                transition_marginal_t = state[:, :, None] * transition_t
+                type_posteriors.append(self.transition_type_posterior(transition_marginal_t))
                 state = torch.bmm(state[:, None, :], transition_t).squeeze(1)
                 states.append(state)
-            transition_probs = transition_log_probs.exp()
         else:
-            transition_log_probs_list = []
             for t in range(length):
                 transition_log_t = self.step_transition_log_probs(evidence_logits[:, t])
                 transition_t = transition_log_t.exp()
-                transition_log_probs_list.append(transition_log_t)
-                transition_probs_by_pos.append(transition_t)
-                transition_marginals_by_pos.append(state[:, :, None] * transition_t)
+                transition_marginal_t = state[:, :, None] * transition_t
+                type_posteriors.append(self.transition_type_posterior(transition_marginal_t))
                 state = torch.bmm(state[:, None, :], transition_t).squeeze(1)
                 states.append(state)
-            transition_log_probs = torch.stack(transition_log_probs_list, dim=1)
-            transition_probs = torch.stack(transition_probs_by_pos, dim=1)
 
         state_probs = torch.stack(states, dim=1)
         state_log_probs = torch.log(state_probs.clamp_min(1.0e-30))
-        transition_marginals = torch.stack(transition_marginals_by_pos, dim=1)
+        transition_type_posteriors = torch.stack(type_posteriors, dim=1)
         output = DenseLayerOutput(
             state_probs=state_probs,
             state_log_probs=state_log_probs,
-            transition_probs=transition_probs,
-            transition_log_probs=transition_log_probs,
-            transition_marginals=transition_marginals,
-            start_posterior=self._transition_posterior(transition_marginals, TYPE_TO_INDEX["start"], self.edge_type_matrix),
-            stop_posterior=self._transition_posterior(transition_marginals, TYPE_TO_INDEX["stop"], self.edge_type_matrix),
-            donor_posterior=self._transition_posterior(transition_marginals, TYPE_TO_INDEX["donor"], self.edge_type_matrix),
-            acceptor_posterior=self._transition_posterior(transition_marginals, TYPE_TO_INDEX["acceptor"], self.edge_type_matrix),
+            transition_type_posteriors=transition_type_posteriors,
+            start_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["start"]],
+            stop_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["stop"]],
+            donor_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["donor"]],
+            acceptor_posterior=transition_type_posteriors[:, :, TYPE_TO_INDEX["acceptor"]],
         )
         if squeeze_batch:
             return DenseLayerOutput(
                 state_probs=output.state_probs.squeeze(0),
                 state_log_probs=output.state_log_probs.squeeze(0),
-                transition_probs=output.transition_probs.squeeze(0),
-                transition_log_probs=output.transition_log_probs.squeeze(0),
-                transition_marginals=output.transition_marginals.squeeze(0),
+                transition_type_posteriors=output.transition_type_posteriors.squeeze(0),
                 start_posterior=output.start_posterior.squeeze(0),
                 stop_posterior=output.stop_posterior.squeeze(0),
                 donor_posterior=output.donor_posterior.squeeze(0),
@@ -422,14 +424,21 @@ class DilatedConvEvidenceModel(nn.Module):
         self.net = nn.Sequential(*blocks)
 
     def forward(self, dna_one_hot: torch.Tensor, evidence_targets: torch.Tensor | None = None) -> torch.Tensor:
-        if dna_one_hot.ndim != 2:
-            raise ValueError("This prototype works gene-by-gene with L x 4 DNA")
+        squeeze_batch = False
+        if dna_one_hot.ndim == 2:
+            dna_one_hot = dna_one_hot.unsqueeze(0)
+            squeeze_batch = True
+        if dna_one_hot.ndim != 3:
+            raise ValueError("dna_one_hot must have shape L x 4 or B x L x 4")
         features = dna_one_hot
         if self.use_evidence_targets:
             if evidence_targets is None:
                 raise ValueError("evidence_targets are required when --use-evidence-targets is enabled")
+            if evidence_targets.ndim == 2:
+                evidence_targets = evidence_targets.unsqueeze(0)
             features = torch.cat([dna_one_hot, evidence_targets], dim=-1)
-        return self.net(features.transpose(0, 1).unsqueeze(0)).squeeze(0).transpose(0, 1)
+        output = self.net(features.transpose(1, 2)).transpose(1, 2)
+        return output.squeeze(0) if squeeze_batch else output
 
 
 class DenseTransitionPhaseModel(nn.Module):
@@ -471,6 +480,49 @@ def tensors_to_device(gene: DenseGene, device: torch.device) -> tuple[torch.Tens
     return gene.dna_one_hot.to(device), gene.evidence_targets.to(device), gene.target_states.to(device)
 
 
+def batch_to_device(genes: list[DenseGene], device: torch.device) -> DenseBatch:
+    batch = len(genes)
+    max_length = max(len(gene.dna) for gene in genes)
+    dna = torch.zeros(batch, max_length, 4, dtype=torch.float32, device=device)
+    evidence = torch.zeros(batch, max_length, K, dtype=torch.float32, device=device)
+    targets = torch.zeros(batch, max_length, dtype=torch.long, device=device)
+    mask = torch.zeros(batch, max_length, dtype=torch.bool, device=device)
+    donor_mask = torch.zeros(batch, max_length, dtype=torch.bool, device=device)
+    acceptor_mask = torch.zeros(batch, max_length, dtype=torch.bool, device=device)
+    start_positions = torch.empty(batch, dtype=torch.long, device=device)
+    stop_positions = torch.empty(batch, dtype=torch.long, device=device)
+    lengths = torch.empty(batch, dtype=torch.long, device=device)
+    intron_counts = torch.empty(batch, dtype=torch.long, device=device)
+
+    for index, gene in enumerate(genes):
+        length = len(gene.dna)
+        dna[index, :length] = gene.dna_one_hot.to(device)
+        evidence[index, :length] = gene.evidence_targets.to(device)
+        targets[index, :length] = gene.target_states.to(device)
+        mask[index, :length] = True
+        start_positions[index] = gene.start_codon_start
+        stop_positions[index] = gene.stop_transition_position
+        lengths[index] = length
+        intron_counts[index] = len(gene.intron_lengths)
+        if gene.donor_positions:
+            donor_mask[index, torch.tensor(gene.donor_positions, dtype=torch.long, device=device)] = True
+        if gene.acceptor_positions:
+            acceptor_mask[index, torch.tensor(gene.acceptor_positions, dtype=torch.long, device=device)] = True
+
+    return DenseBatch(
+        dna_one_hot=dna,
+        evidence_targets=evidence,
+        target_states=targets,
+        mask=mask,
+        start_positions=start_positions,
+        stop_transition_positions=stop_positions,
+        donor_mask=donor_mask,
+        acceptor_mask=acceptor_mask,
+        lengths=lengths,
+        intron_counts=intron_counts,
+    )
+
+
 def compute_loss(
     output: DenseLayerOutput,
     evidence_logits: torch.Tensor,
@@ -498,6 +550,62 @@ def compute_loss(
         acceptor_loss = -torch.log(output.acceptor_posterior[acceptor_index].clamp_min(1.0e-30)).mean()
     else:
         acceptor_loss = phase_loss.new_zeros(())
+    total = (
+        phase_loss
+        + evidence_loss_weight * evidence_loss
+        + start_loss_weight * start_loss
+        + stop_loss_weight * stop_loss
+        + donor_loss_weight * donor_loss
+        + acceptor_loss_weight * acceptor_loss
+    )
+    return total, {
+        "total": total.detach(),
+        "phase": phase_loss.detach(),
+        "evidence": evidence_loss.detach(),
+        "start": start_loss.detach(),
+        "stop": stop_loss.detach(),
+        "donor": donor_loss.detach(),
+        "acceptor": acceptor_loss.detach(),
+    }
+
+
+def compute_batch_loss(
+    output: DenseLayerOutput,
+    evidence_logits: torch.Tensor,
+    batch: DenseBatch,
+    *,
+    evidence_loss_weight: float,
+    start_loss_weight: float,
+    stop_loss_weight: float,
+    donor_loss_weight: float,
+    acceptor_loss_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    flat_phase_loss = F.nll_loss(
+        output.state_log_probs.reshape(-1, S),
+        batch.target_states.reshape(-1),
+        reduction="none",
+    ).reshape_as(batch.target_states)
+    phase_loss = flat_phase_loss.masked_select(batch.mask).mean()
+
+    evidence_loss_by_pos = F.binary_cross_entropy_with_logits(
+        evidence_logits,
+        batch.evidence_targets,
+        reduction="none",
+    ).mean(dim=-1)
+    evidence_loss = evidence_loss_by_pos.masked_select(batch.mask).mean()
+
+    batch_index = torch.arange(batch.target_states.shape[0], device=batch.target_states.device)
+    start_loss = -torch.log(output.start_posterior[batch_index, batch.start_positions].clamp_min(1.0e-30)).mean()
+    stop_loss = -torch.log(output.stop_posterior[batch_index, batch.stop_transition_positions].clamp_min(1.0e-30)).mean()
+    donor_weight = batch.donor_mask.to(output.donor_posterior.dtype)
+    donor_loss = (
+        -torch.log(output.donor_posterior.clamp_min(1.0e-30)) * donor_weight
+    ).sum() / donor_weight.sum().clamp_min(1.0)
+    acceptor_weight = batch.acceptor_mask.to(output.acceptor_posterior.dtype)
+    acceptor_loss = (
+        -torch.log(output.acceptor_posterior.clamp_min(1.0e-30)) * acceptor_weight
+    ).sum() / acceptor_weight.sum().clamp_min(1.0)
+
     total = (
         phase_loss
         + evidence_loss_weight * evidence_loss
@@ -547,17 +655,18 @@ def evaluate(model: DenseTransitionPhaseModel, args: argparse.Namespace, *, devi
     acceptor_exact = 0
     length_sum = 0
     intron_sum = 0
-    group_sums = {"U": 0.0, "C": 0.0, "I": 0.0, "T": 0.0}
-    for _ in range(examples):
-        gene = make_gene(args, rng)
-        dna_one_hot, evidence_targets, target = tensors_to_device(gene, device)
-        output, evidence_logits = model(dna_one_hot, evidence_targets if args.use_evidence_targets else None)
-        _loss, parts = compute_loss(
+    group_correct = {"U": 0, "C": 0, "I": 0, "T": 0}
+    group_total = {"U": 0, "C": 0, "I": 0, "T": 0}
+    remaining = examples
+    while remaining > 0:
+        chunk_size = min(args.eval_batch_size, remaining)
+        genes = [make_gene(args, rng) for _ in range(chunk_size)]
+        batch = batch_to_device(genes, device)
+        output, evidence_logits = model(batch.dna_one_hot, batch.evidence_targets if args.use_evidence_targets else None)
+        _loss, parts = compute_batch_loss(
             output,
             evidence_logits,
-            target,
-            evidence_targets,
-            gene,
+            batch,
             evidence_loss_weight=args.evidence_loss_weight,
             start_loss_weight=args.start_loss_weight,
             stop_loss_weight=args.stop_loss_weight,
@@ -565,21 +674,33 @@ def evaluate(model: DenseTransitionPhaseModel, args: argparse.Namespace, *, devi
             acceptor_loss_weight=args.acceptor_loss_weight,
         )
         for key, value in parts.items():
-            loss_sums[key] += float(value.item())
+            loss_sums[key] += float(value.item()) * chunk_size
         predicted = output.state_log_probs.argmax(dim=-1)
-        matches = predicted == target
-        bases += int(target.numel())
+        matches = (predicted == batch.target_states) & batch.mask
+        bases += int(batch.mask.sum().item())
         correct += int(matches.sum().item())
-        exact += int(bool(matches.all().item()))
-        start_exact += int(output.start_posterior.argmax().item() == gene.start_codon_start)
-        stop_exact += int(output.stop_posterior.argmax().item() == gene.stop_transition_position)
-        donor_exact += int(output.donor_posterior.argmax().item() in gene.donor_positions) if gene.donor_positions else 1
-        acceptor_exact += int(output.acceptor_posterior.argmax().item() in gene.acceptor_positions) if gene.acceptor_positions else 1
-        length_sum += len(gene.dna)
-        intron_sum += len(gene.intron_lengths)
-        for key, value in group_accuracy(predicted, target).items():
-            if value == value:
-                group_sums[key] += value
+        exact += int(((predicted == batch.target_states) | ~batch.mask).all(dim=1).sum().item())
+        batch_index = torch.arange(chunk_size, device=device)
+        start_exact += int((output.start_posterior.argmax(dim=1) == batch.start_positions).sum().item())
+        stop_exact += int((output.stop_posterior.argmax(dim=1) == batch.stop_transition_positions).sum().item())
+        donor_exact += int(batch.donor_mask[batch_index, output.donor_posterior.argmax(dim=1)].sum().item())
+        acceptor_exact += int(batch.acceptor_mask[batch_index, output.acceptor_posterior.argmax(dim=1)].sum().item())
+        length_sum += int(batch.lengths.sum().item())
+        intron_sum += int(batch.intron_counts.sum().item())
+        groups = {
+            "U": [idx_U(g) for g in range(3)],
+            "C": [idx_C(g, p) for g in range(3) for p in range(3)],
+            "I": [idx_I(g, p) for g in range(3) for p in range(3)],
+            "T": [idx_T(g) for g in range(3)],
+        }
+        for key, states in groups.items():
+            group_mask = torch.zeros_like(batch.mask)
+            for state in states:
+                group_mask |= batch.target_states == state
+            group_mask &= batch.mask
+            group_total[key] += int(group_mask.sum().item())
+            group_correct[key] += int((matches & group_mask).sum().item())
+        remaining -= chunk_size
     return {
         "loss": loss_sums["total"] / examples,
         "phase_loss": loss_sums["phase"] / examples,
@@ -596,7 +717,10 @@ def evaluate(model: DenseTransitionPhaseModel, args: argparse.Namespace, *, devi
         "acceptor_exact": acceptor_exact / examples,
         "mean_length": length_sum / examples,
         "mean_introns": intron_sum / examples,
-        "groups": {key: value / examples for key, value in group_sums.items()},
+        "groups": {
+            key: (group_correct[key] / group_total[key] if group_total[key] else float("nan"))
+            for key in group_total
+        },
     }
 
 
@@ -645,6 +769,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--examples-per-step", type=int, default=4)
     parser.add_argument("--validation-examples", type=int, default=64)
+    parser.add_argument("--eval-batch-size", type=int, default=32)
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--validate-every", type=int, default=250)
     parser.add_argument("--checkpoint-every", type=int, default=250)
@@ -654,7 +779,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=96)
     parser.add_argument("--conv-layers", type=int, default=4)
     parser.add_argument("--use-evidence-targets", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--materialize-transitions", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--materialize-transitions", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--evidence-loss-weight", type=float, default=0.1)
     parser.add_argument("--start-loss-weight", type=float, default=0.25)
     parser.add_argument("--stop-loss-weight", type=float, default=0.25)
@@ -720,53 +845,52 @@ def main() -> None:
         should_validate = step == 1 or step == args.steps or (args.validate_every > 0 and step % args.validate_every == 0)
         should_save = step % args.checkpoint_every == 0 or step == args.steps
         should_report = should_print or should_validate or should_save
-        step_loss = None
         loss_parts = {key: 0.0 for key in ("total", "phase", "evidence", "start", "stop", "donor", "acceptor")}
         train_counts = {"bases": 0, "correct": 0, "exact": 0, "start": 0, "stop": 0, "donor": 0, "acceptor": 0}
-        length_sum = 0
-        intron_sum = 0
-        group_sums = {"U": 0.0, "C": 0.0, "I": 0.0, "T": 0.0}
+        group_correct = {"U": 0, "C": 0, "I": 0, "T": 0}
+        group_total = {"U": 0, "C": 0, "I": 0, "T": 0}
 
-        for _ in range(args.examples_per_step):
-            gene = make_gene(args, train_rng)
-            dna_one_hot, evidence_targets, target = tensors_to_device(gene, device)
-            output, evidence_logits = model(dna_one_hot, evidence_targets if args.use_evidence_targets else None)
-            loss, parts = compute_loss(
-                output,
-                evidence_logits,
-                target,
-                evidence_targets,
-                gene,
-                evidence_loss_weight=args.evidence_loss_weight,
-                start_loss_weight=args.start_loss_weight,
-                stop_loss_weight=args.stop_loss_weight,
-                donor_loss_weight=args.donor_loss_weight,
-                acceptor_loss_weight=args.acceptor_loss_weight,
-            )
-            scaled_loss = loss / args.examples_per_step
-            step_loss = scaled_loss if step_loss is None else step_loss + scaled_loss
-            if should_report:
-                with torch.no_grad():
-                    predicted = output.state_log_probs.argmax(dim=-1)
-                    matches = predicted == target
-                    train_counts["bases"] += int(target.numel())
-                    train_counts["correct"] += int(matches.sum().item())
-                    train_counts["exact"] += int(bool(matches.all().item()))
-                    train_counts["start"] += int(output.start_posterior.argmax().item() == gene.start_codon_start)
-                    train_counts["stop"] += int(output.stop_posterior.argmax().item() == gene.stop_transition_position)
-                    train_counts["donor"] += int(output.donor_posterior.argmax().item() in gene.donor_positions) if gene.donor_positions else 1
-                    train_counts["acceptor"] += (
-                        int(output.acceptor_posterior.argmax().item() in gene.acceptor_positions) if gene.acceptor_positions else 1
-                    )
-                    for key, value in group_accuracy(predicted, target).items():
-                        if value == value:
-                            group_sums[key] += value
-                    length_sum += len(gene.dna)
-                    intron_sum += len(gene.intron_lengths)
-                for key, value in parts.items():
-                    loss_parts[key] += float(value.item()) / args.examples_per_step
+        genes = [make_gene(args, train_rng) for _ in range(args.examples_per_step)]
+        batch = batch_to_device(genes, device)
+        output, evidence_logits = model(batch.dna_one_hot, batch.evidence_targets if args.use_evidence_targets else None)
+        step_loss, parts = compute_batch_loss(
+            output,
+            evidence_logits,
+            batch,
+            evidence_loss_weight=args.evidence_loss_weight,
+            start_loss_weight=args.start_loss_weight,
+            stop_loss_weight=args.stop_loss_weight,
+            donor_loss_weight=args.donor_loss_weight,
+            acceptor_loss_weight=args.acceptor_loss_weight,
+        )
+        if should_report:
+            with torch.no_grad():
+                predicted = output.state_log_probs.argmax(dim=-1)
+                matches = (predicted == batch.target_states) & batch.mask
+                train_counts["bases"] += int(batch.mask.sum().item())
+                train_counts["correct"] += int(matches.sum().item())
+                train_counts["exact"] += int(((predicted == batch.target_states) | ~batch.mask).all(dim=1).sum().item())
+                batch_index = torch.arange(args.examples_per_step, device=device)
+                train_counts["start"] += int((output.start_posterior.argmax(dim=1) == batch.start_positions).sum().item())
+                train_counts["stop"] += int((output.stop_posterior.argmax(dim=1) == batch.stop_transition_positions).sum().item())
+                train_counts["donor"] += int(batch.donor_mask[batch_index, output.donor_posterior.argmax(dim=1)].sum().item())
+                train_counts["acceptor"] += int(batch.acceptor_mask[batch_index, output.acceptor_posterior.argmax(dim=1)].sum().item())
+                groups = {
+                    "U": [idx_U(g) for g in range(3)],
+                    "C": [idx_C(g, p) for g in range(3) for p in range(3)],
+                    "I": [idx_I(g, p) for g in range(3) for p in range(3)],
+                    "T": [idx_T(g) for g in range(3)],
+                }
+                for key, states in groups.items():
+                    group_mask = torch.zeros_like(batch.mask)
+                    for state in states:
+                        group_mask |= batch.target_states == state
+                    group_mask &= batch.mask
+                    group_total[key] += int(group_mask.sum().item())
+                    group_correct[key] += int((matches & group_mask).sum().item())
+            for key, value in parts.items():
+                loss_parts[key] = float(value.item())
 
-        assert step_loss is not None
         step_loss.backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -806,8 +930,9 @@ def main() -> None:
             print(f"\nStep {step:06d} | learning_rate={optimizer.param_groups[0]['lr']:.2e} | elapsed={elapsed:.1f}s")
             print(
                 "Batch shape | "
-                f"genes={args.examples_per_step}, genome mean={length_sum / args.examples_per_step:.1f} bp, "
-                f"introns mean={intron_sum / args.examples_per_step:.2f}"
+                f"genes={args.examples_per_step}, genome mean={float(batch.lengths.float().mean().item()):.1f} bp, "
+                f"genome max={int(batch.lengths.max().item())} bp, "
+                f"introns mean={float(batch.intron_counts.float().mean().item()):.2f}"
             )
             train_metrics = {
                 "loss": loss_parts["total"],
@@ -823,7 +948,10 @@ def main() -> None:
                 "stop_exact": train_counts["stop"] / args.examples_per_step,
                 "donor_exact": train_counts["donor"] / args.examples_per_step,
                 "acceptor_exact": train_counts["acceptor"] / args.examples_per_step,
-                "groups": {key: value / args.examples_per_step for key, value in group_sums.items()},
+                "groups": {
+                    key: (group_correct[key] / group_total[key] if group_total[key] else float("nan"))
+                    for key in group_total
+                },
             }
             print(format_metrics("train     ", train_metrics))
             if validation is not None:
