@@ -918,6 +918,8 @@ def parse_args() -> argparse.Namespace:
                         help="Generate a single batch once and reuse it every step to profile model speed.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="Number of background DataLoader CPU workers.")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None,
+                        help="Optional path to a checkpoint to resume training from.")
     return parser.parse_args()
 
 
@@ -977,7 +979,18 @@ def main() -> None:
         )
         dataloader_iter = iter(dataloader)
 
-    for step in range(1, args.steps + 1):
+    start_step = 1
+    if args.resume_checkpoint and args.resume_checkpoint.exists():
+        print(f"Loading checkpoint: {args.resume_checkpoint}")
+        checkpoint = torch.load(args.resume_checkpoint, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_step = checkpoint["step"] + 1
+        if "validation" in checkpoint and checkpoint["validation"] and "loss" in checkpoint["validation"]:
+            best_loss = float(checkpoint["validation"]["loss"])
+        print(f"Resuming training from step {start_step}")
+
+    for step in range(start_step, args.steps + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         should_print = step == 1 or step % args.print_every == 0 or step == args.steps
