@@ -23,6 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description="Headless prediction plotter.")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to best.pt checkpoint")
     parser.add_argument("--output", type=str, default="prediction_plot.png", help="Output plot filename")
+    parser.add_argument("--num-examples", type=int, default=4, help="Number of random examples to plot")
     parser.add_argument("--device", type=str, default="cpu")
     args = parser.parse_args()
 
@@ -49,77 +50,81 @@ def main():
     for k, v in ckpt_args.items():
         setattr(cfg, k, v)
 
-    # Generate a single sequence for visualization
     import random
     rng = random.Random(42)
-    print("Generating synthetic gene...")
-    gene = make_gene(cfg, rng)
-    batch = batch_to_device([gene], device)
+    output_path = Path(args.output)
 
-    # Run forward pass
-    with torch.no_grad():
-        output, _ = model(batch.dna_one_hot, batch.splice_tracks if cfg.use_splice_tracks else None)
+    for i in range(args.num_examples):
+        print(f"Generating synthetic gene {i}...")
+        gene = make_gene(cfg, rng)
+        batch = batch_to_device([gene], device)
 
-    # Extract sequences to CPU
-    true_states = batch.target_states[0].cpu().numpy()
-    pred_states = output.state_log_probs[0].argmax(dim=-1).cpu().numpy()
-    
-    start_pos = output.start_posterior[0].cpu().numpy()
-    stop_pos = output.stop_posterior[0].cpu().numpy()
-    donor_pos = output.donor_posterior[0].cpu().numpy()
-    acceptor_pos = output.acceptor_posterior[0].cpu().numpy()
+        # Run forward pass
+        with torch.no_grad():
+            output, _ = model(batch.dna_one_hot, batch.splice_tracks if cfg.use_splice_tracks else None)
 
-    length = len(true_states)
-    x = np.arange(length)
+        # Extract sequences to CPU
+        true_states = batch.target_states[0].cpu().numpy()
+        pred_states = output.state_log_probs[0].argmax(dim=-1).cpu().numpy()
+        
+        start_pos = output.start_posterior[0].cpu().numpy()
+        stop_pos = output.stop_posterior[0].cpu().numpy()
+        donor_pos = output.donor_posterior[0].cpu().numpy()
+        acceptor_pos = output.acceptor_posterior[0].cpu().numpy()
 
-    print("Plotting results...")
-    fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True, gridspec_kw={'height_ratios': [1, 1, 2]})
+        length = len(true_states)
+        x = np.arange(length)
 
-    # Subplot 1: True vs Predicted States
-    axes[0].plot(x, true_states, label="True States", color="black", alpha=0.7)
-    axes[0].plot(x, pred_states, label="Predicted States", color="crimson", linestyle="--", alpha=0.8)
-    axes[0].set_ylabel("State Index (0-23)")
-    axes[0].set_title("HMM State Sequence")
-    axes[0].legend(loc="upper right")
-    axes[0].grid(True, alpha=0.3)
+        print(f"Plotting results for example {i}...")
+        fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True, gridspec_kw={'height_ratios': [1, 1, 2]})
 
-    # Subplot 2: Transition Signal Posteriors
-    axes[1].plot(x, start_pos, label="Start Codon Posterior", color="forestgreen", alpha=0.8)
-    axes[1].plot(x, stop_pos, label="Stop Codon Posterior", color="darkorange", alpha=0.8)
-    axes[1].plot(x, donor_pos, label="Donor Splice Posterior", color="royalblue", alpha=0.8)
-    axes[1].plot(x, acceptor_pos, label="Acceptor Splice Posterior", color="purple", alpha=0.8)
+        # Subplot 1: True vs Predicted States
+        axes[0].plot(x, true_states, label="True States", color="black", alpha=0.7)
+        axes[0].plot(x, pred_states, label="Predicted States", color="crimson", linestyle="--", alpha=0.8)
+        axes[0].set_ylabel("State Index (0-23)")
+        axes[0].set_title("HMM State Sequence")
+        axes[0].legend(loc="upper right")
+        axes[0].grid(True, alpha=0.3)
 
-    # Plot Ground Truth positions as vertical lines on ALL subplots for maximum visibility
-    for ax in axes:
-        ax.axvline(gene.start_codon_start, color="forestgreen", linestyle="--", linewidth=1.5, alpha=0.7)
-        ax.axvline(gene.stop_transition_position, color="darkorange", linestyle="--", linewidth=1.5, alpha=0.7)
-        for d_pos in gene.donor_positions:
-            ax.axvline(d_pos, color="royalblue", linestyle="--", linewidth=1.5, alpha=0.7)
-        for a_pos in gene.acceptor_positions:
-            ax.axvline(a_pos, color="purple", linestyle="--", linewidth=1.5, alpha=0.7)
+        # Subplot 2: Transition Signal Posteriors
+        axes[1].plot(x, start_pos, label="Start Codon Posterior", color="forestgreen", alpha=0.8)
+        axes[1].plot(x, stop_pos, label="Stop Codon Posterior", color="darkorange", alpha=0.8)
+        axes[1].plot(x, donor_pos, label="Donor Splice Posterior", color="royalblue", alpha=0.8)
+        axes[1].plot(x, acceptor_pos, label="Acceptor Splice Posterior", color="purple", alpha=0.8)
 
-    # Add legend handles for vertical lines on subplot 2
-    axes[1].plot([], [], color="forestgreen", linestyle="--", label="True Start")
-    axes[1].plot([], [], color="darkorange", linestyle="--", label="True Stop")
-    axes[1].plot([], [], color="royalblue", linestyle="--", label="True Donor")
-    axes[1].plot([], [], color="purple", linestyle="--", label="True Acceptor")
+        # Plot Ground Truth positions as vertical lines on ALL subplots for maximum visibility
+        for ax in axes:
+            ax.axvline(gene.start_codon_start, color="forestgreen", linestyle="--", linewidth=1.5, alpha=0.7)
+            ax.axvline(gene.stop_transition_position, color="darkorange", linestyle="--", linewidth=1.5, alpha=0.7)
+            for d_pos in gene.donor_positions:
+                ax.axvline(d_pos, color="royalblue", linestyle="--", linewidth=1.5, alpha=0.7)
+            for a_pos in gene.acceptor_positions:
+                ax.axvline(a_pos, color="purple", linestyle="--", linewidth=1.5, alpha=0.7)
 
-    axes[1].set_ylabel("Probability")
-    axes[1].set_title("Boundary Posteriors & True Coordinates (dashed lines)")
-    axes[1].legend(loc="upper right")
-    axes[1].grid(True, alpha=0.3)
+        # Add legend handles for vertical lines on subplot 2
+        axes[1].plot([], [], color="forestgreen", linestyle="--", label="True Start")
+        axes[1].plot([], [], color="darkorange", linestyle="--", label="True Stop")
+        axes[1].plot([], [], color="royalblue", linestyle="--", label="True Donor")
+        axes[1].plot([], [], color="purple", linestyle="--", label="True Acceptor")
 
-    # Subplot 3: State-by-state probabilities (Heatmap)
-    state_probs = output.state_probs[0].cpu().numpy() # (L, S)
-    im = axes[2].imshow(state_probs.T, aspect='auto', cmap='magma', interpolation='nearest')
-    axes[2].set_ylabel("State Index")
-    axes[2].set_xlabel("Nucleotide Position (bp)")
-    axes[2].set_title("Full Posterior State Probabilities Heatmap")
-    fig.colorbar(im, ax=axes[2], orientation='horizontal', pad=0.15, label="Probability")
+        axes[1].set_ylabel("Probability")
+        axes[1].set_title("Boundary Posteriors & True Coordinates (dashed lines)")
+        axes[1].legend(loc="upper right")
+        axes[1].grid(True, alpha=0.3)
 
-    plt.tight_layout()
-    plt.savefig(args.output, dpi=150)
-    print(f"Saved plot successfully to {args.output}")
+        # Subplot 3: State-by-state probabilities (Heatmap)
+        state_probs = output.state_probs[0].cpu().numpy() # (L, S)
+        im = axes[2].imshow(state_probs.T, aspect='auto', cmap='magma', interpolation='nearest')
+        axes[2].set_ylabel("State Index")
+        axes[2].set_xlabel("Nucleotide Position (bp)")
+        axes[2].set_title("Full Posterior State Probabilities Heatmap")
+        fig.colorbar(im, ax=axes[2], orientation='horizontal', pad=0.15, label="Probability")
+
+        plt.tight_layout()
+        this_output = output_path.parent / f"{output_path.stem}_{i}{output_path.suffix}"
+        plt.savefig(this_output, dpi=150)
+        plt.close(fig)
+        print(f"Saved plot successfully to {this_output}")
 
 if __name__ == "__main__":
     main()
