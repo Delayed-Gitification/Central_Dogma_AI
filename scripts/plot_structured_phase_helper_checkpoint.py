@@ -125,8 +125,8 @@ def module_parse_defaults() -> argparse.Namespace:
         min_intron_length=50,
         max_intron_length=300,
         allow_split_start_stop=True,
-        require_split_codon="any",
-        unsplit_codon_fraction=0.25,
+        require_split_codon="none",
+        unsplit_codon_fraction=0.0,
         init_textbook=False,
     )
 

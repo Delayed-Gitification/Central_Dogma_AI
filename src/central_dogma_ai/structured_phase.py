@@ -192,6 +192,29 @@ def _split_lengths(total_length: int, parts: int, *, min_part: int, rng: random.
     return tuple(lengths)
 
 
+def _random_cut_points(total_length: int, parts: int, *, min_part: int, rng: random.Random) -> tuple[int, ...]:
+    """Sample random internal cut points while respecting a minimum segment length."""
+
+    if parts < 1:
+        raise ValueError("parts must be at least 1")
+    if parts == 1:
+        return ()
+    if total_length < parts * min_part:
+        raise ValueError("total_length is too short for the requested split")
+    for _attempt in range(1000):
+        cuts = tuple(sorted(rng.sample(range(1, total_length), parts - 1)))
+        lengths = (cuts[0],) + tuple(right - left for left, right in zip(cuts, cuts[1:])) + (total_length - cuts[-1],)
+        if all(length >= min_part for length in lengths):
+            return cuts
+    lengths = _split_lengths(total_length, parts, min_part=min_part, rng=rng)
+    cursor = 0
+    cuts = []
+    for length in lengths[:-1]:
+        cursor += length
+        cuts.append(cursor)
+    return tuple(cuts)
+
+
 def _build_phase_target_for_path(
     *,
     genome_length: int,
@@ -244,9 +267,14 @@ def generate_multiexon_phase_gene(
     utr3 = _random_utr3_without_in_frame_stops(utr3_length, rng)
     transcript_rows = _matrix_from_transcript(utr5=utr5, cds=cds, utr3=utr3)
     transcript_length = len(transcript_rows)
+    cds_start = utr5_length
+    cds_end = utr5_length + len(cds)
 
     if exon_lengths is None:
-        exon_lengths = _split_lengths(transcript_length, exon_count, min_part=min_exon_length, rng=rng)
+        cds_cut_points = _random_cut_points(len(cds), exon_count, min_part=min_exon_length, rng=rng)
+        transcript_cut_points = tuple(cds_start + cut for cut in cds_cut_points)
+        boundaries = (0,) + transcript_cut_points + (transcript_length,)
+        exon_lengths = tuple(right - left for left, right in zip(boundaries, boundaries[1:]))
     else:
         exon_lengths = tuple(exon_lengths)
         if sum(exon_lengths) != transcript_length:
@@ -254,6 +282,11 @@ def generate_multiexon_phase_gene(
         exon_count = len(exon_lengths)
         if any(length < 1 for length in exon_lengths):
             raise ValueError("exon lengths must be positive")
+        cursor = 0
+        for length in exon_lengths[:-1]:
+            cursor += length
+            if not (cds_start < cursor < cds_end):
+                raise ValueError("exon boundaries must fall inside the CDS")
 
     genome_rows: list[tuple[str, int]] = []
     path_indices: list[int] = []

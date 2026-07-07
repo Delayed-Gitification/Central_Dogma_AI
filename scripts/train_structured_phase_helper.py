@@ -95,10 +95,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-intron-length", type=int, default=24)
     parser.add_argument(
         "--allow-split-start-stop",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Allow ATG/stop codons to be split by introns. The current simple DNA adapter cannot solve this cleanly; "
-            "leave disabled for the first trainer."
+            "Allow ATG/stop codons to be split by introns. Enabled by default for natural random CDS intron insertion."
         ),
     )
     parser.add_argument(

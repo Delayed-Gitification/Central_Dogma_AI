@@ -48,7 +48,7 @@ def test_synthetic_generator_builds_protein_then_aligned_dna_phase_matrix():
         utr5_length=13,
         coding_codons=8,
         utr3_length=9,
-        exon_lengths=(9, 11, 26),
+        exon_lengths=(20, 10, 16),
         min_intron_length=10,
         max_intron_length=10,
         seed=17,
