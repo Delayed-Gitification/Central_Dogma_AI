@@ -80,6 +80,14 @@ class PhaseLayerOutput:
     log_partition: torch.Tensor
 
 
+@dataclass(frozen=True)
+class PathCodonLogits:
+    """Codon start/stop logits scored on one mature transcript path."""
+
+    start_logits: torch.Tensor
+    stop_logits: torch.Tensor
+
+
 def generate_single_exon_phase_gene(
     *,
     utr5_length: int = 12,
@@ -299,6 +307,33 @@ class DNACodonFeatureExtractor(nn.Module):
         }
 
 
+class PathAwareCodonFeatureExtractor(DNACodonFeatureExtractor):
+    """Score codons on spliced transcript paths instead of raw genomic windows."""
+
+    def forward(
+        self,
+        dna_one_hot: torch.Tensor,
+        paths: tuple[SplicePath, ...] | None = None,
+    ) -> dict[str, torch.Tensor] | tuple[PathCodonLogits, ...]:
+        if paths is None:
+            return super().forward(dna_one_hot)
+        if dna_one_hot.ndim != 2 or dna_one_hot.shape[-1] != 4:
+            raise ValueError("dna_one_hot must have shape L x 4")
+
+        scored_paths = []
+        for path in paths:
+            indices = path.genomic_indices.to(device=dna_one_hot.device, dtype=torch.long)
+            transcript_one_hot = dna_one_hot[indices]
+            features = super().forward(transcript_one_hot)
+            scored_paths.append(
+                PathCodonLogits(
+                    start_logits=features["start_logits"],
+                    stop_logits=features["stop_logits"],
+                )
+            )
+        return tuple(scored_paths)
+
+
 class StructuredPhaseLayer(nn.Module):
     """Log-space latent start/stop phase layer over mature transcript paths."""
 
@@ -349,16 +384,19 @@ class StructuredPhaseLayer(nn.Module):
         start_logits: torch.Tensor,
         stop_logits: torch.Tensor,
         paths: tuple[SplicePath, ...],
+        path_codon_logits: tuple[PathCodonLogits, ...] | None = None,
     ) -> PhaseLayerOutput:
         if start_logits.shape != stop_logits.shape:
             raise ValueError("start_logits and stop_logits must have matching shape")
+        if path_codon_logits is not None and len(path_codon_logits) != len(paths):
+            raise ValueError("path_codon_logits must match paths")
         genome_length = int(start_logits.shape[0])
         state_buckets = self._empty_buckets(genome_length, len(PHASE_STATES))
         initiation_buckets: list[list[torch.Tensor]] = [[] for _ in range(genome_length)]
         termination_buckets: list[list[torch.Tensor]] = [[] for _ in range(genome_length)]
         all_path_scores: list[torch.Tensor] = []
 
-        for path in paths:
+        for path_index, path in enumerate(paths):
             indices = path.genomic_indices.to(device=start_logits.device, dtype=torch.long)
             transcript_length = int(indices.numel())
             if transcript_length < self.min_orf_codons * 3:
@@ -372,8 +410,17 @@ class StructuredPhaseLayer(nn.Module):
             max_codon_start = transcript_length - 3
             min_stop_delta = (self.min_orf_codons - 1) * 3
             offsets = torch.arange(transcript_length, device=start_logits.device)
-            start_by_offset = start_logits[indices]
-            stop_by_offset = stop_logits[indices]
+            if path_codon_logits is None:
+                start_by_offset = start_logits[indices]
+                stop_by_offset = stop_logits[indices]
+            else:
+                path_logits = path_codon_logits[path_index]
+                if path_logits.start_logits.shape != path_logits.stop_logits.shape:
+                    raise ValueError("path-local start/stop logits must have matching shape")
+                if int(path_logits.start_logits.numel()) != transcript_length:
+                    raise ValueError("path-local logits must match transcript path length")
+                start_by_offset = path_logits.start_logits.to(device=start_logits.device, dtype=start_logits.dtype)
+                stop_by_offset = path_logits.stop_logits.to(device=start_logits.device, dtype=start_logits.dtype)
 
             suffix_stop = self._frame_suffix_logsum(stop_by_offset, max_codon_start)
             prefix_start = self._frame_prefix_logsum(start_by_offset, max_codon_start)
@@ -473,17 +520,22 @@ class StructuredPhaseLayer(nn.Module):
 class StructuredTranslationPhaseModel(nn.Module):
     """DNA feature extractor plus structured phase helper layer."""
 
-    def __init__(self, *, min_orf_codons: int = 2):
+    def __init__(self, *, min_orf_codons: int = 2, path_aware_codons: bool = True):
         super().__init__()
-        self.feature_extractor = DNACodonFeatureExtractor()
+        self.path_aware_codons = path_aware_codons
+        self.feature_extractor = PathAwareCodonFeatureExtractor() if path_aware_codons else DNACodonFeatureExtractor()
         self.phase_layer = StructuredPhaseLayer(min_orf_codons=min_orf_codons)
 
     def forward(self, dna_one_hot: torch.Tensor, paths: tuple[SplicePath, ...]) -> PhaseLayerOutput:
-        features = self.feature_extractor(dna_one_hot)
+        genomic_features = DNACodonFeatureExtractor.forward(self.feature_extractor, dna_one_hot)
+        path_codon_logits = None
+        if self.path_aware_codons:
+            path_codon_logits = self.feature_extractor(dna_one_hot, paths)
         return self.phase_layer(
-            start_logits=features["start_logits"],
-            stop_logits=features["stop_logits"],
+            start_logits=genomic_features["start_logits"],
+            stop_logits=genomic_features["stop_logits"],
             paths=paths,
+            path_codon_logits=path_codon_logits,
         )
 
 

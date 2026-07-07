@@ -132,6 +132,32 @@ def test_textbook_initialized_model_recovers_multiexon_phase_across_introns():
     assert int(output.termination_log_probs.argmax().item()) == gene.stop_codon_start
 
 
+def test_path_aware_model_recovers_split_start_and_stop_codons():
+    gene = generate_multiexon_phase_gene(
+        utr5_length=7,
+        coding_codons=5,
+        utr3_length=6,
+        exon_lengths=(8, 12, 8),
+        min_intron_length=8,
+        max_intron_length=8,
+        seed=51,
+    )
+    path = gene.paths[0].genomic_indices.tolist()
+    assert path[gene.utr5_length] == gene.start_codon_start
+    assert gene.dna[gene.start_codon_start : gene.start_codon_start + 3] != "ATG"
+    assert gene.dna[gene.stop_codon_start : gene.stop_codon_start + 3] not in {"TAA", "TAG", "TGA"}
+
+    model = StructuredTranslationPhaseModel(path_aware_codons=True)
+    model.feature_extractor.initialize_textbook_motifs(strength=6.0, bias=-12.0)
+
+    output = model(gene.dna_one_hot, gene.paths)
+    predicted = output.state_log_probs.argmax(dim=-1)
+
+    assert predicted.tolist() == gene.target_states.tolist()
+    assert int(output.initiation_log_probs.argmax().item()) == gene.start_codon_start
+    assert int(output.termination_log_probs.argmax().item()) == gene.stop_codon_start
+
+
 def test_splice_path_log_weights_receive_gradients_through_logsumexp_merge():
     edge_logits = torch.zeros(2, requires_grad=True)
     paths = (
