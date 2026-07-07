@@ -89,20 +89,23 @@ def main():
     axes[1].plot(x, donor_pos, label="Donor Splice Posterior", color="royalblue", alpha=0.8)
     axes[1].plot(x, acceptor_pos, label="Acceptor Splice Posterior", color="purple", alpha=0.8)
 
-    # Plot Ground Truth positions as vertical lines
-    axes[1].axvline(gene.start_codon_start, color="forestgreen", linestyle=":", linewidth=1.5, alpha=0.6, label="True Start")
-    axes[1].axvline(gene.stop_transition_position, color="darkorange", linestyle=":", linewidth=1.5, alpha=0.6, label="True Stop")
-    for d_pos in gene.donor_positions:
-        axes[1].axvline(d_pos, color="royalblue", linestyle=":", linewidth=1.5, alpha=0.6)
-    if gene.donor_positions:
-        axes[1].axvline(gene.donor_positions[0], color="royalblue", linestyle=":", linewidth=1.5, alpha=0.0, label="True Donor")
-    for a_pos in gene.acceptor_positions:
-        axes[1].axvline(a_pos, color="purple", linestyle=":", linewidth=1.5, alpha=0.6)
-    if gene.acceptor_positions:
-        axes[1].axvline(gene.acceptor_positions[0], color="purple", linestyle=":", linewidth=1.5, alpha=0.0, label="True Acceptor")
+    # Plot Ground Truth positions as vertical lines on ALL subplots for maximum visibility
+    for ax in axes:
+        ax.axvline(gene.start_codon_start, color="forestgreen", linestyle="--", linewidth=1.5, alpha=0.7)
+        ax.axvline(gene.stop_transition_position, color="darkorange", linestyle="--", linewidth=1.5, alpha=0.7)
+        for d_pos in gene.donor_positions:
+            ax.axvline(d_pos, color="royalblue", linestyle="--", linewidth=1.5, alpha=0.7)
+        for a_pos in gene.acceptor_positions:
+            ax.axvline(a_pos, color="purple", linestyle="--", linewidth=1.5, alpha=0.7)
+
+    # Add legend handles for vertical lines on subplot 2
+    axes[1].plot([], [], color="forestgreen", linestyle="--", label="True Start")
+    axes[1].plot([], [], color="darkorange", linestyle="--", label="True Stop")
+    axes[1].plot([], [], color="royalblue", linestyle="--", label="True Donor")
+    axes[1].plot([], [], color="purple", linestyle="--", label="True Acceptor")
 
     axes[1].set_ylabel("Probability")
-    axes[1].set_title("Boundary Posteriors & True Coordinates (dotted)")
+    axes[1].set_title("Boundary Posteriors & True Coordinates (dashed lines)")
     axes[1].legend(loc="upper right")
     axes[1].grid(True, alpha=0.3)
 
