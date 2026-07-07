@@ -383,7 +383,7 @@ def main() -> None:
             gene = module.make_gene(model_args, rng)
             dna_one_hot = gene.dna_one_hot.to(device)
             target = gene.target_states.to(device)
-            output = model(dna_one_hot, gene.paths)
+            output = module.run_model_on_gene(model, model_args, gene, dna_one_hot)
 
             overview_window = (0, min(len(gene.dna), args.window_bases))
             if len(gene.dna) > args.window_bases:

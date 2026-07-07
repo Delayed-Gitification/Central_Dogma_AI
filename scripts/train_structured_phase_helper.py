@@ -37,6 +37,7 @@ def configure_mamba_cache(cache_root: Path | None = None) -> Path:
 from central_dogma_ai.structured_phase import (  # noqa: E402
     PHASE_STATES,
     PathCodonLogits,
+    SplicePath,
     SyntheticPhaseGene,
     StructuredPhaseLayer,
     StructuredTranslationPhaseModel,
@@ -247,6 +248,28 @@ def splice_tracks_for_paths(length: int, paths: tuple, device: torch.device) -> 
     return tracks
 
 
+def path_from_splice_tracks(splice_tracks: torch.Tensor) -> tuple:
+    """Reconstruct the mature positive-strand path from donor/acceptor tracks."""
+
+    if splice_tracks.ndim != 2 or splice_tracks.shape[-1] != 2:
+        raise ValueError("splice_tracks must have shape L x 2")
+    device = splice_tracks.device
+    path_indices = []
+    in_intron = False
+    donor = splice_tracks[:, 0] > 0.5
+    acceptor = splice_tracks[:, 1] > 0.5
+    for index in range(int(splice_tracks.shape[0])):
+        if in_intron:
+            if bool(acceptor[index].item()):
+                path_indices.append(index)
+                in_intron = False
+            continue
+        path_indices.append(index)
+        if bool(donor[index].item()):
+            in_intron = True
+    return (SplicePath(genomic_indices=torch.tensor(path_indices, dtype=torch.long, device=device)),)
+
+
 def import_mamba2():
     if "TRITON_CACHE_DIR" not in os.environ:
         configure_mamba_cache()
@@ -396,8 +419,8 @@ class MambaStructuredPhaseModel(nn.Module):
             )
         return tuple(scored_paths)
 
-    def forward(self, dna_one_hot: torch.Tensor, paths: tuple) -> object:
-        splice_tracks = splice_tracks_for_paths(dna_one_hot.shape[0], paths, dna_one_hot.device)
+    def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor) -> object:
+        paths = path_from_splice_tracks(splice_tracks)
         hidden = self.encode_genome(dna_one_hot, splice_tracks)
         path_codon_logits = self.path_logits(hidden, paths)
         zeros = hidden.new_zeros(hidden.shape[0])
@@ -407,6 +430,13 @@ class MambaStructuredPhaseModel(nn.Module):
             paths=paths,
             path_codon_logits=path_codon_logits,
         )
+
+
+def run_model_on_gene(model: nn.Module, args: argparse.Namespace, gene: SyntheticPhaseGene, dna_one_hot: torch.Tensor):
+    if args.evidence_model == "mamba":
+        splice_tracks = splice_tracks_for_gene(gene, dna_one_hot.device)
+        return model(dna_one_hot, splice_tracks)
+    return model(dna_one_hot, gene.paths)
 
 
 def state_counts(target: torch.Tensor) -> dict[str, int]:
@@ -464,7 +494,7 @@ def evaluate(
     for _ in range(examples):
         gene = make_gene(args, rng)
         dna_one_hot, target = tensor_to_device(gene, device)
-        output = model(dna_one_hot, gene.paths)
+        output = run_model_on_gene(model, args, gene, dna_one_hot)
         loss, parts = compute_loss(
             output,
             target,
@@ -638,6 +668,7 @@ def main() -> None:
             f"chunk={args.mamba_chunk_size}, headdim={args.mamba_headdim}, "
             f"{'bidirectional' if args.bidirectional else 'forward-only'}"
         )
+        print("Mamba path source: reconstructed from donor/acceptor tracks, not explicit path_indices")
     print(
         f"mode: {args.mode}; examples_per_step={args.examples_per_step}; "
         f"validation_examples={args.validation_examples}; validate_every={args.validate_every}"
@@ -680,7 +711,7 @@ def main() -> None:
         for _example_index in range(args.examples_per_step):
             gene = make_gene(args, train_rng)
             dna_one_hot, target = tensor_to_device(gene, device)
-            output = model(dna_one_hot, gene.paths)
+            output = run_model_on_gene(model, args, gene, dna_one_hot)
             loss, parts = compute_loss(
                 output,
                 target,
