@@ -91,6 +91,12 @@ def build_edge_type_matrix() -> torch.Tensor:
 EDGE_TYPE_MATRIX = build_edge_type_matrix()
 
 
+def edge_list_from_matrix(edge_type_matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    edge_from, edge_to = torch.nonzero(edge_type_matrix >= 0, as_tuple=True)
+    edge_type = edge_type_matrix[edge_from, edge_to]
+    return edge_from.to(torch.long), edge_to.to(torch.long), edge_type.to(torch.long)
+
+
 @dataclass(frozen=True)
 class DenseGene:
     dna: str
@@ -329,6 +335,10 @@ class DenseTransitionPhaseLayer(nn.Module):
         self.register_buffer("edge_type_matrix", matrix.to(torch.long), persistent=False)
         type_masks = torch.stack([(matrix == type_index).to(torch.float32) for type_index in range(K)], dim=0)
         self.register_buffer("edge_type_masks", type_masks, persistent=False)
+        edge_from, edge_to, edge_type = edge_list_from_matrix(matrix)
+        self.register_buffer("edge_from", edge_from, persistent=False)
+        self.register_buffer("edge_to", edge_to, persistent=False)
+        self.register_buffer("edge_type", edge_type, persistent=False)
         self.initial_state = initial_state
         self.materialize_transitions = materialize_transitions
 
@@ -351,6 +361,24 @@ class DenseTransitionPhaseLayer(nn.Module):
     def transition_type_posterior(self, transition_marginal_t: torch.Tensor) -> torch.Tensor:
         return (transition_marginal_t[:, None, :, :] * self.edge_type_masks[None, :, :, :]).sum(dim=(-2, -1))
 
+    def edge_log_probs(self, evidence_logits: torch.Tensor) -> torch.Tensor:
+        """Return row-normalised log-probs for the fixed legal edge list."""
+
+        edge_logits = evidence_logits[..., self.edge_type]
+        edge_log_probs = torch.empty_like(edge_logits)
+        for state_index in range(S):
+            edge_mask = self.edge_from == state_index
+            edge_log_probs[..., edge_mask] = torch.log_softmax(edge_logits[..., edge_mask], dim=-1)
+        return edge_log_probs
+
+    def step_edge_log_probs(self, evidence_t: torch.Tensor) -> torch.Tensor:
+        edge_logits = evidence_t[:, self.edge_type]
+        edge_log_probs = torch.empty_like(edge_logits)
+        for state_index in range(S):
+            edge_mask = self.edge_from == state_index
+            edge_log_probs[:, edge_mask] = torch.log_softmax(edge_logits[:, edge_mask], dim=-1)
+        return edge_log_probs
+
     def forward(self, evidence_logits: torch.Tensor) -> DenseLayerOutput:
         squeeze_batch = False
         if evidence_logits.ndim == 2:
@@ -363,20 +391,27 @@ class DenseTransitionPhaseLayer(nn.Module):
         type_posteriors = []
 
         if self.materialize_transitions:
-            transition_log_probs = self.transition_log_probs(evidence_logits)
+            edge_log_probs = self.edge_log_probs(evidence_logits)
             for t in range(length):
-                transition_t = transition_log_probs[:, t].exp()
-                transition_marginal_t = state[:, :, None] * transition_t
-                type_posteriors.append(self.transition_type_posterior(transition_marginal_t))
-                state = torch.bmm(state[:, None, :], transition_t).squeeze(1)
+                edge_prob_t = edge_log_probs[:, t].exp()
+                edge_marginal_t = state[:, self.edge_from] * edge_prob_t
+                next_state = state.new_zeros((batch, S))
+                next_state.scatter_add_(1, self.edge_to.expand(batch, -1), edge_marginal_t)
+                type_posterior = state.new_zeros((batch, K))
+                type_posterior.scatter_add_(1, self.edge_type.expand(batch, -1), edge_marginal_t)
+                type_posteriors.append(type_posterior)
+                state = next_state
                 states.append(state)
         else:
             for t in range(length):
-                transition_log_t = self.step_transition_log_probs(evidence_logits[:, t])
-                transition_t = transition_log_t.exp()
-                transition_marginal_t = state[:, :, None] * transition_t
-                type_posteriors.append(self.transition_type_posterior(transition_marginal_t))
-                state = torch.bmm(state[:, None, :], transition_t).squeeze(1)
+                edge_prob_t = self.step_edge_log_probs(evidence_logits[:, t]).exp()
+                edge_marginal_t = state[:, self.edge_from] * edge_prob_t
+                next_state = state.new_zeros((batch, S))
+                next_state.scatter_add_(1, self.edge_to.expand(batch, -1), edge_marginal_t)
+                type_posterior = state.new_zeros((batch, K))
+                type_posterior.scatter_add_(1, self.edge_type.expand(batch, -1), edge_marginal_t)
+                type_posteriors.append(type_posterior)
+                state = next_state
                 states.append(state)
 
         state_probs = torch.stack(states, dim=1)
