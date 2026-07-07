@@ -873,6 +873,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-intron-length", type=int, default=50)
     parser.add_argument("--max-intron-length", type=int, default=300)
     parser.add_argument("--intron-mod", choices=("any", "0", "1", "2", "nonzero"), default="any")
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--disable-compile", action="store_true", help="Disable torch.compile")
     return parser.parse_args()
 
 
@@ -888,11 +890,13 @@ def main() -> None:
     model = GenomeSweepPhaseModel(hidden_dim=args.hidden_dim, use_structure_tracks=args.use_structure_tracks).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     train_dataset = SweepGeneDataset(args, args.seed + 101)
-    train_loader = DataLoader(train_dataset, batch_size=args.examples_per_step, collate_fn=collate_sweep_genes, num_workers=4, prefetch_factor=2)
+    
+    prefetch = 2 if args.num_workers > 0 else None
+    train_loader = DataLoader(train_dataset, batch_size=args.examples_per_step, collate_fn=collate_sweep_genes, num_workers=args.num_workers, prefetch_factor=prefetch)
     train_iter = iter(train_loader)
     
     scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
-    if hasattr(torch, "compile"):
+    if hasattr(torch, "compile") and not args.disable_compile:
         # Compile if possible
         try:
             model = torch.compile(model)
