@@ -8,13 +8,17 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from central_dogma_ai.structured_phase import (  # noqa: E402
     PHASE_STATES,
+    PathCodonLogits,
     SyntheticPhaseGene,
+    StructuredPhaseLayer,
     StructuredTranslationPhaseModel,
     generate_multiexon_phase_gene,
     generate_single_exon_phase_gene,
@@ -44,6 +48,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-loss-weight", type=float, default=0.25)
     parser.add_argument("--stop-loss-weight", type=float, default=0.25)
     parser.add_argument("--mode", choices=("single_exon", "multiexon"), default="single_exon")
+    parser.add_argument("--evidence-model", choices=("motif", "mamba"), default="motif")
+    parser.add_argument("--mamba-hidden-dim", type=int, default=64)
+    parser.add_argument("--mamba-layers", type=int, default=4)
+    parser.add_argument("--mamba-chunk-size", type=int, default=16)
+    parser.add_argument("--mamba-headdim", type=int, default=8)
+    parser.add_argument("--bidirectional", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--min-utr5-length", type=int, default=6)
     parser.add_argument("--max-utr5-length", type=int, default=24)
@@ -195,6 +205,182 @@ def tensor_to_device(gene: SyntheticPhaseGene, device: torch.device) -> tuple[to
     return gene.dna_one_hot.to(device), gene.target_states.to(device)
 
 
+def splice_tracks_for_gene(gene: SyntheticPhaseGene, device: torch.device) -> torch.Tensor:
+    return splice_tracks_for_paths(len(gene.dna), gene.paths, device)
+
+
+def splice_tracks_for_paths(length: int, paths: tuple, device: torch.device) -> torch.Tensor:
+    tracks = torch.zeros(length, 2, dtype=torch.float32, device=device)
+    if not paths:
+        return tracks
+    path_indices = paths[0].genomic_indices.tolist()
+    for offset in range(len(path_indices) - 1):
+        if path_indices[offset + 1] != path_indices[offset] + 1:
+            tracks[path_indices[offset], 0] = 1.0
+            tracks[path_indices[offset + 1], 1] = 1.0
+    return tracks
+
+
+def import_mamba2():
+    try:
+        from mamba_ssm import Mamba2
+    except ImportError as exc:
+        try:
+            from mamba_ssm.modules.mamba2 import Mamba2
+        except ImportError:
+            raise RuntimeError(
+                "Mamba evidence model needs mamba-ssm. Use the bipangolin/cluster env where Mamba2 is installed."
+            ) from exc
+    return Mamba2
+
+
+class OfficialMamba2Block(nn.Module):
+    def __init__(self, hidden_dim: int, *, chunk_size: int = 16, headdim: int = 8):
+        super().__init__()
+        Mamba2 = import_mamba2()
+        d_inner = 2 * hidden_dim
+        if d_inner % headdim != 0:
+            raise ValueError("2 * hidden_dim must be divisible by headdim")
+        nheads = d_inner // headdim
+        fused_projection_width = 2 * d_inner + 2 * 32 + nheads
+        if fused_projection_width % 8 != 0:
+            raise ValueError("Mamba2 fused projection width must be divisible by 8; try --mamba-headdim 8")
+        self.chunk_size = chunk_size
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.mamba = Mamba2(
+            d_model=hidden_dim,
+            d_state=32,
+            d_conv=4,
+            expand=2,
+            headdim=headdim,
+            chunk_size=chunk_size,
+        )
+        with torch.no_grad():
+            if hasattr(self.mamba, "dt_bias"):
+                self.mamba.dt_bias.fill_(-2.0)
+            if hasattr(self.mamba, "A_log"):
+                self.mamba.A_log.zero_()
+            if hasattr(self.mamba, "D"):
+                self.mamba.D.fill_(1.0)
+
+    def _pad_to_chunk(self, x: torch.Tensor) -> tuple[torch.Tensor, int]:
+        remainder = x.shape[1] % self.chunk_size
+        if remainder == 0:
+            return x, 0
+        pad_length = self.chunk_size - remainder
+        padding = x.new_zeros(x.shape[0], pad_length, x.shape[2])
+        return torch.cat([x, padding], dim=1), pad_length
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        padded, pad_length = self._pad_to_chunk(self.norm(x))
+        y = self.mamba(padded)
+        if isinstance(y, tuple):
+            y = y[0]
+        if pad_length:
+            y = y[:, :-pad_length]
+        return residual + y
+
+
+class OfficialMamba2Encoder(nn.Module):
+    def __init__(self, hidden_dim: int, *, layers: int, chunk_size: int, headdim: int):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [OfficialMamba2Block(hidden_dim, chunk_size=chunk_size, headdim=headdim) for _ in range(layers)]
+        )
+        self.final_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return self.final_norm(x)
+
+
+class MambaStructuredPhaseModel(nn.Module):
+    def __init__(
+        self,
+        *,
+        min_orf_codons: int,
+        hidden_dim: int,
+        layers: int,
+        chunk_size: int,
+        headdim: int,
+        bidirectional: bool,
+    ):
+        super().__init__()
+        self.bidirectional = bidirectional
+        self.input_projection = nn.Linear(6, hidden_dim)
+        self.local_stem = nn.Sequential(
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=7, padding=3, groups=1),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+        )
+        self.forward_encoder = OfficialMamba2Encoder(
+            hidden_dim,
+            layers=layers,
+            chunk_size=chunk_size,
+            headdim=headdim,
+        )
+        if bidirectional:
+            self.reverse_encoder = OfficialMamba2Encoder(
+                hidden_dim,
+                layers=layers,
+                chunk_size=chunk_size,
+                headdim=headdim,
+            )
+            self.bidirectional_fusion = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.codon_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 3),
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+        )
+        self.phase_layer = StructuredPhaseLayer(min_orf_codons=min_orf_codons)
+
+    def encode_genome(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor) -> torch.Tensor:
+        features = torch.cat([dna_one_hot, splice_tracks], dim=-1).unsqueeze(0)
+        hidden = self.input_projection(features)
+        hidden = hidden + self.local_stem(hidden.transpose(1, 2)).transpose(1, 2)
+        forward_hidden = self.forward_encoder(hidden)
+        if not self.bidirectional:
+            return forward_hidden.squeeze(0)
+        reverse_hidden = torch.flip(self.reverse_encoder(torch.flip(hidden, dims=(1,))), dims=(1,))
+        return self.bidirectional_fusion(torch.cat([forward_hidden, reverse_hidden], dim=-1)).squeeze(0)
+
+    def path_logits(self, hidden: torch.Tensor, paths: tuple) -> tuple[PathCodonLogits, ...]:
+        scored_paths = []
+        for path in paths:
+            indices = path.genomic_indices.to(device=hidden.device, dtype=torch.long)
+            path_hidden = hidden[indices]
+            length = int(path_hidden.shape[0])
+            if length < 3:
+                low = hidden.new_full((length,), -1.0e4)
+                scored_paths.append(PathCodonLogits(start_logits=low, stop_logits=low))
+                continue
+            windows = torch.cat([path_hidden[:-2], path_hidden[1:-1], path_hidden[2:]], dim=-1)
+            logits = self.codon_head(windows)
+            pad = hidden.new_full((2,), -1.0e4)
+            scored_paths.append(
+                PathCodonLogits(
+                    start_logits=torch.cat([logits[:, 0], pad], dim=0),
+                    stop_logits=torch.cat([logits[:, 1], pad], dim=0),
+                )
+            )
+        return tuple(scored_paths)
+
+    def forward(self, dna_one_hot: torch.Tensor, paths: tuple) -> object:
+        splice_tracks = splice_tracks_for_paths(dna_one_hot.shape[0], paths, dna_one_hot.device)
+        hidden = self.encode_genome(dna_one_hot, splice_tracks)
+        path_codon_logits = self.path_logits(hidden, paths)
+        zeros = hidden.new_zeros(hidden.shape[0])
+        return self.phase_layer(
+            start_logits=zeros,
+            stop_logits=zeros,
+            paths=paths,
+            path_codon_logits=path_codon_logits,
+        )
+
+
 def state_counts(target: torch.Tensor) -> dict[str, int]:
     return {name: int((target == index).sum().item()) for index, name in enumerate(PHASE_STATES)}
 
@@ -322,7 +508,7 @@ def format_metrics(prefix: str, metrics: dict[str, object]) -> str:
 def save_checkpoint(
     path: Path,
     *,
-    model: StructuredTranslationPhaseModel,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     args: argparse.Namespace,
     step: int,
@@ -345,13 +531,19 @@ def save_checkpoint(
 def load_checkpoint(
     path: Path,
     *,
-    model: StructuredTranslationPhaseModel,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     resume: bool,
 ) -> tuple[int, float]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    strict = bool(resume)
+    load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+    if not strict:
+        missing = load_result.missing_keys
+        unexpected = load_result.unexpected_keys
+        if missing or unexpected:
+            print(f"checkpoint partially loaded: missing={len(missing)}, unexpected={len(unexpected)}")
     start_step = 0
     best_loss = float("inf")
     if resume:
@@ -361,6 +553,19 @@ def load_checkpoint(
         if "loss" in validation:
             best_loss = float(validation["loss"])
     return start_step, best_loss
+
+
+def build_model(args: argparse.Namespace) -> nn.Module:
+    if args.evidence_model == "motif":
+        return StructuredTranslationPhaseModel(min_orf_codons=args.min_orf_codons)
+    return MambaStructuredPhaseModel(
+        min_orf_codons=args.min_orf_codons,
+        hidden_dim=args.mamba_hidden_dim,
+        layers=args.mamba_layers,
+        chunk_size=args.mamba_chunk_size,
+        headdim=args.mamba_headdim,
+        bidirectional=args.bidirectional,
+    )
 
 
 def main() -> None:
@@ -373,8 +578,8 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    model = StructuredTranslationPhaseModel(min_orf_codons=args.min_orf_codons).to(device)
-    if args.init_textbook:
+    model = build_model(args).to(device)
+    if args.init_textbook and hasattr(model, "feature_extractor"):
         model.feature_extractor.initialize_textbook_motifs(strength=4.0, bias=-8.0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start_step = 0
@@ -395,6 +600,14 @@ def main() -> None:
         print(f"CUDA device: {torch.cuda.get_device_name(device)}")
     print("task: structured translated phase helper")
     print(f"states: {PHASE_STATES}")
+    print(f"evidence model: {args.evidence_model}")
+    if args.evidence_model == "mamba":
+        print(
+            "Mamba evidence: "
+            f"hidden={args.mamba_hidden_dim}, layers={args.mamba_layers}, "
+            f"chunk={args.mamba_chunk_size}, headdim={args.mamba_headdim}, "
+            f"{'bidirectional' if args.bidirectional else 'forward-only'}"
+        )
     print(
         f"mode: {args.mode}; examples_per_step={args.examples_per_step}; "
         f"validation_examples={args.validation_examples}; validate_every={args.validate_every}"
