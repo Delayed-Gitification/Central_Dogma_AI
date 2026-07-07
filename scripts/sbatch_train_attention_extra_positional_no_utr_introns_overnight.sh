@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=phase_no_utr_introns
-#SBATCH --partition=vis
-#SBATCH --gres=gpu:l40:1
+#SBATCH --partition=ga100
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
