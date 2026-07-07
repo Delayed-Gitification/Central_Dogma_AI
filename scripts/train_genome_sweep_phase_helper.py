@@ -305,9 +305,12 @@ class GenomeSweepPhaseLayer(nn.Module):
     def _scores_from_buckets(buckets: list[list[torch.Tensor]], like: torch.Tensor) -> torch.Tensor:
         values = []
         for bucket in buckets:
-            finite_bucket = [value for value in bucket if bool(torch.isfinite(value.detach()).item())]
-            if finite_bucket:
-                values.append(torch.logsumexp(torch.stack(finite_bucket), dim=0))
+            if bucket:
+                stacked = torch.stack(bucket)
+                finite = torch.isfinite(stacked)
+                safe_stacked = torch.where(finite, stacked, stacked.new_full(stacked.shape, -1.0e30))
+                score = torch.logsumexp(safe_stacked, dim=0)
+                values.append(torch.where(finite.any(dim=0), score, like.new_full((), -torch.inf)))
             else:
                 values.append(like.new_full((), -torch.inf))
         return torch.stack(values)
@@ -315,9 +318,9 @@ class GenomeSweepPhaseLayer(nn.Module):
     @staticmethod
     def _transition_log_probs(scores: torch.Tensor) -> torch.Tensor:
         finite = torch.isfinite(scores)
-        if not bool(finite.any().item()):
-            return scores
-        return scores - torch.logsumexp(scores[finite], dim=0)
+        safe_scores = torch.where(finite, scores, scores.new_full(scores.shape, -1.0e30))
+        log_z = torch.logsumexp(safe_scores, dim=0)
+        return torch.where(finite.any(), scores - log_z, scores)
 
     def forward(self, evidence_logits: torch.Tensor) -> SweepLayerOutput:
         if evidence_logits.ndim != 2 or evidence_logits.shape[-1] != len(EVIDENCE_NAMES):
@@ -509,13 +512,13 @@ def compute_loss(
         + evidence_loss_weight * evidence_loss
     )
     return total, {
-        "total": float(total.detach().item()),
-        "phase": float(phase_loss.detach().item()),
-        "start": float(start_loss.detach().item()),
-        "stop": float(stop_loss.detach().item()),
-        "donor": float(donor_loss.detach().item()),
-        "acceptor": float(acceptor_loss.detach().item()),
-        "evidence": float(evidence_loss.detach().item()),
+        "total": total.detach(),
+        "phase": phase_loss.detach(),
+        "start": start_loss.detach(),
+        "stop": stop_loss.detach(),
+        "donor": donor_loss.detach(),
+        "acceptor": acceptor_loss.detach(),
+        "evidence": evidence_loss.detach(),
     }
 
 
@@ -568,7 +571,7 @@ def evaluate(model: GenomeSweepPhaseModel, args: argparse.Namespace, *, device: 
         predicted = output.state_log_probs.argmax(dim=-1)
         matches = predicted == target
         for key, value in parts.items():
-            sums[key] += value
+            sums[key] += float(value.item())
         bases += int(target.numel())
         correct += int(matches.sum().item())
         exact += int(bool(matches.all().item()))
@@ -725,6 +728,10 @@ def main() -> None:
     for step in range(1, args.steps + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        should_print = step == 1 or step % args.print_every == 0 or step == args.steps
+        should_validate = step == 1 or step == args.steps or (args.validate_every > 0 and step % args.validate_every == 0)
+        should_save = step % args.checkpoint_every == 0 or step == args.steps
+        should_report = should_print or should_validate or should_save
         step_loss = None
         loss_parts = {key: 0.0 for key in ("total", "phase", "start", "stop", "donor", "acceptor", "evidence")}
         train_counts = {"bases": 0, "correct": 0, "exact": 0, "start": 0, "stop": 0, "donor": 0, "acceptor": 0}
@@ -749,26 +756,27 @@ def main() -> None:
             )
             scaled = loss / args.examples_per_step
             step_loss = scaled if step_loss is None else step_loss + scaled
-            with torch.no_grad():
-                predicted = output.state_log_probs.argmax(dim=-1)
-                matches = predicted == target
-                train_counts["bases"] += int(target.numel())
-                train_counts["correct"] += int(matches.sum().item())
-                train_counts["exact"] += int(bool(matches.all().item()))
-                train_counts["start"] += int(output.initiation_log_probs.argmax().item() == gene.start_codon_start)
-                train_counts["stop"] += int(output.termination_log_probs.argmax().item() == gene.stop_codon_start)
-                train_counts["donor"] += int(output.donor_log_probs.argmax().item() in gene.donor_positions) if gene.donor_positions else 1
-                train_counts["acceptor"] += (
-                    int(output.acceptor_log_probs.argmax().item() in gene.acceptor_positions) if gene.acceptor_positions else 1
-                )
-                state_acc = split_state_accuracy(predicted, target)
-                for key, value in state_acc.items():
-                    if value == value:
-                        group_sums[key] += value
-                length_sum += len(gene.dna)
-                intron_sum += len(gene.intron_lengths)
-            for key, value in parts.items():
-                loss_parts[key] += value / args.examples_per_step
+            if should_report:
+                with torch.no_grad():
+                    predicted = output.state_log_probs.argmax(dim=-1)
+                    matches = predicted == target
+                    train_counts["bases"] += int(target.numel())
+                    train_counts["correct"] += int(matches.sum().item())
+                    train_counts["exact"] += int(bool(matches.all().item()))
+                    train_counts["start"] += int(output.initiation_log_probs.argmax().item() == gene.start_codon_start)
+                    train_counts["stop"] += int(output.termination_log_probs.argmax().item() == gene.stop_codon_start)
+                    train_counts["donor"] += int(output.donor_log_probs.argmax().item() in gene.donor_positions) if gene.donor_positions else 1
+                    train_counts["acceptor"] += (
+                        int(output.acceptor_log_probs.argmax().item() in gene.acceptor_positions) if gene.acceptor_positions else 1
+                    )
+                    state_acc = split_state_accuracy(predicted, target)
+                    for key, value in state_acc.items():
+                        if value == value:
+                            group_sums[key] += value
+                    length_sum += len(gene.dna)
+                    intron_sum += len(gene.intron_lengths)
+                for key, value in parts.items():
+                    loss_parts[key] += float(value.item()) / args.examples_per_step
 
         assert step_loss is not None
         step_loss.backward()
@@ -776,9 +784,6 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
 
-        should_print = step == 1 or step % args.print_every == 0 or step == args.steps
-        should_validate = step == 1 or step == args.steps or (args.validate_every > 0 and step % args.validate_every == 0)
-        should_save = step % args.checkpoint_every == 0 or step == args.steps
         validation = None
         if should_validate:
             validation = evaluate(model, args, device=device, seed=args.seed + 100000 + step, examples=args.validation_examples)
