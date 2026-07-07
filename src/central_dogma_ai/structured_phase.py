@@ -15,7 +15,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from central_dogma_ai.biology import DNA_BASES, DNA_TO_INDEX, NON_STOP_CODONS, STOP_CODONS, clean_dna
+from central_dogma_ai.biology import CODONS_BY_AA, DNA_BASES, DNA_TO_INDEX, NON_STOP_CODONS, STOP_CODONS, clean_dna
 
 
 PHASE_STATES = ("N", "C0", "C1", "C2", "T")
@@ -45,6 +45,51 @@ def _random_dna_without_atg(length: int, rng: random.Random) -> str:
         if len(bases) >= 3 and "".join(bases[-3:]) == "ATG":
             bases.pop()
     return "".join(bases)
+
+
+def _random_utr3_without_in_frame_stops(length: int, rng: random.Random) -> str:
+    """Generate 3' UTR while avoiding extra same-frame stops after the CDS stop."""
+
+    complete_codons = length // 3
+    remainder = length % 3
+    codons = [rng.choice(NON_STOP_CODONS) for _ in range(complete_codons)]
+    tail = "".join(rng.choice(DNA_BASES) for _ in range(remainder))
+    return "".join(codons) + tail
+
+
+def _random_protein(codons: int, rng: random.Random) -> str:
+    """Create a protein sequence that starts with M and excludes terminal stop."""
+
+    if codons < 1:
+        raise ValueError("protein codons must be at least 1")
+    amino_acids = tuple(amino_acid for amino_acid in CODONS_BY_AA if amino_acid not in {"*", "M"})
+    return "M" + "".join(rng.choice(amino_acids) for _ in range(codons - 1))
+
+
+def _reverse_translate_with_stop(protein: str, rng: random.Random) -> str:
+    codons = []
+    for index, amino_acid in enumerate(protein):
+        if index == 0:
+            codons.append("ATG")
+        else:
+            codons.append(rng.choice(CODONS_BY_AA[amino_acid]))
+    codons.append(rng.choice(STOP_CODONS))
+    return "".join(codons)
+
+
+def _matrix_from_transcript(
+    *,
+    utr5: str,
+    cds: str,
+    utr3: str,
+) -> list[tuple[str, int]]:
+    """Build one aligned base/label matrix before introns are inserted."""
+
+    rows: list[tuple[str, int]] = []
+    rows.extend((base, N_STATE) for base in utr5)
+    rows.extend((base, C0_STATE + (index % 3)) for index, base in enumerate(cds))
+    rows.extend((base, T_STATE) for base in utr3)
+    return rows
 
 
 @dataclass(frozen=True)
@@ -106,22 +151,15 @@ def generate_single_exon_phase_gene(
         raise ValueError("coding_codons must include at least ATG and stop")
     rng = random.Random(seed)
     utr5 = _random_dna_without_atg(utr5_length, rng)
-    internal_codons = []
-    internal_choices = tuple(codon for codon in NON_STOP_CODONS if codon != "ATG")
-    for _ in range(coding_codons - 2):
-        internal_codons.append(rng.choice(internal_choices))
-    stop_codon = rng.choice(STOP_CODONS)
-    cds = "ATG" + "".join(internal_codons) + stop_codon
-    utr3 = "".join(rng.choice(DNA_BASES) for _ in range(utr3_length))
-    dna = utr5 + cds + utr3
+    protein = _random_protein(coding_codons - 1, rng)
+    cds = _reverse_translate_with_stop(protein, rng)
+    utr3 = _random_utr3_without_in_frame_stops(utr3_length, rng)
+    rows = _matrix_from_transcript(utr5=utr5, cds=cds, utr3=utr3)
+    dna = "".join(base for base, _state in rows)
+    target = torch.tensor([state for _base, state in rows], dtype=torch.long)
 
     start = utr5_length
     stop = utr5_length + len(cds) - 3
-    target = torch.full((len(dna),), N_STATE, dtype=torch.long)
-    for genomic_index in range(start, stop + 3):
-        target[genomic_index] = C0_STATE + ((genomic_index - start) % 3)
-    if stop + 3 < len(dna):
-        target[stop + 3 :] = T_STATE
 
     path = SplicePath(genomic_indices=torch.arange(len(dna), dtype=torch.long))
     return SyntheticPhaseGene(
@@ -201,12 +239,11 @@ def generate_multiexon_phase_gene(
 
     rng = random.Random(seed)
     utr5 = _random_dna_without_atg(utr5_length, rng)
-    internal_choices = tuple(codon for codon in NON_STOP_CODONS if codon != "ATG")
-    internal_codons = [rng.choice(internal_choices) for _ in range(coding_codons - 2)]
-    cds = "ATG" + "".join(internal_codons) + rng.choice(STOP_CODONS)
-    utr3 = "".join(rng.choice(DNA_BASES) for _ in range(utr3_length))
-    transcript = utr5 + cds + utr3
-    transcript_length = len(transcript)
+    protein = _random_protein(coding_codons - 1, rng)
+    cds = _reverse_translate_with_stop(protein, rng)
+    utr3 = _random_utr3_without_in_frame_stops(utr3_length, rng)
+    transcript_rows = _matrix_from_transcript(utr5=utr5, cds=cds, utr3=utr3)
+    transcript_length = len(transcript_rows)
 
     if exon_lengths is None:
         exon_lengths = _split_lengths(transcript_length, exon_count, min_part=min_exon_length, rng=rng)
@@ -218,32 +255,28 @@ def generate_multiexon_phase_gene(
         if any(length < 1 for length in exon_lengths):
             raise ValueError("exon lengths must be positive")
 
-    genome_parts: list[str] = []
+    genome_rows: list[tuple[str, int]] = []
     path_indices: list[int] = []
     intron_lengths = []
     transcript_cursor = 0
     for exon_index, exon_length in enumerate(exon_lengths):
-        exon = transcript[transcript_cursor : transcript_cursor + exon_length]
-        for base in exon:
-            path_indices.append(len(genome_parts))
-            genome_parts.append(base)
+        exon = transcript_rows[transcript_cursor : transcript_cursor + exon_length]
+        for row in exon:
+            path_indices.append(len(genome_rows))
+            genome_rows.append(row)
         transcript_cursor += exon_length
         if exon_index < exon_count - 1:
             intron_length = rng.randint(min_intron_length, max_intron_length)
             intron_lengths.append(intron_length)
-            genome_parts.extend("GT" + "".join(rng.choice(DNA_BASES) for _ in range(intron_length - 4)) + "AG")
+            intron = "GT" + "".join(rng.choice(DNA_BASES) for _ in range(intron_length - 4)) + "AG"
+            genome_rows.extend((base, N_STATE) for base in intron)
 
-    dna = "".join(genome_parts)
+    dna = "".join(base for base, _state in genome_rows)
     start_offset = utr5_length
     stop_offset = utr5_length + len(cds) - 3
     start_genomic = path_indices[start_offset]
     stop_genomic = path_indices[stop_offset]
-    target = _build_phase_target_for_path(
-        genome_length=len(dna),
-        path_indices=path_indices,
-        start_offset=start_offset,
-        stop_offset=stop_offset,
-    )
+    target = torch.tensor([state for _base, state in genome_rows], dtype=torch.long)
 
     path = SplicePath(genomic_indices=torch.tensor(path_indices, dtype=torch.long))
     return SyntheticPhaseGene(

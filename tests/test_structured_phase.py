@@ -1,5 +1,6 @@
 import torch
 
+from central_dogma_ai.biology import translate_sequence
 from central_dogma_ai.structured_phase import (
     C0_STATE,
     C1_STATE,
@@ -40,6 +41,46 @@ def test_single_exon_synthetic_truth_has_utr_cds_and_post_stop_states():
         C2_STATE,
     ]
     assert gene.target_states[gene.stop_codon_start + 3 :].tolist() == [T_STATE] * gene.utr3_length
+
+
+def test_synthetic_generator_builds_protein_then_aligned_dna_phase_matrix():
+    gene = generate_multiexon_phase_gene(
+        utr5_length=13,
+        coding_codons=8,
+        utr3_length=9,
+        exon_lengths=(9, 11, 26),
+        min_intron_length=10,
+        max_intron_length=10,
+        seed=17,
+    )
+    path = gene.paths[0].genomic_indices.tolist()
+    path_set = set(path)
+    spliced = "".join(gene.dna[index] for index in path)
+    spliced_labels = gene.target_states[path].tolist()
+    cds = spliced[gene.utr5_length : gene.utr5_length + 8 * 3]
+
+    assert cds[:3] == "ATG"
+    assert cds[-3:] in {"TAA", "TAG", "TGA"}
+    assert translate_sequence(cds).startswith("M")
+    assert translate_sequence(cds).endswith("*")
+    assert spliced_labels[: gene.utr5_length] == [N_STATE] * gene.utr5_length
+    assert spliced_labels[gene.utr5_length : gene.utr5_length + 6] == [
+        C0_STATE,
+        C1_STATE,
+        C2_STATE,
+        C0_STATE,
+        C1_STATE,
+        C2_STATE,
+    ]
+    assert spliced_labels[gene.utr5_length + 8 * 3 :] == [T_STATE] * gene.utr3_length
+
+    intron_positions = [index for index in range(len(gene.dna)) if index not in path_set]
+    assert intron_positions
+    assert all(gene.target_states[index].item() == N_STATE for index in intron_positions)
+    for intron_start in [index for index in intron_positions if index - 1 in path_set]:
+        intron = gene.dna[intron_start : intron_start + 10]
+        assert intron.startswith("GT")
+        assert intron.endswith("AG")
 
 
 def test_textbook_initialized_model_recovers_single_exon_phase_and_codons():
