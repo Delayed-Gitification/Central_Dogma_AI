@@ -93,6 +93,14 @@ def build_edge_type_matrix() -> torch.Tensor:
 
 EDGE_TYPE_MATRIX = build_edge_type_matrix()
 
+# Pre-compute state transitions lookup: STATE_TRANSITIONS[src][type_index] = dst
+STATE_TRANSITIONS = [[-1 for _ in range(K)] for _ in range(S)]
+for src in range(S):
+    for dst in range(S):
+        t_type = int(EDGE_TYPE_MATRIX[src, dst].item())
+        if t_type >= 0:
+            STATE_TRANSITIONS[src][t_type] = dst
+
 
 def edge_list_from_matrix(edge_type_matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     edge_from, edge_to = torch.nonzero(edge_type_matrix >= 0, as_tuple=True)
@@ -145,19 +153,17 @@ class DenseBatch:
 
 
 def one_hot_dna(sequence: str) -> torch.Tensor:
-    encoded = torch.zeros(len(sequence), 4, dtype=torch.float32)
-    for index, base in enumerate(sequence):
-        encoded[index, DNA_TO_INDEX[base]] = 1.0
-    return encoded
+    indices = torch.tensor([DNA_TO_INDEX[base] for base in sequence], dtype=torch.long)
+    return F.one_hot(indices, num_classes=4).to(torch.float32)
 
 
 def random_dna(length: int, rng: random.Random) -> str:
-    return "".join(rng.choice(DNA_BASES) for _ in range(length))
+    return "".join(rng.choices(DNA_BASES, k=length))
 
 
 def random_protein(codons: int, rng: random.Random) -> str:
     amino_acids = tuple(aa for aa in CODONS_BY_AA if aa not in {"*", "M"})
-    return "M" + "".join(rng.choice(amino_acids) for _ in range(codons - 1))
+    return "M" + "".join(rng.choices(amino_acids, k=codons - 1))
 
 
 def reverse_translate_with_stop(protein: str, rng: random.Random) -> str:
@@ -254,12 +260,7 @@ def generate_dense_gene(
     exon_lengths[-1] += utr3_length
 
     dna = "".join(base for base, _region, _phase in rows)
-    target = torch.empty(len(rows), dtype=torch.long)
-    splice_tracks = torch.zeros(len(rows), 2, dtype=torch.float32)
-    evidence_targets = torch.zeros(len(rows), K, dtype=torch.float32)
     transition_donor_positions = tuple(position + 1 for position in donor_positions)
-    donor_set = set(transition_donor_positions)
-    acceptor_set = set(acceptor_positions)
     transition_types = ["u5" for _ in rows]
 
     for pos, (base, region, phase) in enumerate(rows):
@@ -282,26 +283,29 @@ def generate_dense_gene(
         transition_types[pos] = "donor"
     for pos in acceptor_positions:
         transition_types[pos] = "acceptor"
-    for pos in transition_donor_positions:
-        splice_tracks[pos, 0] = 1.0
-    for pos in acceptor_positions:
-        splice_tracks[pos, 1] = 1.0
+
+    # Pre-calculated/vectorized splice tracks
+    splice_tracks = torch.zeros(len(rows), 2, dtype=torch.float32)
+    if transition_donor_positions:
+        splice_tracks[torch.tensor(transition_donor_positions, dtype=torch.long), 0] = 1.0
+    if acceptor_positions:
+        splice_tracks[torch.tensor(acceptor_positions, dtype=torch.long), 1] = 1.0
 
     current_state = idx_U(0)
     stop_transition_pos = None
     stop_type_index = TYPE_TO_INDEX["stop"]
     for pos, transition_type in enumerate(transition_types):
-        if pos >= stop_pos and bool((EDGE_TYPE_MATRIX[current_state] == stop_type_index).any().item()):
+        if pos >= stop_pos and STATE_TRANSITIONS[current_state][stop_type_index] != -1:
             stop_transition_pos = pos
             break
         type_index = TYPE_TO_INDEX[transition_type]
-        next_states = torch.nonzero(EDGE_TYPE_MATRIX[current_state] == type_index, as_tuple=False).flatten()
-        if int(next_states.numel()) != 1:
+        next_state = STATE_TRANSITIONS[current_state][type_index]
+        if next_state == -1:
             raise RuntimeError(
-                f"Transition table has {int(next_states.numel())} exits from "
+                f"Transition table has no exits from "
                 f"{STATE_NAMES[current_state]} using {transition_type} at position {pos}"
             )
-        current_state = int(next_states[0].item())
+        current_state = next_state
     if stop_transition_pos is None:
         raise RuntimeError("Could not find a legal stop transition in synthetic gene")
     transition_types[stop_transition_pos] = "stop"
@@ -309,17 +313,22 @@ def generate_dense_gene(
         transition_types[pos] = "u3"
 
     current_state = idx_U(0)
+    target_list = []
+    evidence_types_list = []
     for pos, transition_type in enumerate(transition_types):
         type_index = TYPE_TO_INDEX[transition_type]
-        evidence_targets[pos, type_index] = 1.0
-        next_states = torch.nonzero(EDGE_TYPE_MATRIX[current_state] == type_index, as_tuple=False).flatten()
-        if int(next_states.numel()) != 1:
+        evidence_types_list.append(type_index)
+        next_state = STATE_TRANSITIONS[current_state][type_index]
+        if next_state == -1:
             raise RuntimeError(
-                f"Transition table has {int(next_states.numel())} exits from "
+                f"Transition table has no exits from "
                 f"{STATE_NAMES[current_state]} using {transition_type} at position {pos}"
             )
-        current_state = int(next_states[0].item())
-        target[pos] = current_state
+        current_state = next_state
+        target_list.append(current_state)
+
+    target = torch.tensor(target_list, dtype=torch.long)
+    evidence_targets = F.one_hot(torch.tensor(evidence_types_list, dtype=torch.long), num_classes=K).to(torch.float32)
 
     return DenseGene(
         dna=dna,
