@@ -383,10 +383,10 @@ class GenomeSweepPhaseLayer(nn.Module):
             raise ValueError(f"evidence_logits must have shape [..., {len(EVIDENCE_NAMES)}]")
 
         alpha_list = [None] * L
-        initiation_list = [evidence_logits.new_full((B,), -torch.inf)] * L
-        termination_list = [evidence_logits.new_full((B,), -torch.inf)] * L
-        donor_list = [evidence_logits.new_full((B,), -torch.inf)] * L
-        acceptor_list = [evidence_logits.new_full((B,), -torch.inf)] * L
+        initiation_list = [evidence_logits.new_full((B,), -1e20)] * L
+        termination_list = [evidence_logits.new_full((B,), -1e20)] * L
+        donor_list = [evidence_logits.new_full((B,), -1e20)] * L
+        acceptor_list = [evidence_logits.new_full((B,), -1e20)] * L
 
         start_logits = evidence_logits[:, :, 0]
         stop_logits = evidence_logits[:, :, 1]
@@ -406,7 +406,7 @@ class GenomeSweepPhaseLayer(nn.Module):
         edge_scores[:, :, 2] = exon_logits
         
         # 3: C2 -> U3
-        edge_scores[:, :, 3] = -torch.inf
+        edge_scores[:, :, 3] = -1e20
         if L >= 3:
             edge_scores[:, 3:, 3] = stop_logits[:, :-3] + exon_logits[:, 3:]
 
@@ -414,7 +414,7 @@ class GenomeSweepPhaseLayer(nn.Module):
         edge_scores[:, :, 4:7] = exon_logits.unsqueeze(2).expand(-1, -1, 3)
 
         # 7,8,9: C -> I
-        edge_scores[:, :, 7:10] = -torch.inf
+        edge_scores[:, :, 7:10] = -1e20
         if L >= 1:
             edge_scores[:, 1:, 7:10] = (donor_logits[:, :-1] + intron_logits[:, 1:]).unsqueeze(2).expand(-1, -1, 3)
 
@@ -424,7 +424,7 @@ class GenomeSweepPhaseLayer(nn.Module):
         # 13,14,15: I -> C
         edge_scores[:, :, 13:16] = (acceptor_logits + exon_logits).unsqueeze(2).expand(-1, -1, 3)
 
-        previous = evidence_logits.new_full((B, self.num_states), -torch.inf)
+        previous = evidence_logits.new_full((B, self.num_states), -1e20)
         previous[:, idx_U5(2)] = 0.0
 
         for t in range(L):
@@ -440,7 +440,7 @@ class GenomeSweepPhaseLayer(nn.Module):
                 donor_list[t - 1] = torch.logsumexp(current_edge_scores[:, 7:10], dim=1)
             acceptor_list[t] = torch.logsumexp(current_edge_scores[:, 13:16], dim=1)
             
-            current = evidence_logits.new_full((B, self.num_states), -torch.inf)
+            current = evidence_logits.new_full((B, self.num_states), -1e20)
             for to_s, edge_indices in self.incoming_edges[g]:
                 if len(edge_indices) == 1:
                     current[:, to_s] = current_edge_scores[:, edge_indices[0]]
@@ -627,7 +627,8 @@ def compute_loss(
     state_log_probs_flat = output.state_log_probs.reshape(-1, NUM_STATES)
     target_states_flat = target_states.reshape(-1)
     phase_loss = F.nll_loss(state_log_probs_flat, target_states_flat, reduction='none').reshape(B, L)
-    phase_loss = (phase_loss * padding_mask.float()).sum() / padding_mask.float().sum()
+    phase_loss = torch.where(padding_mask, phase_loss, 0.0)
+    phase_loss = phase_loss.sum() / padding_mask.float().sum()
     
     start_loss = phase_loss.new_zeros(())
     stop_loss = phase_loss.new_zeros(())
