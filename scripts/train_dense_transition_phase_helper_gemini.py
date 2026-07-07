@@ -931,6 +931,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-intron-length", type=int, default=50)
     parser.add_argument("--max-intron-length", type=int, default=300)
     parser.add_argument("--intron-mod", choices=("any", "0", "1", "2", "nonzero"), default="any")
+    parser.add_argument("--overfit-single-batch", action="store_true",
+                        help="Generate a single batch once and reuse it every step to profile model speed.")
     return parser.parse_args()
 
 
@@ -972,6 +974,12 @@ def main() -> None:
     print(f"checkpoint directory: {args.checkpoint_dir}")
     print("starting training")
 
+    static_batch = None
+    if args.overfit_single_batch:
+        print("Generating a single static batch for overfitting...")
+        static_genes = [make_gene(args, train_rng) for _ in range(args.examples_per_step)]
+        static_batch = batch_to_device(static_genes, device)
+
     for step in range(1, args.steps + 1):
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -984,8 +992,11 @@ def main() -> None:
         group_correct = {"U": 0, "C": 0, "I": 0, "T": 0}
         group_total = {"U": 0, "C": 0, "I": 0, "T": 0}
 
-        genes = [make_gene(args, train_rng) for _ in range(args.examples_per_step)]
-        batch = batch_to_device(genes, device)
+        if args.overfit_single_batch:
+            batch = static_batch
+        else:
+            genes = [make_gene(args, train_rng) for _ in range(args.examples_per_step)]
+            batch = batch_to_device(genes, device)
         output, evidence_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
         step_loss, parts = compute_batch_loss(
             output,
