@@ -22,6 +22,23 @@ from train_dense_transition_phase_helper_attention_extra_positional import (
     S, K, STATE_NAMES, TYPE_TO_INDEX
 )
 
+STOP_CODONS = {"TAA", "TAG", "TGA"}
+
+
+def codon_hits_by_frame(dna: str) -> tuple[list[int], list[int], list[int], list[int]]:
+    start_x, start_y, stop_x, stop_y = [], [], [], []
+    for pos in range(max(0, len(dna) - 2)):
+        codon = dna[pos : pos + 3]
+        frame = pos % 3
+        if codon == "ATG":
+            start_x.append(pos)
+            start_y.append(frame)
+        elif codon in STOP_CODONS:
+            stop_x.append(pos)
+            stop_y.append(frame)
+    return start_x, start_y, stop_x, stop_y
+
+
 def main():
     parser = argparse.ArgumentParser(description="Headless prediction plotter for attention-extra-positional checkpoints.")
     parser.add_argument(
@@ -112,9 +129,10 @@ def main():
 
         length = len(true_states)
         x = np.arange(length)
+        start_codon_x, start_codon_y, stop_codon_x, stop_codon_y = codon_hits_by_frame(gene.dna)
 
         print(f"Plotting results for example {i}...")
-        fig, axes = plt.subplots(3, 1, figsize=(15, 10), sharex=True, gridspec_kw={'height_ratios': [1, 1, 2]})
+        fig, axes = plt.subplots(4, 1, figsize=(15, 11.5), sharex=True, gridspec_kw={'height_ratios': [1, 0.75, 1, 2]})
 
         # Subplot 1: True vs Predicted Regions (step plot)
         axes[0].step(x, true_regions, where="post", label="True Region", color="black", alpha=0.7)
@@ -126,11 +144,22 @@ def main():
         axes[0].legend(loc="upper right")
         axes[0].grid(True, alpha=0.3)
 
-        # Subplot 2: Transition Signal Posteriors
-        axes[1].plot(x, start_pos, label="Start Codon Posterior", color="forestgreen", alpha=0.8)
-        axes[1].plot(x, stop_pos, label="Stop Codon Posterior", color="darkorange", alpha=0.8)
-        axes[1].plot(x, donor_pos, label="Donor Splice Posterior", color="royalblue", alpha=0.8)
-        axes[1].plot(x, acceptor_pos, label="Acceptor Splice Posterior", color="purple", alpha=0.8)
+        # Subplot 2: Raw 3-frame genomic start/stop codon hits
+        axes[1].scatter(start_codon_x, start_codon_y, marker="s", s=18, color="forestgreen", label="ATG start codon", alpha=0.9)
+        axes[1].scatter(stop_codon_x, stop_codon_y, marker="s", s=18, color="crimson", label="Stop codon", alpha=0.9)
+        axes[1].set_yticks([0, 1, 2])
+        axes[1].set_yticklabels(["frame 0", "frame 1", "frame 2"])
+        axes[1].set_ylim(-0.6, 2.6)
+        axes[1].set_ylabel("Raw\n3-frame")
+        axes[1].set_title("Raw Genome 3-Frame Start/Stop Codon Track")
+        axes[1].legend(loc="upper right")
+        axes[1].grid(True, axis="x", alpha=0.25)
+
+        # Subplot 3: Transition Signal Posteriors
+        axes[2].plot(x, start_pos, label="Start Codon Posterior", color="forestgreen", alpha=0.8)
+        axes[2].plot(x, stop_pos, label="Stop Codon Posterior", color="darkorange", alpha=0.8)
+        axes[2].plot(x, donor_pos, label="Donor Splice Posterior", color="royalblue", alpha=0.8)
+        axes[2].plot(x, acceptor_pos, label="Acceptor Splice Posterior", color="purple", alpha=0.8)
 
         # Plot Ground Truth positions as vertical lines on ALL subplots for maximum visibility
         for ax in axes:
@@ -141,24 +170,24 @@ def main():
             for a_pos in gene.acceptor_positions:
                 ax.axvline(a_pos, color="purple", linestyle="--", linewidth=1.5, alpha=0.7)
 
-        # Add legend handles for vertical lines on subplot 2
-        axes[1].plot([], [], color="forestgreen", linestyle="--", label="True Start")
-        axes[1].plot([], [], color="darkorange", linestyle="--", label="True Stop")
-        axes[1].plot([], [], color="royalblue", linestyle="--", label="True Donor")
-        axes[1].plot([], [], color="purple", linestyle="--", label="True Acceptor")
+        # Add legend handles for vertical lines on posterior subplot
+        axes[2].plot([], [], color="forestgreen", linestyle="--", label="True Start")
+        axes[2].plot([], [], color="darkorange", linestyle="--", label="True Stop")
+        axes[2].plot([], [], color="royalblue", linestyle="--", label="True Donor")
+        axes[2].plot([], [], color="purple", linestyle="--", label="True Acceptor")
 
-        axes[1].set_ylabel("Probability")
-        axes[1].set_title("Boundary Posteriors & True Coordinates (dashed lines)")
-        axes[1].legend(loc="upper right")
-        axes[1].grid(True, alpha=0.3)
+        axes[2].set_ylabel("Probability")
+        axes[2].set_title("Boundary Posteriors & True Coordinates (dashed lines)")
+        axes[2].legend(loc="upper right")
+        axes[2].grid(True, alpha=0.3)
 
-        # Subplot 3: State-by-state probabilities (Heatmap)
+        # Subplot 4: State-by-state probabilities (Heatmap)
         state_probs = output.state_probs[0].cpu().numpy() # (L, S)
-        im = axes[2].imshow(state_probs.T, aspect='auto', cmap='magma', interpolation='nearest')
-        axes[2].set_ylabel("State Index")
-        axes[2].set_xlabel("Nucleotide Position (bp)")
-        axes[2].set_title("Full Posterior State Probabilities Heatmap")
-        fig.colorbar(im, ax=axes[2], orientation='horizontal', pad=0.15, label="Probability")
+        im = axes[3].imshow(state_probs.T, aspect='auto', cmap='magma', interpolation='nearest')
+        axes[3].set_ylabel("State Index")
+        axes[3].set_xlabel("Nucleotide Position (bp)")
+        axes[3].set_title("Full Posterior State Probabilities Heatmap")
+        fig.colorbar(im, ax=axes[3], orientation='horizontal', pad=0.15, label="Probability")
 
         plt.tight_layout()
         this_output = output_path.parent / f"{output_path.stem}_{i}{output_path.suffix}"
