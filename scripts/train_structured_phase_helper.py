@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -13,6 +14,25 @@ import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+
+def configure_mamba_cache(cache_root: Path | None = None) -> Path:
+    """Keep Triton/Mamba JIT artifacts out of quota-limited default caches."""
+
+    configured_root = cache_root or os.environ.get("MAMBA_TRITON_CACHE_ROOT") or os.environ.get("CACHE_ROOT")
+    root = Path(configured_root) if configured_root else ROOT / ".cache" / "mamba_triton_cache"
+    root = root.expanduser()
+    os.environ["MAMBA_TRITON_CACHE_ROOT"] = str(root)
+    cache_dirs = {
+        "TRITON_CACHE_DIR": root / "triton",
+        "TORCH_EXTENSIONS_DIR": root / "torch_extensions",
+        "XDG_CACHE_HOME": root / "xdg",
+        "TMPDIR": root / "tmp",
+    }
+    for env_name, path in cache_dirs.items():
+        os.environ[env_name] = str(path)
+        path.mkdir(parents=True, exist_ok=True)
+    return root
 
 from central_dogma_ai.structured_phase import (  # noqa: E402
     PHASE_STATES,
@@ -53,6 +73,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mamba-layers", type=int, default=4)
     parser.add_argument("--mamba-chunk-size", type=int, default=16)
     parser.add_argument("--mamba-headdim", type=int, default=8)
+    parser.add_argument(
+        "--mamba-cache-root",
+        type=Path,
+        default=None,
+        help="Scratch/cache root for Mamba/Triton compilation artifacts.",
+    )
     parser.add_argument("--bidirectional", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--min-utr5-length", type=int, default=6)
@@ -222,6 +248,8 @@ def splice_tracks_for_paths(length: int, paths: tuple, device: torch.device) -> 
 
 
 def import_mamba2():
+    if "TRITON_CACHE_DIR" not in os.environ:
+        configure_mamba_cache()
     try:
         from mamba_ssm import Mamba2
     except ImportError as exc:
@@ -572,6 +600,7 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    mamba_cache_root = configure_mamba_cache(args.mamba_cache_root)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -598,6 +627,7 @@ def main() -> None:
     print(f"Using device: {device}")
     if device.type == "cuda":
         print(f"CUDA device: {torch.cuda.get_device_name(device)}")
+    print(f"Mamba/Triton cache root: {mamba_cache_root}")
     print("task: structured translated phase helper")
     print(f"states: {PHASE_STATES}")
     print(f"evidence model: {args.evidence_model}")
