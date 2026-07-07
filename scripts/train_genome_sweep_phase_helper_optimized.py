@@ -375,6 +375,8 @@ class GenomeSweepPhaseLayer(nn.Module):
             evidence_logits = evidence_logits.unsqueeze(0)
             if padding_mask is not None:
                 padding_mask = padding_mask.unsqueeze(0)
+        
+        evidence_logits = evidence_logits.float()
 
         B, L, E = evidence_logits.shape
         if E != len(EVIDENCE_NAMES):
