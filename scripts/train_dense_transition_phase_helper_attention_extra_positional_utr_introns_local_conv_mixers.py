@@ -764,6 +764,244 @@ class BiMambaBlock(nn.Module):
             return self.mamba_fwd(x)
 
 
+
+def rotate_state_block_by_genomic_mod(state_block: torch.Tensor, ref_g: int) -> torch.Tensor:
+    """
+    Rotate a 24-channel HMM state block by genomic modulo index g.
+
+    Args:
+        state_block: Tensor of shape (B, L, 24), ordered as:
+            U0,U1,U2,
+            C00,C01,C02,C10,C11,C12,C20,C21,C22,
+            I00,I01,I02,I10,I11,I12,I20,I21,I22,
+            T0,T1,T2
+
+            where C[g,p] and I[g,p] are stored with g outer, p inner.
+
+        ref_g:
+            Reference genomic modulo class. After rotation, absolute g=ref_g
+            appears in canonical slot g=0.
+
+    Returns:
+        Tensor of shape (B, L, 24) in canonicalised state order:
+            U rel-g 0,1,2
+            C rel-g 0,1,2 × p 0,1,2
+            I rel-g 0,1,2 × p 0,1,2
+            T rel-g 0,1,2
+    """
+    if state_block.shape[-1] != S:
+        raise ValueError(f"Expected state block with {S} channels, got {state_block.shape[-1]}")
+
+    # U[g]
+    U = state_block[..., 0:3]  # B,L,3
+
+    # C[g,p]
+    C = state_block[..., 3:12].reshape(*state_block.shape[:-1], 3, 3)  # B,L,g,p
+
+    # I[g,p]
+    I = state_block[..., 12:21].reshape(*state_block.shape[:-1], 3, 3)  # B,L,g,p
+
+    # T[g]
+    T = state_block[..., 21:24]  # B,L,3
+
+    # Rotate only the genomic-mod axis g.
+    # After roll(-ref_g), absolute g=ref_g is at canonical index 0.
+    U = torch.roll(U, shifts=-ref_g, dims=-1)
+    C = torch.roll(C, shifts=-ref_g, dims=-2)
+    I = torch.roll(I, shifts=-ref_g, dims=-2)
+    T = torch.roll(T, shifts=-ref_g, dims=-1)
+
+    return torch.cat(
+        [
+            U,
+            C.reshape(*state_block.shape[:-1], 9),
+            I.reshape(*state_block.shape[:-1], 9),
+            T,
+        ],
+        dim=-1,
+    )
+
+
+def canonicalize_refiner_features_by_genomic_mod(
+    x: torch.Tensor,
+    *,
+    input_dim1: int,
+    use_backward_features: bool,
+    ref_g: int,
+) -> torch.Tensor:
+    """
+    Canonicalise the full refinement feature tensor for one reference genomic modulo.
+
+    Current feature layout in AttentionRefinementBlock.forward is:
+
+        features1                     input_dim1
+        evidence1_logits              K
+        state_probs                   S
+        transition_posteriors         K
+        state_entropy                 1
+        transition_entropy            1
+        beta                          S       optional
+        beta_entropy                  1       optional
+
+    Args:
+        x:
+            Full refinement features, shape (B, L, C).
+
+    Returns:
+        Canonicalised features, shape (B, L, C), same channel count.
+    """
+    state_start = input_dim1 + K
+    trans_start = state_start + S
+    entropy_start = trans_start + K
+    beta_start = entropy_start + 2
+
+    expected_dim = beta_start + (S + 1 if use_backward_features else 0)
+    if x.shape[-1] != expected_dim:
+        raise ValueError(
+            f"Unexpected refinement feature dim: got {x.shape[-1]}, expected {expected_dim}. "
+            "Check feature layout before phase canonicalisation."
+        )
+
+    parts = []
+
+    # Raw DNA/splice + evidence logits are kept unchanged.
+    parts.append(x[..., :state_start])
+
+    # HMM posterior state block is canonicalised by genomic modulo g.
+    parts.append(
+        rotate_state_block_by_genomic_mod(
+            x[..., state_start:state_start + S],
+            ref_g=ref_g,
+        )
+    )
+
+    # Transition posteriors and entropies are not phase-specific in the current model.
+    parts.append(x[..., trans_start:entropy_start + 2])
+
+    # Optional beta state block is canonicalised in the same way.
+    if use_backward_features:
+        parts.append(
+            rotate_state_block_by_genomic_mod(
+                x[..., beta_start:beta_start + S],
+                ref_g=ref_g,
+            )
+        )
+        parts.append(x[..., beta_start + S:beta_start + S + 1])
+
+    return torch.cat(parts, dim=-1)
+
+
+def genomic_mod_weights_from_state_probs(state_probs: torch.Tensor) -> torch.Tensor:
+    """
+    Compute soft posterior over genomic modulo g=0,1,2 from 24 HMM state probabilities.
+
+    Args:
+        state_probs: (B, L, 24)
+
+    Returns:
+        weights: (B, L, 3), summing to 1 over g.
+    """
+    if state_probs.shape[-1] != S:
+        raise ValueError(f"Expected state_probs with {S} channels, got {state_probs.shape[-1]}")
+
+    U = state_probs[..., 0:3]                                  # B,L,g
+    C = state_probs[..., 3:12].reshape(*state_probs.shape[:-1], 3, 3).sum(dim=-1)   # sum p
+    I = state_probs[..., 12:21].reshape(*state_probs.shape[:-1], 3, 3).sum(dim=-1)  # sum p
+    T = state_probs[..., 21:24]                                 # B,L,g
+
+    weights = U + C + I + T
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-30)
+    return weights
+
+
+class PhaseCanonicalLocalStem(nn.Module):
+    """
+    Shared local Conv1d stem over three phase-canonical genomic-mod views.
+
+    This is not blind phase averaging. It keeps the 3 canonical outputs separate,
+    then recombines them according to the HMM posterior over genomic modulo g.
+
+    Output shape:
+        (B, attention_dim, L)
+
+    Designed to be added residually to x_base with a zero-initialised gate.
+    """
+    def __init__(
+        self,
+        *,
+        feature_dim: int,
+        attention_dim: int,
+        input_dim1: int,
+        use_backward_features: bool,
+        init_scale: float = 0.0,
+    ):
+        super().__init__()
+        self.input_dim1 = input_dim1
+        self.use_backward_features = use_backward_features
+
+        self.shared_stem = nn.Sequential(
+            nn.Conv1d(feature_dim, attention_dim, kernel_size=7, padding=3),
+            nn.GELU(),
+            nn.Conv1d(attention_dim, attention_dim, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(attention_dim, attention_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(attention_dim, attention_dim, kernel_size=1),
+        )
+
+        # Zero-init for checkpoint compatibility.
+        self.gate = nn.Parameter(torch.tensor(float(init_scale)))
+
+        self.last_unscaled_norm: torch.Tensor | None = None
+        self.last_weight_entropy: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor, state_probs: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:
+                Full refinement features, shape (B, L, feature_dim).
+
+            state_probs:
+                HMM posterior state probabilities from the current pass,
+                shape (B, L, 24).
+
+        Returns:
+            Gated local refinement tensor, shape (B, attention_dim, L).
+        """
+        B, L, _C = x.shape
+
+        # Build three canonical views.
+        views = [
+            canonicalize_refiner_features_by_genomic_mod(
+                x,
+                input_dim1=self.input_dim1,
+                use_backward_features=self.use_backward_features,
+                ref_g=ref_g,
+            ).transpose(1, 2)  # B,C,L
+            for ref_g in range(3)
+        ]
+
+        # Shared stem over B*3 batch.
+        x_all = torch.cat(views, dim=0)                 # 3B,C,L
+        y_all = self.shared_stem(x_all)                 # 3B,H,L
+
+        # Split back into explicit genomic-mod/reference axis.
+        y0, y1, y2 = torch.chunk(y_all, chunks=3, dim=0)
+        y = torch.stack([y0, y1, y2], dim=1)             # B,3,H,L
+
+        # Softly select/fuse the relevant canonical view using HMM posterior over g.
+        weights = genomic_mod_weights_from_state_probs(state_probs)  # B,L,3
+        weights_t = weights.transpose(1, 2).unsqueeze(2)             # B,3,1,L
+
+        y_fused = (y * weights_t).sum(dim=1)             # B,H,L
+
+        self.last_unscaled_norm = y_fused.detach().norm()
+        weight_entropy = -(weights * torch.log(weights.clamp_min(1.0e-30))).sum(dim=-1).mean()
+        self.last_weight_entropy = weight_entropy.detach()
+
+        return self.gate * y_fused
+
+
 class AttentionRefinementBlock(nn.Module):
     def __init__(
         self,
@@ -813,16 +1051,13 @@ class AttentionRefinementBlock(nn.Module):
             self.feature_dim += S + 1
             
         self.proj_in = nn.Conv1d(self.feature_dim, attention_dim, kernel_size=1)
-        self.local_refinement_stem = nn.Sequential(
-            nn.Conv1d(self.feature_dim, attention_dim, kernel_size=7, padding=3),
-            nn.GELU(),
-            nn.Conv1d(attention_dim, attention_dim, kernel_size=5, padding=2),
-            nn.GELU(),
-            nn.Conv1d(attention_dim, attention_dim, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv1d(attention_dim, attention_dim, kernel_size=1),
+        self.phase_local_stem = PhaseCanonicalLocalStem(
+            feature_dim=self.feature_dim,
+            attention_dim=attention_dim,
+            input_dim1=input_dim1,
+            use_backward_features=use_backward_features,
+            init_scale=local_refinement_init_scale,
         )
-        self.local_refinement_gate = nn.Parameter(torch.tensor(float(local_refinement_init_scale)))
         
         if mixer_type in ("mamba", "mamba_attention"):
             self.mamba_blocks = nn.ModuleList([
@@ -903,9 +1138,9 @@ class AttentionRefinementBlock(nn.Module):
         self.last_x_local_norm = torch.tensor(0.0, device=x.device)
         
         if self.use_local_refinement_stem:
-            x_local = self.local_refinement_stem(x_conv_in)
+            x_local = self.phase_local_stem(x, output1_fw.state_probs)
             self.last_x_local_norm = x_local.detach().norm()
-            x_base = x_base + self.local_refinement_gate * x_local
+            x_base = x_base + x_local
         
         # x_base has shape (B, attention_dim, L)
         
@@ -1502,11 +1737,21 @@ def format_extra_attention_stats(model: nn.Module) -> str | None:
     
     # 1. Local stem stats
     if getattr(refiner, "use_local_refinement_stem", False):
-        gate = getattr(refiner, "local_refinement_gate", None)
-        base_norm = getattr(refiner, "last_x_base_norm", None)
-        local_norm = getattr(refiner, "last_x_local_norm", None)
-        if gate is not None and base_norm is not None and local_norm is not None:
-            lines.append(f"local stem | gate={gate.item():.4g} base_norm={base_norm.item():.3f} local_norm={local_norm.item():.3f}")
+        phase_local_stem = getattr(refiner, "phase_local_stem", None)
+        if phase_local_stem is not None:
+            gate = phase_local_stem.gate
+            base_norm = getattr(refiner, "last_x_base_norm", None)
+            local_norm = getattr(refiner, "last_x_local_norm", None)
+            phase_entropy = phase_local_stem.last_weight_entropy
+            if gate is not None and base_norm is not None and local_norm is not None:
+                ent_str = f" weight_entropy={phase_entropy.item():.3f}" if phase_entropy is not None else ""
+                lines.append(f"local stem | gate={gate.item():.4g} base_norm={base_norm.item():.3f} local_norm={local_norm.item():.3f}{ent_str}")
+        else:
+            gate = getattr(refiner, "local_refinement_gate", None)
+            base_norm = getattr(refiner, "last_x_base_norm", None)
+            local_norm = getattr(refiner, "last_x_local_norm", None)
+            if gate is not None and base_norm is not None and local_norm is not None:
+                lines.append(f"local stem | gate={gate.item():.4g} base_norm={base_norm.item():.3f} local_norm={local_norm.item():.3f}")
             
     # 2. Extra attention stats
     if hasattr(refiner, "extra_attention_stats"):
