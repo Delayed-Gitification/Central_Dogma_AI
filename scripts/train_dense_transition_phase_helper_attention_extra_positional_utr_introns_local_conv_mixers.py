@@ -1332,6 +1332,7 @@ class StackedDenseTransitionPhaseModel(nn.Module):
         delta_logits = None
         if self.use_attention_refinement:
             delta_logits = self.refiner(features1, evidence1_logits, output1)
+            delta_logits = torch.clamp(delta_logits, min=-10.0, max=10.0)
             evidence2_logits = evidence1_logits + self.delta_logit_scale * delta_logits
         elif self.use_residual_refinement:
             state_probs = output1.state_probs
@@ -1352,12 +1353,13 @@ class StackedDenseTransitionPhaseModel(nn.Module):
                 refinement_features.extend([beta, beta_entropy])
             x = torch.cat(refinement_features, dim=-1)
             delta_logits = self.refiner(x.transpose(1, 2)).transpose(1, 2)
+            delta_logits = torch.clamp(delta_logits, min=-10.0, max=10.0)
             evidence2_logits = evidence1_logits + self.delta_logit_scale * delta_logits
         else:
             features2 = torch.cat([features1, output1.state_probs, output1.transition_type_posteriors], dim=-1)
             evidence2_logits = self.evidence2(features2)
             
-        output2 = self.phase_layer2(evidence2_logits, run_backward=False, mask=mask)
+        output2 = self.phase_layer2(evidence2_logits, run_backward=self.use_backward_features, mask=mask)
         
         if squeeze_batch:
             def squeeze_output(out):
