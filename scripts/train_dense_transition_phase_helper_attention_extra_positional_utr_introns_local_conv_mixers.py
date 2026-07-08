@@ -566,7 +566,7 @@ class DenseTransitionPhaseLayer(nn.Module):
             d *= 2
         return P
 
-    def forward(self, evidence_logits: torch.Tensor, run_backward: bool = True) -> DenseLayerOutput:
+    def forward(self, evidence_logits: torch.Tensor, run_backward: bool = True, mask: torch.Tensor | None = None) -> DenseLayerOutput:
         squeeze_batch = False
         if evidence_logits.ndim == 2:
             evidence_logits = evidence_logits.unsqueeze(0)
@@ -578,6 +578,11 @@ class DenseTransitionPhaseLayer(nn.Module):
 
         # --- 1. Forward Pass (Alpha) ---
         T_all = self._build_transition_matrices(evidence_logits)
+        if mask is not None:
+            eye = torch.eye(S, device=T_all.device, dtype=T_all.dtype)
+            eye = eye.view(1, 1, S, S).expand(batch, length, S, S)
+            T_all = torch.where(mask.view(batch, length, 1, 1), T_all, eye)
+
         P_fw = self._parallel_prefix_product(T_all)
         state_0_fw = evidence_logits.new_zeros((batch, S))
         state_0_fw[:, self.initial_state] = 1.0
@@ -1301,7 +1306,7 @@ class StackedDenseTransitionPhaseModel(nn.Module):
             
         self.phase_layer2 = DenseTransitionPhaseLayer(materialize_transitions=materialize_transitions)
 
-    def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor | None = None) -> tuple[
+    def forward(self, dna_one_hot: torch.Tensor, splice_tracks: torch.Tensor | None = None, mask: torch.Tensor | None = None) -> tuple[
         tuple[DenseLayerOutput, torch.Tensor],
         tuple[DenseLayerOutput, torch.Tensor],
         torch.Tensor | None
@@ -1321,7 +1326,7 @@ class StackedDenseTransitionPhaseModel(nn.Module):
             features1 = torch.cat([dna_one_hot, splice_tracks], dim=-1)
             
         evidence1_logits = self.evidence1(features1)
-        output1 = self.phase_layer1(evidence1_logits, run_backward=self.use_backward_features)
+        output1 = self.phase_layer1(evidence1_logits, run_backward=self.use_backward_features, mask=mask)
         
         # Unit 2 Forward (Residual Refinement or Standard Stacked)
         delta_logits = None
@@ -1352,7 +1357,7 @@ class StackedDenseTransitionPhaseModel(nn.Module):
             features2 = torch.cat([features1, output1.state_probs, output1.transition_type_posteriors], dim=-1)
             evidence2_logits = self.evidence2(features2)
             
-        output2 = self.phase_layer2(evidence2_logits, run_backward=False)
+        output2 = self.phase_layer2(evidence2_logits, run_backward=False, mask=mask)
         
         if squeeze_batch:
             def squeeze_output(out):
@@ -1609,7 +1614,7 @@ def evaluate(model: StackedDenseTransitionPhaseModel, args: argparse.Namespace, 
         chunk_size = min(args.eval_batch_size, remaining)
         genes = [make_gene(args, rng) for _ in range(chunk_size)]
         batch = batch_to_device(genes, device)
-        (output1, evidence1_logits), (output2, evidence2_logits), delta_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
+        (output1, evidence1_logits), (output2, evidence2_logits), delta_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None, mask=batch.mask)
         loss1, parts1 = compute_batch_loss(
             output1,
             evidence1_logits,
@@ -1981,7 +1986,7 @@ def main() -> None:
         else:
             cpu_batch = next(dataloader_iter)
             batch = transfer_batch_to_device(cpu_batch, device)
-        (output1, evidence1_logits), (output2, evidence2_logits), delta_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None)
+        (output1, evidence1_logits), (output2, evidence2_logits), delta_logits = model(batch.dna_one_hot, batch.splice_tracks if args.use_splice_tracks else None, mask=batch.mask)
         loss1, parts1 = compute_batch_loss(
             output1,
             evidence1_logits,
